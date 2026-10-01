@@ -12,16 +12,16 @@ use axum::{
     Router,
     body::{Body, Bytes, to_bytes},
     extract::{Request, State},
-    http::{StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::any,
+    routing::{any, get},
 };
 use serde_json::{Value, json};
 use std::{
     os::unix::fs::PermissionsExt,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -30,6 +30,81 @@ use tower::ServiceExt;
 const ROOT: &str = "Test-Only-Root-91c7e8aa-2345-SufficientEntropy";
 const KEY: &str = "exact-token-no-invented-prefix";
 const SECRET_COOKIE: &str = "private-upstream-cookie";
+
+#[tokio::test]
+async fn checkin_management_contract_auth_and_strict_settings() {
+    let f = Fixture::new(false).await;
+    let denied = f.request("GET", "/api/checkin", None, false, None).await;
+    assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(denied.headers()["cache-control"], "no-store");
+    let cookie = f.session().await;
+    let dto = json_body(
+        f.request("GET", "/api/checkin", Some(&cookie), false, None)
+            .await,
+    )
+    .await;
+    assert_eq!(dto["settings"]["enabled"], false);
+    assert_eq!(dto["settings"]["timezone"], "Asia/Shanghai");
+    assert_eq!(dto["cycle_date"].as_str().unwrap().len(), 10);
+    assert!(dto["next_run_at"].is_null());
+    for input in [
+        json!({"enabled":true,"time":"9:00"}),
+        json!({"enabled":true,"time":"09:00","timezone":"UTC"}),
+        json!({"enabled":"true","time":"09:00"}),
+    ] {
+        assert_eq!(
+            f.request(
+                "PUT",
+                "/api/checkin/settings",
+                Some(&cookie),
+                false,
+                Some(input)
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+    let response = f
+        .request(
+            "PUT",
+            "/api/checkin/settings",
+            Some(&cookie),
+            false,
+            Some(json!({"enabled":true,"time":"07:17"})),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(json_body(response).await["settings"]["time"], "07:17");
+    let response = f
+        .request(
+            "POST",
+            "/api/checkin/run",
+            Some(&cookie),
+            false,
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json_body(response).await["error"]["code"],
+        "account_not_configured"
+    );
+    let request = axum::http::Request::builder()
+        .method("PUT")
+        .uri("/api/checkin/settings")
+        .header("host", "127.0.0.1:8080")
+        .header("cookie", cookie)
+        .header("origin", "https://evil.invalid")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"enabled":false,"time":"09:00"}"#))
+        .unwrap();
+    assert_eq!(
+        f.router.clone().oneshot(request).await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+    f.app.shutdown().await;
+}
 
 struct FakeLogin {
     fail: AtomicBool,
@@ -60,7 +135,7 @@ fn credentials() -> Credentials {
     }
 }
 
-fn active() -> Active {
+pub(crate) fn active() -> Active {
     Active {
         revision: "1".into(),
         username: "old-account".into(),
@@ -303,6 +378,69 @@ impl Fixture {
 
 async fn json_body(response: Response) -> Value {
     serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap()).unwrap()
+}
+
+#[tokio::test]
+async fn health_status_shutdown_and_forwarded_headers_are_safe() {
+    let f = Fixture::new(true).await;
+    let response = f.request("GET", "/health/live", None, false, None).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(json_body(response).await, json!({"status":"live"}));
+    let response = f.request("GET", "/health/ready", None, false, None).await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        json_body(response).await,
+        json!({"status":"not_ready","reason":"browser_isolation_unavailable"})
+    );
+    for (host, origin) in [
+        ("evil.example", "http://localhost:5173"),
+        ("127.0.0.1:8080", "https://evil.example"),
+    ] {
+        let response = f
+            .router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/api/admin/session")
+                    .header("host", host)
+                    .header("origin", origin)
+                    .header("x-forwarded-host", "127.0.0.1:8080")
+                    .header("x-forwarded-proto", "https")
+                    .header("authorization", format!("Bearer {ROOT}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+    let before = store::load(&f.app.config.state_path).err();
+    f.app.shutdown().await;
+    let response = f
+        .request("POST", "/api/admin/session", None, true, None)
+        .await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        json_body(response).await["error"]["code"],
+        "server_stopping"
+    );
+    assert_eq!(
+        json_body(f.request("GET", "/health/ready", None, false, None).await).await,
+        json!({"status":"not_ready","reason":"server_stopping"})
+    );
+    assert_eq!(store::load(&f.app.config.state_path).err(), before);
+    assert_eq!(
+        f.app
+            .accounts
+            .lock()
+            .await
+            .active
+            .as_ref()
+            .unwrap()
+            .username,
+        "old-account"
+    );
 }
 
 struct DiagnosticFailure;
@@ -1123,6 +1261,90 @@ async fn downstream_tcp_sse_abort_drops_upstream_response_stream() {
 #[tokio::test]
 async fn downstream_tcp_upload_abort_cancels_upstream_request_body() {
     network_disconnect_test(true).await;
+}
+
+#[tokio::test]
+async fn native_gateway_large_stream_is_incremental_and_cookie_free() {
+    use futures_util::StreamExt;
+    let sent = Arc::new(AtomicUsize::new(0));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let transport = Upstream::mock(format!("http://{}", listener.local_addr().unwrap()));
+    let counter = sent.clone();
+    let upstream_task = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new().route(
+                "/v1/large",
+                get(move |headers: HeaderMap| {
+                    let counter = counter.clone();
+                    async move {
+                        assert!(!headers.contains_key("cookie"));
+                        assert!(!headers.contains_key("new-api-user"));
+                        assert_eq!(headers["authorization"], format!("Bearer {KEY}"));
+                        let stream = futures_util::stream::unfold(
+                            (counter, 0usize),
+                            |(counter, n)| async move {
+                                if n == 64 {
+                                    return None;
+                                }
+                                if n > 0 {
+                                    tokio::time::sleep(Duration::from_millis(5)).await;
+                                }
+                                counter.fetch_add(1, Ordering::SeqCst);
+                                Some((
+                                    Ok::<_, std::io::Error>(Bytes::from(vec![b'x'; 65536])),
+                                    (counter, n + 1),
+                                ))
+                            },
+                        );
+                        Body::from_stream(stream)
+                    }
+                }),
+            ),
+        )
+        .await
+        .unwrap();
+    });
+    let directory = tempfile::tempdir().unwrap();
+    let app = App::new(
+        Config {
+            root_key: ROOT.into(),
+            state_path: directory.path().join("account.json"),
+            ..Default::default()
+        },
+        Some(active()),
+        transport,
+        Arc::new(FakeLogin {
+            fail: AtomicBool::new(false),
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let downstream = tokio::spawn(async move {
+        axum::serve(listener, app::router(app)).await.unwrap();
+    });
+    let response = reqwest::Client::new()
+        .get(format!("http://{address}/v1/large"))
+        .header("host", "localhost:8080")
+        .header("cookie", "session_token=local-fake-admin")
+        .bearer_auth(ROOT)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut stream = response.bytes_stream();
+    let first = stream.next().await.unwrap().unwrap();
+    assert!(
+        sent.load(Ordering::SeqCst) < 64,
+        "gateway must deliver before all chunks are produced"
+    );
+    let mut count = first.len();
+    while let Some(bytes) = stream.next().await {
+        count += bytes.unwrap().len();
+    }
+    assert_eq!(count, 64 * 65536);
+    downstream.abort();
+    upstream_task.abort();
 }
 
 #[test]

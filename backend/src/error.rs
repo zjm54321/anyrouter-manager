@@ -31,6 +31,12 @@ pub struct SafeError {
 impl SafeError {
     pub fn new(code: &'static str) -> Self {
         let message = match code {
+            "checkin_retry_confirmation_required" => {
+                "The previous check-in may have completed. Confirm before retrying."
+            }
+            "checkin_outcome_unknown" => {
+                "Check-in was not confirmed. Review the saved result before retrying."
+            }
             "invalid_credentials" => "The upstream explicitly rejected the login credentials.",
             "upstream_challenge" => "The upstream browser challenge could not be completed.",
             "upstream_session_expired" => "The upstream session is no longer valid.",
@@ -51,6 +57,7 @@ impl SafeError {
             "forbidden" => "The request host or origin is not allowed.",
             "bad_request" => "The request is invalid.",
             "not_found" => "The endpoint does not exist.",
+            "server_stopping" => "The server is shutting down.",
             "too_many_keys" => "The upstream token list exceeds the supported limit.",
             _ => "The upstream returned an unsupported response.",
         };

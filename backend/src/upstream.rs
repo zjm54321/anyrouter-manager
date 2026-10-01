@@ -23,6 +23,7 @@ impl Upstream {
         Ok(Self {
             base,
             client: reqwest::Client::builder()
+                .retry(reqwest::retry::never())
                 .redirect(reqwest::redirect::Policy::none())
                 .connect_timeout(Duration::from_secs(15))
                 .user_agent(USER_AGENT)
@@ -97,19 +98,20 @@ impl Upstream {
     }
 
     pub async fn balance(&self, credentials: &Credentials) -> Result<Balance, SafeError> {
+        self.profile(credentials).await.map(|(balance, _)| balance)
+    }
+
+    pub async fn profile(
+        &self,
+        credentials: &Credentials,
+    ) -> Result<(Balance, Option<String>), SafeError> {
         let data = self
             .json(credentials, reqwest::Method::GET, "/api/user/self")
             .await?;
         if identifier(&data["id"])? != credentials.api_user {
             return Err(unexpected());
         }
-        let quota_raw = raw_decimal(&data["quota"])?;
-        let used_quota_raw = raw_decimal(&data["used_quota"])?;
-        Ok(Balance {
-            quota_raw,
-            used_quota_raw,
-            fetched_at: now(),
-        })
+        profile_data(&data, &credentials.api_user)
     }
 
     pub async fn keys(&self, credentials: &Credentials) -> Result<Vec<ListedKey>, SafeError> {
@@ -215,7 +217,10 @@ impl Upstream {
     }
 }
 
-fn credential_headers(credentials: &Credentials, path: &str) -> Result<HeaderMap, SafeError> {
+pub(crate) fn credential_headers(
+    credentials: &Credentials,
+    path: &str,
+) -> Result<HeaderMap, SafeError> {
     let mut headers = HeaderMap::new();
     headers.insert(
         header::COOKIE,
@@ -245,11 +250,37 @@ fn raw_decimal(value: &Value) -> Result<String, SafeError> {
         Err(unexpected())
     }
 }
-fn identifier(value: &Value) -> Result<String, SafeError> {
+pub(crate) fn identifier(value: &Value) -> Result<String, SafeError> {
     let text = raw_decimal(value)?;
     if positive_id(&text) {
         Ok(text)
     } else {
         Err(unexpected())
     }
+}
+
+pub(crate) fn profile_data(
+    data: &Value,
+    user: &str,
+) -> Result<(Balance, Option<String>), SafeError> {
+    if identifier(&data["id"])? != user {
+        return Err(SafeError::new("upstream_session_unverified"));
+    }
+    let username = match data.get("username") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s))
+            if !s.is_empty() && s.len() <= 512 && !s.chars().any(char::is_control) =>
+        {
+            Some(s.clone())
+        }
+        _ => return Err(unexpected()),
+    };
+    Ok((
+        Balance {
+            quota_raw: raw_decimal(&data["quota"])?,
+            used_quota_raw: raw_decimal(&data["used_quota"])?,
+            fetched_at: now(),
+        },
+        username,
+    ))
 }

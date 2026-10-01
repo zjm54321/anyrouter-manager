@@ -3,8 +3,21 @@
 root_key = "REPLACE_WITH_A_RANDOM_ROOT_KEY_AT_LEAST_32_BYTES"
 bind = "127.0.0.1:8080"
 state_path = "data/account.json"
+# Optional: defaults to checkin.json alongside state_path (same private volume).
+# Independent 0600 JSON, at most 180 summaries across all accounts; schedule defaults off.
+# checkin_state_path = "data/checkin.json"
 frontend_dir = "frontend/dist"
 browser_helper_dir = "tools/browser-helper"
+# Opt-in container listener. Remote web origins require HTTPS and secure cookies.
+# Container mode uses a dedicated subreaper for browser lifecycle, NOT a sandbox.
+# Requires a private container PID namespace; --pid=host / hostPID is forbidden.
+# Lost cleanup ACK, worker crash, or cleanup timeout fatally exits the service:
+# the container PID namespace must then be torn down to remove all descendants.
+# Non-container mode retains user/PID namespaces, with no automatic fallback.
+container_mode = false
+cookie_secure = false
+# Docker can set an absolute, operator-controlled Python executable (no uv at runtime):
+# browser_helper_executable = "/app/tools/browser-helper/.venv/bin/python"
 helper_timeout = 90
 # Enable only temporarily: fixed, non-secret login metadata; no raw browser content.
 login_diagnostics = false
