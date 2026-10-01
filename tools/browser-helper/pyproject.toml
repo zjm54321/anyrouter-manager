@@ -1,0 +1,13 @@
+[project]
+name = "anyrouter-browser-helper"
+version = "0.1.0"
+description = "Restricted stdin/stdout CloakBrowser login helper"
+license = "GPL-3.0-or-later"
+requires-python = ">=3.11"
+dependencies = [
+  "cloakbrowser==0.5.11",
+  "playwright==1.58.0",
+]
+
+[tool.uv]
+package = false
