@@ -1,0 +1,11 @@
+# Copy to config.toml and supply your own high-entropy root key (at least 32 bytes).
+# This placeholder is deliberately rejected at startup. Never commit real credentials.
+root_key = "REPLACE_WITH_A_RANDOM_ROOT_KEY_AT_LEAST_32_BYTES"
+bind = "127.0.0.1:8080"
+state_path = "data/account.json"
+frontend_dir = "frontend/dist"
+browser_helper_dir = "tools/browser-helper"
+helper_timeout = 90
+# Enable only temporarily: fixed, non-secret login metadata; no raw browser content.
+login_diagnostics = false
+allowed_origin = ["http://localhost:5173", "http://127.0.0.1:5173", "http://localhost:8080", "http://127.0.0.1:8080"]

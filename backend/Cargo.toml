@@ -1,0 +1,26 @@
+[package]
+name = "anyrouter-manager-backend"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+
+[dependencies]
+axum = "0.8"
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+futures-util = "0.3"
+libc = "0.2"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["arbitrary_precision"] }
+sha2 = "0.10"
+subtle = "2"
+tokio = { version = "1", features = ["full"] }
+toml = "0.9"
+tower-http = { version = "0.6", features = ["fs"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
