@@ -13,7 +13,12 @@ for name in \
     app::runtime_tests::secure_cookie_has_same_creation_deletion_policy \
     helper::container_command_is_explicit_and_native_command_keeps_namespace \
     tests::cookie_structure_requires_finite_expiry_but_not_live_session \
-    tests::cookie_selection_obeys_domain_secure_expiry_path_and_precedence
+    tests::cookie_selection_obeys_domain_secure_expiry_path_and_precedence \
+    upstream_body::tests::gzip_is_bounded_and_requires_complete_valid_stream \
+    log_settings::tests::strict_defaults_thresholds_and_fixed_errors \
+    log_settings::tests::update_commit_hot_watch_failure_keeps_old_and_reopen \
+    helper::tests::session_payload_prunes_expired_and_canonicalizes_session_expiry \
+    helper::tests::session_payload_expired_is_not_malformed_but_unsafe_fields_still_are
 do
     # Exact matching and an asserted count prevent renamed tests passing as zero tests.
     cargo test --locked --bin anyrouter-manager-backend "$name" -- --exact > /tmp/rust-test-result.txt

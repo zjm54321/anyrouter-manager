@@ -13,7 +13,7 @@ WORKDIR /build/backend
 COPY backend/Cargo.toml backend/Cargo.lock ./
 COPY backend/src/ ./src/
 COPY docker/rust-tests.sh /build/rust-tests.sh
-# Execute eight reviewed pure tests; production supervisor probes run on the loaded image.
+# Execute 13 reviewed pure tests; production supervisor probes run on the loaded image.
 RUN /bin/sh /build/rust-tests.sh && cargo build --locked --release
 
 FROM python:3.13-slim-bookworm AS helper

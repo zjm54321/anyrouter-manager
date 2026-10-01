@@ -98,7 +98,15 @@ def main():
         "helper::container_command_is_explicit_and_native_command_keeps_namespace": "helper.rs",
         "tests::cookie_structure_requires_finite_expiry_but_not_live_session": "tests.rs",
         "tests::cookie_selection_obeys_domain_secure_expiry_path_and_precedence": "tests.rs",
+        "upstream_body::tests::gzip_is_bounded_and_requires_complete_valid_stream": "upstream_body.rs",
+        "log_settings::tests::strict_defaults_thresholds_and_fixed_errors": "log_settings.rs",
+        "log_settings::tests::update_commit_hot_watch_failure_keeps_old_and_reopen": "log_settings.rs",
+        "helper::tests::session_payload_prunes_expired_and_canonicalizes_session_expiry": "helper.rs",
+        "helper::tests::session_payload_expired_is_not_malformed_but_unsafe_fields_still_are": "helper.rs",
     }
+    selected = re.findall(r"^    ([a-zA-Z_][\w:]*)[ \t]*\\?$", rust, re.M)
+    assert len(selected) == len(expected) == 13 and set(selected) == set(expected)
+    assert f"# Execute {len(expected)} reviewed pure tests;" in docker
     for name, source in expected.items():
         assert name in rust
         assert f"fn {name.rsplit('::', 1)[1]}()" in (ROOT / "backend/src" / source).read_text()
@@ -118,7 +126,7 @@ def main():
     checks += 1
 
     ignore = (ROOT / ".dockerignore").read_text().splitlines()
-    assert all(pattern in ignore for pattern in (".git", ".env*", "**/config.toml", "**/data",
+    assert all(pattern in ignore for pattern in (".git", ".slim/", ".env*", "**/config.toml", "**/data",
         "**/target", "**/node_modules", "**/dist", "**/.venv", "**/*.log", "**/traces"))
     assert not any("lock" in line for line in ignore if not line.startswith("flake"))
     for path in [*ROOT.glob("docker/*.py"), *ROOT.glob("tests/container/*.py")]:

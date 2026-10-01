@@ -1,6 +1,7 @@
 .git
 .git/**
 .git*
+.slim/
 .env
 .env*
 **/.env*
