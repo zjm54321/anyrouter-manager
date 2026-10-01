@@ -732,7 +732,7 @@ runpy.run_module('browser_helper',run_name='__main__')
 import atexit, ctypes, os, runpy, sys
 from browser_helper import core
 libc = ctypes.CDLL(None)
-async def noisy(credentials):
+async def noisy(credentials, state=None):
     print("never-print-password")
     print("never-log-cookie", file=sys.stderr)
     os.write(1, b"never-log-cookie")
@@ -773,6 +773,40 @@ runpy.run_module("browser_helper", run_name="__main__")
         with patch('browser_helper.__main__.os.write', side_effect=partial):
             write_all(123, b'abcdefg')
         self.assertEqual(b''.join(chunks), b'abcdefg')
+
+    def test_process_watchdog_single_safe_result_when_loop_or_teardown_blocks(self):
+        # Real module entry, no browser/network. Blocking native-style startup
+        # cannot be interrupted by asyncio.wait_for; neither can stuck teardown.
+        for enabled, phase in ((False, 'launch'), (True, 'profile_wait'), (True, 'done')):
+            script = '''
+import asyncio, runpy, time
+from browser_helper import core
+core.CLEANUP_SECONDS = 0.1
+async def blocked(credentials, state):
+    state.update(phase=PHASE, login_requested=True, login_status=200,
+                 login_success=True, self_requested=True)
+    if PHASE == 'done':
+        asyncio.get_running_loop().call_soon(time.sleep, 20)
+        return {'ok':True}
+    time.sleep(20)
+core.run_login = blocked
+runpy.run_module('browser_helper', run_name='__main__')
+'''.replace('PHASE', repr(phase))
+            process = subprocess.run([sys.executable, '-B', '-c', script],
+                                     input=b'{"username":"private-user-sentinel","password":"private-password-sentinel","timeout_ms":1000}\n',
+                                     capture_output=True, cwd=ROOT,
+                                     env=dict(os.environ, BROWSER_HELPER_DIAGNOSTICS='1' if enabled else '0'), timeout=5)
+            result = json.loads(process.stdout)
+            self.assertEqual(process.returncode, 1)
+            self.assertEqual(process.stdout.count(b'\n'), 1)
+            self.assertEqual(process.stderr, b'')
+            self.assertEqual(result['error'], 'timeout')
+            self.assertNotIn(b'sentinel', process.stdout)
+            self.assertEqual('diagnostics' in result, enabled)
+            if enabled:
+                self.assertEqual(result['diagnostics'], core.diagnostics(dict(
+                    phase=phase, exception='timeout', login_requested=True,
+                    login_status=200, login_success=True, self_requested=True)))
 
     def test_incomplete_stdin_is_bounded(self):
         process = subprocess.Popen([sys.executable, '-B', '-m', 'browser_helper'],

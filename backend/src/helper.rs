@@ -234,17 +234,27 @@ impl LoginProvider for BrowserLogin {
         credentials: Credentials,
         budget: Duration,
     ) -> Result<Credentials, SafeError> {
-        let input = serde_json::json!({"mode":"session_verify", "cookies":credentials.cookies, "api_user":credentials.api_user, "timeout_ms":budget.min(self.timeout).as_millis()});
-        let result = tokio::time::timeout(budget, self.execute_input(self.command(), input))
-            .await
-            .map_err(|_| SafeError::new("upstream_timeout"))??;
+        let bounded = self.with_budget(budget)?;
+        let input = session_verify_input(&credentials, bounded.timeout)?;
+        let result = tokio::time::timeout(
+            bounded.timeout,
+            bounded.execute_input(bounded.command(), input),
+        )
+        .await
+        .map_err(|_| bounded.timeout_error())??;
         if result.api_user != credentials.api_user {
             return Err(SafeError::new("upstream_session_unverified"));
         }
         Ok(result)
     }
     async fn login(&self, username: String, password: String) -> Result<Credentials, SafeError> {
-        self.execute(self.command(), username, password).await
+        if crate::logging::diagnostics_enabled() && !self.diagnostics {
+            let mut bounded = self.with_budget(self.timeout)?;
+            bounded.diagnostics = true;
+            bounded.execute(bounded.command(), username, password).await
+        } else {
+            self.execute(self.command(), username, password).await
+        }
     }
     async fn login_with_budget(
         &self,
@@ -252,23 +262,36 @@ impl LoginProvider for BrowserLogin {
         password: String,
         budget: Duration,
     ) -> Result<Credentials, SafeError> {
-        if budget < Duration::from_secs(1) {
-            return Err(SafeError::new("upstream_timeout"));
-        }
-        let bounded = BrowserLogin {
-            directory: self.directory.clone(),
-            timeout: budget.min(self.timeout),
-            diagnostics: self.diagnostics,
-            executable: self.executable.clone(),
-            container_mode: self.container_mode,
-        };
-        tokio::time::timeout(budget, bounded.login(username, password))
+        let bounded = self.with_budget(budget)?;
+        tokio::time::timeout(bounded.timeout, bounded.login(username, password))
             .await
-            .map_err(|_| SafeError::new("upstream_timeout"))?
+            .map_err(|_| bounded.timeout_error())?
     }
 }
 
 impl BrowserLogin {
+    fn timeout_error(&self) -> SafeError {
+        let mut error = SafeError::new("upstream_timeout").with_source(ErrorSource::Helper);
+        if self.diagnostics {
+            error.diagnostics = Some(LoginDiagnostics::launch_timeout());
+        }
+        error
+    }
+
+    fn with_budget(&self, budget: Duration) -> Result<Self, SafeError> {
+        let timeout = budget.min(self.timeout);
+        if helper_work_budget(timeout) < Duration::from_secs(1) {
+            return Err(self.timeout_error());
+        }
+        Ok(Self {
+            directory: self.directory.clone(),
+            timeout,
+            diagnostics: self.diagnostics || crate::logging::diagnostics_enabled(),
+            executable: self.executable.clone(),
+            container_mode: self.container_mode,
+        })
+    }
+
     fn command(&self) -> Command {
         if self.container_mode {
             let mut command = if let Some(executable) = &self.executable {
@@ -358,15 +381,28 @@ impl BrowserLogin {
     async fn execute_input(
         &self,
         mut command: Command,
-        input: serde_json::Value,
+        mut input: serde_json::Value,
     ) -> Result<Credentials, SafeError> {
-        let permit = BROWSER_GATE
-            .clone()
-            .acquire_owned()
+        // One absolute deadline includes permit waiting, interpreter startup,
+        // work, final JSON and process reap. Never reset it after queueing.
+        let deadline = tokio::time::Instant::now() + self.timeout;
+        use crate::{
+            log_settings::LogLevel,
+            system_log::{EventKind, EventReason, EventStage},
+        };
+        crate::logging::emit(
+            LogLevel::Debug,
+            EventKind::BrowserWait,
+            EventStage::BrowserWait,
+            None,
+            None,
+        );
+        let permit = tokio::time::timeout_at(deadline, BROWSER_GATE.clone().acquire_owned())
             .await
+            .map_err(|_| self.timeout_error())?
             .map_err(|_| SafeError::new("browser_unavailable"))?;
-        // The config is the sole opt-in, including if the backend inherited this
-        // variable from its caller. Apply at execution to cover every command.
+        // Only explicit config or this operation's captured hot logging policy
+        // can opt in; never inherit an unsolicited caller environment setting.
         if self.diagnostics {
             command.env("BROWSER_HELPER_DIAGNOSTICS", "1");
         } else {
@@ -397,7 +433,31 @@ impl BrowserLogin {
             }));
             (Lifecycle::Namespace(managed), stdin, stdout)
         };
-        let result = tokio::time::timeout(self.timeout, async {
+        crate::logging::emit(
+            LogLevel::Debug,
+            EventKind::BrowserSpawn,
+            EventStage::BrowserSpawn,
+            None,
+            None,
+        );
+        let result = tokio::time::timeout_at(deadline, async {
+            // Python's timeout covers work only; its finally block needs up to
+            // 2s to close context/browser, then emits exactly one final JSON.
+            // Reserve 3-5s (half for intermediate budgets) for startup/cleanup
+            // and transport/reap, without granting a fresh timeout to Python.
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let requested = input
+                .get("timeout_ms")
+                .and_then(serde_json::Value::as_u64)
+                .map(Duration::from_millis)
+                .unwrap_or(remaining);
+            let work_budget = helper_work_budget(remaining.min(requested));
+            // Session handoff must not turn a spent queueing budget into the
+            // parser's invalid_input. Keep existing login execution unchanged.
+            if input["mode"] == "session_verify" && work_budget < Duration::from_secs(1) {
+                return Err(self.timeout_error());
+            }
+            input["timeout_ms"] = serde_json::json!(work_budget.as_millis());
             let input = serde_json::to_vec(&input)
                 .map_err(|_| SafeError::new("upstream_unexpected_response"))?;
             if input.len() > 32 * 1024 {
@@ -413,6 +473,13 @@ impl BrowserLogin {
             drop(stdin);
             drop(input);
             let stdout = pipe(stdout.into()).map_err(|_| SafeError::new("upstream_unavailable"))?;
+            crate::logging::emit(
+                LogLevel::Trace,
+                EventKind::HelperResult,
+                EventStage::HelperResult,
+                None,
+                None,
+            );
             let bytes = read_output(&stdout)
                 .await
                 .map_err(|_| SafeError::new("upstream_unavailable"))?;
@@ -433,6 +500,15 @@ impl BrowserLogin {
                     "upstream_unavailable"
                 })
             })?;
+            let diagnostics = if self.diagnostics {
+                output
+                    .diagnostics
+                    .and_then(|value| serde_json::from_value::<LoginDiagnostics>(value).ok())
+            } else {
+                None
+            };
+            // Exactly one final snapshot, including successful helper outcomes.
+            crate::logging::helper_snapshot(diagnostics.clone());
             if !output.ok {
                 let code = match output.error.as_deref() {
                     Some("invalid_credentials") => "invalid_credentials",
@@ -453,11 +529,7 @@ impl BrowserLogin {
                     } else {
                         ErrorSource::Helper
                     });
-                if self.diagnostics {
-                    error.diagnostics = output
-                        .diagnostics
-                        .and_then(|value| serde_json::from_value::<LoginDiagnostics>(value).ok());
-                }
+                error.diagnostics = diagnostics;
                 return Err(error);
             }
             if !success {
@@ -476,9 +548,33 @@ impl BrowserLogin {
         .await;
         let result = match result {
             Ok(result) => result,
-            Err(_) => Err(SafeError::new("upstream_timeout")),
+            Err(_) => {
+                let error = self.timeout_error();
+                crate::logging::helper_snapshot(error.diagnostics.clone());
+                Err(error)
+            }
         };
+        if result
+            .as_ref()
+            .err()
+            .is_some_and(|e| e.code == "upstream_timeout")
+        {
+            crate::logging::emit(
+                LogLevel::Warn,
+                EventKind::Timeout,
+                EventStage::HelperResult,
+                Some(EventReason::DeadlineExpired),
+                None,
+            );
+        }
         managed.close().await;
+        crate::logging::emit(
+            LogLevel::Debug,
+            EventKind::Cleanup,
+            EventStage::Cleanup,
+            Some(EventReason::Success),
+            None,
+        );
         result.map_err(|mut error| {
             if error.source.is_none() {
                 error.source = Some(ErrorSource::Helper);
@@ -486,6 +582,49 @@ impl BrowserLogin {
             error
         })
     }
+}
+
+pub(crate) fn session_verify_input(
+    credentials: &Credentials,
+    timeout: Duration,
+) -> Result<serde_json::Value, SafeError> {
+    // Persisted cookie jars outlive short-lived challenge cookies. Validate ALL
+    // entries before pruning; expiration must not conceal malformed attributes.
+    if !credentials.validate_structure()
+        || !credentials.api_user.parse::<i64>().is_ok_and(|id| id > 0)
+        || credentials
+            .cookies
+            .iter()
+            .any(|c| c.expires.is_some_and(|e| e < 0.0 && e != -1.0))
+    {
+        return Err(SafeError::new("helper_input_invalid").with_source(ErrorSource::Helper));
+    }
+    let now = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+    let mut live = credentials.clone();
+    live.cookies
+        .retain(|c| c.expires.is_none_or(|e| e == -1.0 || e > now));
+    if live
+        .cookie_header_for("https://anyrouter.top/api/user/self")
+        .is_none()
+    {
+        return Err(SafeError::new("upstream_session_expired")
+            .with_source(ErrorSource::Helper)
+            .with_reason(crate::system_log::EventReason::SessionExpired));
+    }
+    // Rust's optional session expiry has the same semantics as Playwright -1,
+    // but JSON null is intentionally not accepted by the Python cookie schema.
+    for cookie in &mut live.cookies {
+        cookie.expires = Some(cookie.expires.unwrap_or(-1.0));
+    }
+    Ok(
+        serde_json::json!({"mode":"session_verify", "cookies":live.cookies,
+        "api_user":live.api_user, "timeout_ms":timeout.as_millis()}),
+    )
+}
+
+fn helper_work_budget(remaining: Duration) -> Duration {
+    remaining
+        .saturating_sub(Duration::from_secs(5).min((remaining / 2).max(Duration::from_secs(3))))
 }
 
 pub async fn wait_browser_idle() {
@@ -523,6 +662,211 @@ pub async fn isolation_available() -> bool {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    fn session_fixture(expires: Option<f64>) -> Credentials {
+        Credentials {
+            api_user: "42".into(),
+            cookies: vec![Cookie {
+                name: "session".into(),
+                value: "private-fixture-cookie".into(),
+                domain: "anyrouter.top".into(),
+                path: "/".into(),
+                secure: true,
+                http_only: true,
+                expires,
+            }],
+        }
+    }
+
+    #[test]
+    fn session_payload_prunes_expired_and_canonicalizes_session_expiry() {
+        for expiry in [
+            None,
+            Some(-1.0),
+            Some(chrono::Utc::now().timestamp() as f64 + 3600.5),
+        ] {
+            let mut credentials = session_fixture(expiry);
+            for index in 0..3 {
+                let mut cookie = credentials.cookies[0].clone();
+                cookie.name = format!("expired{index}");
+                cookie.expires = Some(index as f64);
+                credentials.cookies.insert(0, cookie);
+            }
+            let original = serde_json::to_value(&credentials).unwrap();
+            let payload = session_verify_input(&credentials, Duration::from_millis(85001)).unwrap();
+            assert_eq!(payload["cookies"].as_array().unwrap().len(), 1);
+            assert_eq!(
+                payload["cookies"][0]["expires"].as_f64(),
+                Some(expiry.unwrap_or(-1.0))
+            );
+            assert_eq!(payload["cookies"][0]["secure"], true);
+            assert_eq!(payload["cookies"][0]["http_only"], true);
+            assert_eq!(payload["timeout_ms"].as_u64(), Some(85001));
+            assert_eq!(serde_json::to_value(&credentials).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn session_payload_expired_is_not_malformed_but_unsafe_fields_still_are() {
+        assert_eq!(
+            session_verify_input(&session_fixture(Some(0.0)), Duration::from_secs(10))
+                .unwrap_err()
+                .code,
+            "upstream_session_expired"
+        );
+        for field in ["domain", "value", "path", "expiry", "identity"] {
+            let mut credentials = session_fixture(Some(0.0));
+            match field {
+                "domain" => credentials.cookies[0].domain = "evil.example".into(),
+                "value" => credentials.cookies[0].value = "private\r\nsentinel".into(),
+                "path" => credentials.cookies[0].path = "/\0".into(),
+                "expiry" => credentials.cookies[0].expires = Some(-0.5),
+                _ => credentials.api_user = u64::MAX.to_string(),
+            }
+            assert_eq!(
+                session_verify_input(&credentials, Duration::from_secs(10))
+                    .unwrap_err()
+                    .code,
+                "helper_input_invalid"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn real_module_session_payload_parses_before_any_browser_or_network() {
+        let helper = BrowserLogin {
+            directory: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .join("tools/browser-helper"),
+            timeout: Duration::from_secs(10),
+            diagnostics: false,
+            executable: None,
+            container_mode: false,
+        };
+        for expiry in [
+            None,
+            Some(-1.0),
+            Some(chrono::Utc::now().timestamp() as f64 + 3600.5),
+        ] {
+            let mut credentials = session_fixture(expiry);
+            credentials
+                .cookies
+                .push(session_fixture(Some(0.0)).cookies.remove(0));
+            let payload = session_verify_input(&credentials, helper.timeout).unwrap();
+            let mut command = helper.command();
+            command.env("CLOAKBROWSER_BINARY_PATH", "");
+            let error = helper.execute_input(command, payload).await.err().unwrap();
+            // Real production parser completed; unavailable binary fails closed
+            // BEFORE browser import, with one final protocol response.
+            assert_eq!(error.code, "browser_unavailable");
+        }
+        let mut command = helper.command();
+        command.env("CLOAKBROWSER_BINARY_PATH", "");
+        let input = serde_json::json!({"mode":"session_verify", "cookies":session_fixture(Some(0.0)).cookies,
+            "api_user":"42", "timeout_ms":10000});
+        assert_eq!(
+            helper
+                .execute_input(command, input)
+                .await
+                .err()
+                .unwrap()
+                .code,
+            "upstream_session_expired"
+        );
+    }
+
+    #[test]
+    fn helper_deadline_reserves_cleanup_without_resetting_remaining_budget() {
+        for (remaining, expected) in [(90, 85), (17, 12), (8, 4), (4, 1), (3, 0), (1, 0)] {
+            assert_eq!(
+                helper_work_budget(Duration::from_secs(remaining)),
+                Duration::from_secs(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn outer_timeout_has_only_opt_in_conservative_launch_metadata() {
+        for enabled in [false, true] {
+            let helper = BrowserLogin {
+                directory: PathBuf::new(),
+                timeout: Duration::from_secs(90),
+                diagnostics: enabled,
+                executable: None,
+                container_mode: false,
+            };
+            let value = serde_json::to_value(helper.timeout_error()).unwrap();
+            assert_eq!(value["code"], "upstream_timeout");
+            assert_eq!(value["source"], "helper");
+            assert_eq!(value.get("diagnostics").is_some(), enabled);
+            if enabled {
+                assert_eq!(value["diagnostics"]["phase"], "launch");
+                assert_eq!(value["diagnostics"]["page"], "other");
+                assert_eq!(value["diagnostics"]["exception"], "timeout");
+                assert_eq!(value["diagnostics"]["login_requested"], false);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn real_module_timeout_preserves_phase_after_cleanup_within_rust_budget() {
+        let helper = BrowserLogin {
+            directory: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .unwrap()
+                .join("tools/browser-helper"),
+            timeout: Duration::from_secs(8),
+            diagnostics: true,
+            executable: None,
+            container_mode: false,
+        };
+        let mut command = namespace_command();
+        // Real entry and real timeout path, local fake work. This used to hit
+        // Rust's identical timeout while Python was still in finally cleanup.
+        command.current_dir(&helper.directory).args([
+            "uv",
+            "run",
+            "--offline",
+            "--frozen",
+            "--no-sync",
+            "python",
+            "-B",
+            "-c",
+            r#"
+import asyncio, runpy
+from browser_helper import core
+async def work(credentials, launch, resources, state):
+    state.update(phase='profile_wait', login_requested=True, login_status=200,
+                 login_json=True, login_success=True, self_requested=True)
+    await asyncio.sleep(60)
+async def close(resources):
+    await asyncio.sleep(1)
+core.browser_launcher = lambda: None
+core.login_work = work
+core.close_resources = close
+runpy.run_module('browser_helper', run_name='__main__')
+"#,
+        ]);
+        let start = tokio::time::Instant::now();
+        let error = helper
+            .execute(
+                command,
+                "private-user-sentinel".into(),
+                "private-password-sentinel".into(),
+            )
+            .await
+            .err()
+            .unwrap();
+        assert!(start.elapsed() < helper.timeout);
+        assert_eq!(error.code, "upstream_session_unverified");
+        assert_eq!(error.source, Some(ErrorSource::Helper));
+        let value = serde_json::to_value(&error).unwrap();
+        assert_eq!(value["diagnostics"]["phase"], "profile_wait");
+        assert_eq!(value["diagnostics"]["exception"], "timeout");
+        assert_eq!(value["diagnostics"]["login_status"], 200);
+        assert!(!value.to_string().contains("sentinel"));
+    }
 
     #[tokio::test]
     async fn browser_permit_survives_cancel_until_reap_before_next_generation() {
@@ -592,7 +936,10 @@ mod tests {
             events: libc::POLLIN,
             revents: 0,
         };
-        assert_eq!(unsafe { libc::poll(&mut poll, 1, 0) }, 1);
+        // Namespace PID1 receives SIGKILL with its unshare parent; kernel
+        // namespace teardown may settle just after that parent's wait returns.
+        // The next-generation assertion above remains an immediate poll.
+        assert_eq!(unsafe { libc::poll(&mut poll, 1, 1000) }, 1);
         assert!(
             unrelated.try_wait().unwrap().is_none(),
             "cleanup must not reap/kill adjacent child"
@@ -738,6 +1085,82 @@ mod tests {
         };
         assert_eq!(unsafe { libc::poll(&mut poll, 1, 0) }, 1);
         assert!(!directory.path().join("account.json").exists());
+    }
+
+    #[tokio::test]
+    async fn final_diagnostics_snapshot_is_logged_once_for_success_and_failure() {
+        use crate::{
+            log_settings::{LogLevel, LogSettings, SharedLogSettings},
+            system_log::{EventKind, SystemLogQuery, SystemLogSink},
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let settings = SharedLogSettings::open(dir.path().join("private/settings.json"))
+            .await
+            .unwrap();
+        settings
+            .update(LogSettings {
+                level: LogLevel::Trace,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let sink = SystemLogSink::open(dir.path().join("private/system.json"), settings)
+            .await
+            .unwrap();
+        for success in [true, false] {
+            let operation = uuid::Uuid::new_v4().to_string();
+            let context =
+                crate::logging::Context::new(sink.clone(), Some(operation.clone()), None, true);
+            let helper = BrowserLogin {
+                directory: PathBuf::new(),
+                timeout: Duration::from_secs(3),
+                diagnostics: true,
+                executable: None,
+                container_mode: false,
+            };
+            let output = serde_json::json!({"ok":success,"error":"login_failed","api_user":"7","cookies":[{"name":"session","value":"fake-cookie-sentinel","domain":"anyrouter.top","path":"/","secure":true,"http_only":true,"expires":-1}],"diagnostics":crate::diagnostics::fixture()});
+            let mut command = namespace_command();
+            command
+                .args([
+                    "python",
+                    "-c",
+                    "import sys;sys.stdin.readline();print(sys.argv[1]);sys.exit(int(sys.argv[2]))",
+                ])
+                .arg(output.to_string())
+                .arg(if success { "0" } else { "1" });
+            let result = crate::logging::CONTEXT
+                .scope(
+                    context,
+                    helper.execute(
+                        command,
+                        "fake-user-sentinel".into(),
+                        "fake-password-sentinel".into(),
+                    ),
+                )
+                .await;
+            assert_eq!(result.is_ok(), success);
+            sink.flush().await.unwrap();
+            let page = sink
+                .page(SystemLogQuery {
+                    operation_id: Some(operation),
+                    ..Default::default()
+                })
+                .unwrap();
+            assert_eq!(
+                page.items
+                    .iter()
+                    .filter(|event| event.diagnostics.is_some())
+                    .count(),
+                1
+            );
+            assert!(
+                page.items
+                    .iter()
+                    .any(|event| event.event == EventKind::Cleanup)
+            );
+            assert!(!serde_json::to_string(&page).unwrap().contains("sentinel"));
+        }
+        sink.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -923,7 +1346,7 @@ mod tests {
         let python = String::from_utf8(python.stdout).unwrap();
         let uv = directory.path().join("uv");
         let script = format!(
-            "#!{}\nimport sys,os,json,socket\nassert sys.argv[1:]==['run','--offline','--frozen','--no-sync','python','-B','-m','browser_helper']\nassert os.getpid()==1\nassert os.getuid()==1000\nv=json.loads(sys.stdin.readline()); assert v=={{'username':'fake-user','password':'fake-password','timeout_ms':3000}}\nassert not sys.stdin.read()\ns=socket.socket();s.bind(('127.0.0.1',0));s.listen();c=socket.create_connection(s.getsockname());p,_=s.accept();c.sendall(b'local');assert p.recv(5)==b'local'\nprint(json.dumps({{'ok':True,'api_user':'7','cookies':[{{'name':'session','value':'fake-cookie','domain':'anyrouter.top','path':'/','secure':True,'http_only':True,'expires':-1}}]}}))\n",
+            "#!{}\nimport sys,os,json,socket\nassert sys.argv[1:]==['run','--offline','--frozen','--no-sync','python','-B','-m','browser_helper']\nassert os.getpid()==1\nassert os.getuid()==1000\nv=json.loads(sys.stdin.readline()); budget=v.pop('timeout_ms'); assert 0<=budget<3000; assert v=={{'username':'fake-user','password':'fake-password'}}\nassert not sys.stdin.read()\ns=socket.socket();s.bind(('127.0.0.1',0));s.listen();c=socket.create_connection(s.getsockname());p,_=s.accept();c.sendall(b'local');assert p.recv(5)==b'local'\nprint(json.dumps({{'ok':True,'api_user':'7','cookies':[{{'name':'session','value':'fake-cookie','domain':'anyrouter.top','path':'/','secure':True,'http_only':True,'expires':-1}}]}}))\n",
             python.trim()
         );
         std::fs::write(&uv, script).unwrap();

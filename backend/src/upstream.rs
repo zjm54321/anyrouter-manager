@@ -1,9 +1,9 @@
+use crate::system_log::{EventReason, EventStage};
 use crate::{
     error::SafeError,
     model::{Balance, Credentials, ListedKey, decimal, full_key, now, positive_id},
 };
 use axum::http::{HeaderMap, header};
-use futures_util::StreamExt;
 use serde_json::Value;
 use std::time::Duration;
 
@@ -40,10 +40,24 @@ impl Upstream {
         credentials: &Credentials,
         method: reqwest::Method,
         path: &str,
-    ) -> Result<Value, SafeError> {
+    ) -> Result<(Value, u16), SafeError> {
+        let stage = if path == "/api/user/self" {
+            EventStage::SelfAccount
+        } else if method == reqwest::Method::GET {
+            EventStage::Tokens
+        } else {
+            EventStage::Key
+        };
+        crate::logging::emit(
+            crate::log_settings::LogLevel::Debug,
+            crate::system_log::EventKind::StorageRead,
+            stage,
+            None,
+            None,
+        );
         // Test transport replaces only the network destination; cookie policy always
         // evaluates against the actual production HTTPS origin and endpoint path.
-        let headers = credential_headers(credentials, path)?;
+        let headers = credential_headers(credentials, path).map_err(|e| e.at(stage, None))?;
         let response = self
             .client
             .request(method, format!("{}{path}", self.base))
@@ -51,50 +65,28 @@ impl Upstream {
             .timeout(Duration::from_secs(30))
             .send()
             .await
-            .map_err(|_| SafeError::new("upstream_unavailable"))?;
-        let status = response.status();
-        if status.is_server_error() {
-            return Err(SafeError::new("upstream_unavailable"));
-        }
-        let mut stream = response.bytes_stream();
-        let mut bytes = Vec::new();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|_| SafeError::new("upstream_unavailable"))?;
-            if bytes.len() + chunk.len() > 2 * 1024 * 1024 {
-                return Err(unexpected());
-            }
-            bytes.extend_from_slice(&chunk);
-        }
-        let value: Value = match serde_json::from_slice(&bytes) {
-            Ok(value) => value,
-            Err(_) => {
-                let text = String::from_utf8_lossy(&bytes).to_ascii_lowercase();
-                let challenge = (text.contains("<html")
-                    || text.contains("<!doctype html")
-                    || text.contains("<script"))
-                    && [
-                        "cf-chl-",
-                        "challenge-platform",
-                        "just a moment",
-                        "checking your browser",
-                        "waf challenge",
-                    ]
-                    .iter()
-                    .any(|s| text.contains(s));
-                return Err(SafeError::new(if challenge {
-                    "upstream_challenge"
+            .map_err(|e| {
+                SafeError::new(if e.is_timeout() {
+                    "upstream_timeout"
                 } else {
-                    "upstream_unexpected_response"
-                }));
-            }
-        };
-        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-            return Err(SafeError::new("upstream_session_expired"));
-        }
-        if !status.is_success() || value.get("success").and_then(Value::as_bool) != Some(true) {
-            return Err(unexpected());
-        }
-        value.get("data").cloned().ok_or_else(unexpected)
+                    "upstream_unavailable"
+                })
+                .at(stage, None)
+            })?;
+        let status = response.status();
+        crate::logging::emit(
+            crate::log_settings::LogLevel::Debug,
+            crate::system_log::EventKind::StorageRead,
+            stage,
+            None,
+            Some(status.as_u16()),
+        );
+        let (_, value) = crate::upstream_body::json(response)
+            .await
+            .map_err(|e| e.at(stage, Some(status.as_u16())))?;
+        crate::upstream_body::data(status, value)
+            .map(|value| (value, status.as_u16()))
+            .map_err(|e| e.at(stage, Some(status.as_u16())))
     }
 
     #[cfg(test)]
@@ -106,20 +98,28 @@ impl Upstream {
         &self,
         credentials: &Credentials,
     ) -> Result<(Balance, Option<String>), SafeError> {
-        let data = self
+        let (data, status) = self
             .json(credentials, reqwest::Method::GET, "/api/user/self")
             .await?;
-        if identifier(&data["id"])? != credentials.api_user {
-            return Err(unexpected());
-        }
         profile_data(&data, &credentials.api_user)
+            .map_err(|e| e.at(EventStage::SelfAccount, Some(status)))
     }
 
     pub async fn keys(&self, credentials: &Credentials) -> Result<Vec<ListedKey>, SafeError> {
+        self.keys_inner(credentials).await.map_err(|mut error| {
+            error.stage.get_or_insert(EventStage::Tokens);
+            if error.reason.is_none() && error.code == "upstream_unexpected_response" {
+                error.reason = Some(EventReason::SchemaInvalid);
+            }
+            error
+        })
+    }
+
+    async fn keys_inner(&self, credentials: &Credentials) -> Result<Vec<ListedKey>, SafeError> {
         let mut keys = Vec::new();
         let mut total_expected = None;
         for page in 0..20 {
-            let data = self
+            let (data, _) = self
                 .json(
                     credentials,
                     reqwest::Method::GET,
@@ -204,7 +204,7 @@ impl Upstream {
             )
             .await;
         match result {
-            Ok(data) => data
+            Ok((data, _)) => data
                 .get("key")
                 .and_then(Value::as_str)
                 .filter(|key| full_key(key))
@@ -264,8 +264,9 @@ pub(crate) fn profile_data(
     data: &Value,
     user: &str,
 ) -> Result<(Balance, Option<String>), SafeError> {
-    if identifier(&data["id"])? != user {
-        return Err(SafeError::new("upstream_session_unverified"));
+    if !identifier(&data["id"]).is_ok_and(|id| id == user) {
+        return Err(SafeError::new("upstream_session_unverified")
+            .with_reason(EventReason::IdentityMismatch));
     }
     let username = match data.get("username") {
         None | Some(Value::Null) => None,
@@ -274,12 +275,14 @@ pub(crate) fn profile_data(
         {
             Some(s.clone())
         }
-        _ => return Err(unexpected()),
+        _ => return Err(unexpected().with_reason(EventReason::SchemaInvalid)),
     };
     Ok((
         Balance {
-            quota_raw: raw_decimal(&data["quota"])?,
-            used_quota_raw: raw_decimal(&data["used_quota"])?,
+            quota_raw: raw_decimal(&data["quota"])
+                .map_err(|e| e.with_reason(EventReason::QuotaInvalid))?,
+            used_quota_raw: raw_decimal(&data["used_quota"])
+                .map_err(|e| e.with_reason(EventReason::QuotaInvalid))?,
             fetched_at: now(),
         },
         username,

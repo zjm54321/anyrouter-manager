@@ -15,6 +15,8 @@ pub struct Config {
     pub state_path: PathBuf,
     pub checkin_state_path: Option<PathBuf>,
     pub request_log_path: Option<PathBuf>,
+    pub system_log_path: Option<PathBuf>,
+    pub log_settings_path: Option<PathBuf>,
     pub frontend_dir: PathBuf,
     pub browser_helper_dir: PathBuf,
     pub browser_helper_executable: Option<PathBuf>,
@@ -33,6 +35,8 @@ impl Default for Config {
             state_path: "data/account.json".into(),
             checkin_state_path: None,
             request_log_path: None,
+            system_log_path: None,
+            log_settings_path: None,
             frontend_dir: "frontend/dist".into(),
             browser_helper_dir: "tools/browser-helper".into(),
             browser_helper_executable: None,
@@ -53,6 +57,16 @@ impl Default for Config {
 }
 
 impl Config {
+    pub fn system_log_path(&self) -> PathBuf {
+        self.system_log_path
+            .clone()
+            .unwrap_or_else(|| self.state_path.with_file_name("system_logs.json"))
+    }
+    pub fn log_settings_path(&self) -> PathBuf {
+        self.log_settings_path
+            .clone()
+            .unwrap_or_else(|| self.state_path.with_file_name("log_settings.json"))
+    }
     pub fn request_log_path(&self) -> PathBuf {
         self.request_log_path
             .clone()
@@ -72,6 +86,8 @@ impl Config {
             config.state_path.clone(),
             config.checkin_path(),
             config.request_log_path(),
+            config.system_log_path(),
+            config.log_settings_path(),
         ] {
             if resolved_destination(&state)? == configuration {
                 return Err("State must not overwrite configuration.");
@@ -81,6 +97,18 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), &'static str> {
+        let mut destinations = HashSet::new();
+        for path in [
+            &self.state_path,
+            &self.checkin_path(),
+            &self.request_log_path(),
+            &self.system_log_path(),
+            &self.log_settings_path(),
+        ] {
+            if !destinations.insert(resolved_destination(path)?) {
+                return Err("All state and logging paths must be separate.");
+            }
+        }
         if resolved_destination(&self.checkin_path())? == resolved_destination(&self.state_path)? {
             return Err("Check-in state must be separate from account state.");
         }
@@ -213,6 +241,31 @@ impl RootAuth {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn system_paths_reject_all_aliases_including_symlinks() {
+        use super::*;
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            root_key: "Fake-Local-Root-51c7e8aa-2345-SufficientEntropy".into(),
+            state_path: directory.path().join("account.json"),
+            ..Default::default()
+        };
+        for target in [
+            config.state_path.clone(),
+            config.checkin_path(),
+            config.request_log_path(),
+            config.log_settings_path(),
+        ] {
+            config.system_log_path = Some(target);
+            assert!(config.validate().is_err());
+        }
+        config.system_log_path = None;
+        std::fs::write(&config.state_path, b"{}").unwrap();
+        let alias = directory.path().join("alias.json");
+        std::os::unix::fs::symlink(&config.state_path, &alias).unwrap();
+        config.log_settings_path = Some(alias);
+        assert!(config.validate().is_err());
+    }
     use super::*;
     #[test]
     fn state_aliases_rejected_before_files_exist() {

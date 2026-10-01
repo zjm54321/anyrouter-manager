@@ -50,12 +50,12 @@ class SessionInputTests(unittest.TestCase):
     def test_cookie_schema_and_size_bounds(self):
         base = session_input()
         good = base['cookies'][0]
-        invalid = [None, {}, [], [good]*129, [dict(good, value='a'*32768)],
+        invalid = [None, {}, [good]*129, [dict(good, value='a'*32768)],
                    [dict(good, value='a'*300)]*128]
         invalid += [[dict(good, **change)] for change in (
             {'domain':'evil.example'}, {'domain':'sub.anyrouter.top'}, {'domain':'.top'},
             {'name':'a;b'}, {'value':'a\nb'}, {'value':'a b'}, {'path':'bad'}, {'path':'/\x00'},
-            {'expires':time.time()-1}, {'expires':0}, {'expires':-0.5}, {'expires':float('nan')},
+            {'expires':None}, {'expires':-0.5}, {'expires':float('nan')},
             {'expires':float('inf')}, {'expires':10**400},
             {'expires':True}, {'secure':1}, {'http_only':'true'}, {'token':'private-sentinel'})]
         invalid += [[{k:v for k,v in good.items() if k != key}] for key in good]
@@ -67,6 +67,34 @@ class SessionInputTests(unittest.TestCase):
     def test_expired_output_cookies_filtered(self):
         cookies = [cookie(), dict(cookie(), expires=time.time()-1), dict(cookie(), expires=time.time()+100)]
         self.assertEqual(len(core.filtered_cookies(cookies, core.ORIGIN+'/console')), 2)
+
+    def test_persisted_expired_cookies_omitted_not_invalid(self):
+        base = session_input()
+        good = base['cookies'][0]
+        # Observed shape only: four cookies, three expired, one live. No real values.
+        cookies = [dict(good, name=f'expired{i}', expires=i) for i in range(3)]
+        future = dict(good, path='/api', domain='.anyrouter.top', secure=False,
+                      http_only=False, expires=time.time()+3600.5)
+        result = self.parse(dict(base, cookies=cookies+[future]))
+        expected = dict(future)
+        expected['httpOnly'] = expected.pop('http_only')
+        self.assertEqual(result.cookies, [expected])
+        self.assertEqual(len(self.parse(dict(base, cookies=cookies+[good])).cookies), 1)
+
+    def test_empty_or_expired_session_fixed_error(self):
+        base = session_input()
+        for cookies in ([], [dict(base['cookies'][0], expires=0)],
+                        [dict(base['cookies'][0], expires=time.time()-1)]):
+            with self.assertRaisesRegex(core.Failure, '^session_expired$'):
+                self.parse(dict(base, cookies=cookies))
+
+    def test_expiration_does_not_hide_invalid_cookie(self):
+        base = session_input()
+        for change in ({'value':'private\r\nsentinel'}, {'domain':'evil.example'},
+                       {'http_only':1}, {'extra':'private-sentinel'}, {'path':'/\x00'}):
+            invalid = dict(base['cookies'][0], expires=0, **change)
+            with self.assertRaisesRegex(core.Failure, '^invalid_input$'):
+                self.parse(dict(base, cookies=[invalid, base['cookies'][0]]))
 
     def test_strict_session_url_authority_and_paths(self):
         for suffix in (':443/console', '/%63onsole', '/api/%2fuser', '/a/../console', '//console', '/a\\b', '/console#x', '/console#'):
@@ -241,6 +269,28 @@ class SessionTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SessionProtocolTests(unittest.TestCase):
+    def test_real_entry_expired_and_valid_session_parse_only(self):
+        base = session_input()
+        good = base['cookies'][0]
+        for cookies, expected in (([], 'session_expired'),
+                                 ([dict(good, expires=0)], 'session_expired'),
+                                 ([dict(good, expires=0), good], 'browser_unavailable'),
+                                 ([dict(good, expires=time.time()+3600.5)], 'browser_unavailable'),
+                                 ([dict(good, expires=0, value='private\r\nsentinel'), good], 'invalid_input')):
+            # Real unmodified entry/module. Missing executable guarantees zero
+            # browser/network calls after parsing; no patched launcher or bypass.
+            process = subprocess.run([sys.executable, '-B', '-m', 'browser_helper'],
+                input=json.dumps(dict(base, cookies=cookies)).encode()+b'\n', cwd=ROOT,
+                env=dict(os.environ, CLOAKBROWSER_BINARY_PATH='', BROWSER_HELPER_DIAGNOSTICS='1'),
+                capture_output=True, timeout=10)
+            result = json.loads(process.stdout)
+            self.assertEqual(result['error'], expected)
+            self.assertEqual(process.returncode, 1)
+            self.assertEqual(process.stderr, b'')
+            self.assertEqual(process.stdout.count(b'\n'), 1)
+            self.assertNotIn(COOKIE_SECRET.encode(), process.stdout)
+            self.assertNotIn(b'private', process.stdout)
+
     def test_real_entry_session_failure_secret_suppression(self):
         script = '''
 import asyncio, runpy, sys

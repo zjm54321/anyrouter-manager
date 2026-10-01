@@ -8,6 +8,13 @@ state_path = "data/account.json"
 # checkin_state_path = "data/checkin.json"
 # Reserved independent state path; must differ from config/account/check-in paths.
 # request_log_path = "data/request_logs.json"
+# Separate typed system events and operator log preferences (0700 parent/0600 files).
+# Defaults alongside state_path; every path must differ from config and all state.
+# system_log_path = "data/system_logs.json"
+# log_settings_path = "data/log_settings.json"
+# /api/log-settings controls hot severity and both 1..90 day retention periods.
+# Default INFO/7/7. DEBUG/TRACE enables safe diagnostics for NEW login tasks only;
+# login_diagnostics below separately controls diagnostic metadata in API errors.
 frontend_dir = "frontend/dist"
 browser_helper_dir = "tools/browser-helper"
 # Opt-in container listener. Remote web origins require HTTPS and secure cookies.

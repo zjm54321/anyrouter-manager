@@ -1,7 +1,7 @@
 //! Conservative single-attempt check-in. UTC midnight is the fixed UTC+8 08:00 boundary.
 use crate::{
     app::{self, App},
-    error::{ApiError, SafeError},
+    error::{ApiError, ErrorSource, SafeError},
     model::{Credentials, Entry},
     upstream::{UPSTREAM, identifier},
 };
@@ -12,7 +12,6 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use chrono::{DateTime, NaiveDate, Utc};
-use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{path::Path, sync::Arc, time::Duration};
@@ -337,6 +336,14 @@ mod tests {
                         )
                         .into_response(),
                         2 => (StatusCode::INTERNAL_SERVER_ERROR, "oops").into_response(),
+                        7 => (
+                            StatusCode::BAD_REQUEST,
+                            [("content-encoding", "gzip")],
+                            crate::upstream_body::gzip(
+                                br#"{"success":false,"message":"\u4eca\u65e5\u5df2\u7b7e\u5230"}"#,
+                            ),
+                        )
+                            .into_response(),
                         _ => Json(json!({"success":true,"message":"签到成功"})).into_response(),
                     };
                 }
@@ -349,6 +356,27 @@ mod tests {
                     return (
                         StatusCode::FORBIDDEN,
                         "<html>cf-chl- challenge-platform</html>",
+                    )
+                        .into_response();
+                }
+                if (mode == 6 && n == 0) || mode == 8 {
+                    return (
+                        [("content-encoding", "gzip")],
+                        crate::upstream_body::gzip(b"<html><script>acw_sc__v2</script></html>"),
+                    )
+                        .into_response();
+                }
+                if mode == 9 {
+                    return (
+                        [("content-encoding", "gzip")],
+                        b"invalid-gzip-private-sentinel",
+                    )
+                        .into_response();
+                }
+                if mode >= 6 {
+                    return (
+                        [("content-encoding", "gzip")],
+                        crate::upstream_body::gzip(br#"{"success":true,"data":{"id":7}}"#),
                     )
                         .into_response();
                 }
@@ -411,6 +439,19 @@ mod tests {
             );
             assert_eq!(verifies.load(Ordering::SeqCst), usize::from(mode == 4));
             let status = app.checkin.lock().await.history[0].status;
+            if matches!(mode, 3 | 5) {
+                let accounts = app.accounts.lock().await;
+                let error = accounts.operation.as_ref().unwrap().error.as_ref().unwrap();
+                assert_eq!(
+                    error.code,
+                    if mode == 3 {
+                        "upstream_session_expired"
+                    } else {
+                        "checkin_preflight_failed"
+                    }
+                );
+                assert!(matches!(error.source, Some(ErrorSource::SelfAccount)));
+            }
             assert!(
                 status
                     == match mode {
@@ -447,6 +488,97 @@ mod tests {
                     .status(),
                 StatusCode::NO_CONTENT
             );
+            app.shutdown().await;
+            server.abort();
+        }
+    }
+
+    #[test]
+    fn already_done_requires_exact_structured_message_and_appropriate_status() {
+        for message in [
+            "今日已签到",
+            "今天已签到",
+            "您今天已经签到过了",
+            "今日已经签到",
+            " 今日已签到 ",
+        ] {
+            for status in [StatusCode::OK, StatusCode::BAD_REQUEST] {
+                assert!(
+                    parse_result(status, &json!({"success":false,"message":message})).unwrap()
+                        == Status::AlreadyDone
+                );
+            }
+        }
+        for (status, value) in [
+            (
+                StatusCode::OK,
+                json!({"success":false,"message":"签到失败"}),
+            ),
+            (
+                StatusCode::OK,
+                json!({"success":false,"message":"今日已签到 private-sentinel"}),
+            ),
+            (
+                StatusCode::OK,
+                json!({"success":"false","message":"今日已签到"}),
+            ),
+            (StatusCode::OK, json!({"message":"今日已签到"})),
+            (
+                StatusCode::FORBIDDEN,
+                json!({"success":false,"message":"今日已签到"}),
+            ),
+            (StatusCode::INTERNAL_SERVER_ERROR, json!({"success":true})),
+        ] {
+            let error = parse_result(status, &value).err().unwrap();
+            assert_eq!(error.code, "checkin_outcome_unknown");
+            assert!(!serde_json::to_string(&error).unwrap().contains("sentinel"));
+        }
+    }
+
+    #[tokio::test]
+    async fn gzip_preflight_bounded_browser_and_already_done_keep_record_classification() {
+        for mode in 6..10 {
+            let (app, posts, verifies, _dir, server) = fixture(mode).await;
+            start(&app, Trigger::Manual, false, fixed()).await.unwrap();
+            settled(&app).await;
+            assert_eq!(posts.load(Ordering::SeqCst), usize::from(mode < 8));
+            assert_eq!(
+                verifies.load(Ordering::SeqCst),
+                usize::from(matches!(mode, 6 | 8))
+            );
+            let expected = match mode {
+                6 => Status::Success,
+                7 => Status::AlreadyDone,
+                _ => Status::Failed,
+            };
+            assert!(app.checkin.lock().await.history[0].status == expected);
+            let error = app
+                .accounts
+                .lock()
+                .await
+                .operation
+                .as_ref()
+                .unwrap()
+                .error
+                .clone();
+            if mode < 8 {
+                assert!(error.is_none());
+                assert_eq!(
+                    start(&app, Trigger::Manual, false, fixed())
+                        .await
+                        .unwrap()
+                        .status(),
+                    StatusCode::OK
+                );
+                assert_eq!(posts.load(Ordering::SeqCst), 1);
+            } else {
+                let error = error.unwrap();
+                assert_eq!(error.code, "checkin_preflight_failed");
+                assert!(matches!(
+                    error.stage,
+                    Some(crate::system_log::EventStage::CheckinPreflight)
+                ));
+            }
             app.shutdown().await;
             server.abort();
         }
@@ -547,7 +679,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn panicking_preflight_provider_finishes_unknown_without_retry() {
+    async fn panicking_preflight_provider_finishes_failed_without_automatic_retry() {
         struct PanicProvider;
         #[async_trait::async_trait]
         impl LoginProvider for PanicProvider {
@@ -571,13 +703,13 @@ mod tests {
             app.accounts.lock().await.operation.as_ref().unwrap().status,
             "failed"
         );
-        assert!(app.checkin.lock().await.history[0].status == Status::Unknown);
+        assert!(app.checkin.lock().await.history[0].status == Status::Failed);
         assert!(
             load_at(&app.config.checkin_path(), fixed())
                 .unwrap()
                 .history[0]
                 .status
-                == Status::Unknown
+                == Status::Failed
         );
         assert_eq!(
             start(&app, Trigger::Scheduled, false, fixed())
@@ -587,12 +719,17 @@ mod tests {
             StatusCode::NO_CONTENT
         );
         assert_eq!(
-            start(&app, Trigger::Manual, false, fixed())
+            app.accounts
+                .lock()
                 .await
-                .unwrap_err()
-                .1
+                .operation
+                .as_ref()
+                .unwrap()
+                .error
+                .as_ref()
+                .unwrap()
                 .code,
-            "checkin_retry_confirmation_required"
+            "checkin_preflight_failed"
         );
         assert_eq!(posts.load(Ordering::SeqCst), 0);
         app.shutdown().await;
@@ -1283,8 +1420,18 @@ async fn start_account(
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     *saved = updated;
     let response = app::start_for(&mut accounts, "checkin", "checking_in", Some(id.into()));
+    drop(saved);
+    drop(accounts);
+    let context = app.operation_context().await;
     let worker = app.clone();
-    app.spawn_job(async move {
+    app.spawn_operation(context, async move {
+        crate::logging::emit(
+            crate::log_settings::LogLevel::Info,
+            crate::system_log::EventKind::CheckinStart,
+            crate::system_log::EventStage::Checkin,
+            None,
+            None,
+        );
         execute(&worker, active, record).await;
     });
     Ok(response)
@@ -1335,7 +1482,35 @@ async fn start(
         .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "not_found"))?;
     start_account(app, &id, trigger, confirm, now).await
 }
-async fn request(app: &App, credentials: &Credentials, post: bool) -> Result<Value, SafeError> {
+async fn request(
+    app: &App,
+    credentials: &Credentials,
+    post: bool,
+) -> Result<Option<Status>, SafeError> {
+    use crate::system_log::{EventReason, EventStage};
+    let stage = if post {
+        EventStage::Checkin
+    } else {
+        EventStage::CheckinPreflight
+    };
+    let result = request_inner(app, credentials, post, stage).await;
+    result.map_err(|mut e| {
+        e.stage = Some(stage);
+        if !post {
+            e.source = Some(ErrorSource::SelfAccount);
+        }
+        if e.reason.is_none() && e.code == "upstream_unexpected_response" {
+            e.reason = Some(EventReason::SchemaInvalid);
+        }
+        e
+    })
+}
+async fn request_inner(
+    app: &App,
+    credentials: &Credentials,
+    post: bool,
+    stage: crate::system_log::EventStage,
+) -> Result<Option<Status>, SafeError> {
     let path = if post {
         "/api/user/sign_in"
     } else {
@@ -1359,35 +1534,67 @@ async fn request(app: &App, credentials: &Credentials, post: bool) -> Result<Val
         .header("X-Requested-With", "XMLHttpRequest")
         .send()
         .await
-        .map_err(|_| SafeError::new("upstream_unavailable"))?;
+        .map_err(|e| {
+            SafeError::new(if e.is_timeout() {
+                "upstream_timeout"
+            } else {
+                "upstream_unavailable"
+            })
+        })?;
     let status = response.status();
-    let mut bytes = Vec::new();
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|_| SafeError::new("upstream_unavailable"))?;
-        if bytes.len() + chunk.len() > 256 * 1024 {
-            return Err(SafeError::new("upstream_unexpected_response"));
-        }
-        bytes.extend_from_slice(&chunk);
+    crate::logging::emit(
+        crate::log_settings::LogLevel::Debug,
+        if post {
+            crate::system_log::EventKind::CheckinStart
+        } else {
+            crate::system_log::EventKind::StorageRead
+        },
+        stage,
+        None,
+        Some(status.as_u16()),
+    );
+    let (_, value) = crate::upstream_body::json(response)
+        .await
+        .map_err(|e| e.at(stage, Some(status.as_u16())))?;
+    if post {
+        return parse_result(status, &value)
+            .map(Some)
+            .map_err(|e| e.at(stage, Some(status.as_u16())));
     }
-    if !post && crate::hybrid::recognized_waf(&bytes) && !status.is_server_error() {
-        return Err(SafeError::new("upstream_challenge"));
+    let data = crate::upstream_body::data(status, value)
+        .map_err(|e| e.at(stage, Some(status.as_u16())))?;
+    if !identifier(&data["id"]).is_ok_and(|id| id == credentials.api_user) {
+        return Err(SafeError::new("upstream_session_unverified").at(stage, Some(status.as_u16())));
     }
-    if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
-        return Err(SafeError::new("upstream_session_expired"));
-    }
-    let value: Value = serde_json::from_slice(&bytes)
-        .map_err(|_| SafeError::new("upstream_unexpected_response"))?;
-    if !status.is_success()
-        || !value.is_object()
-        || value.get("success").and_then(Value::as_bool) != Some(true)
+    Ok(None)
+}
+
+fn parse_result(status: StatusCode, value: &Value) -> Result<Status, SafeError> {
+    if status.is_success()
+        && value.is_object()
+        && value.get("success").and_then(Value::as_bool) == Some(true)
     {
-        return Err(SafeError::new("upstream_unexpected_response"));
+        return Ok(Status::Success);
     }
-    if !post && identifier(&value["data"]["id"])? != credentials.api_user {
-        return Err(SafeError::new("upstream_session_unverified"));
+    // Conservative exact compatibility phrases, not evidence from a live response.
+    // No substring matching, translation guessing, or acceptance of a generic failure.
+    if (status.is_success() || status == StatusCode::BAD_REQUEST)
+        && value.is_object()
+        && value.get("success").and_then(Value::as_bool) == Some(false)
+        && value
+            .get("message")
+            .and_then(Value::as_str)
+            .is_some_and(|message| {
+                matches!(
+                    message.trim(),
+                    "今日已签到" | "今天已签到" | "您今天已经签到过了" | "今日已经签到"
+                )
+            })
+    {
+        return Ok(Status::AlreadyDone);
     }
-    Ok(value)
+    Err(SafeError::new("checkin_outcome_unknown")
+        .with_reason(crate::system_log::EventReason::OutcomeUnknown))
 }
 async fn execute(app: &App, active: Arc<Entry>, mut record: Record) {
     use futures_util::FutureExt;
@@ -1403,7 +1610,11 @@ async fn execute(app: &App, active: Arc<Entry>, mut record: Record) {
                         credentials,
                         deadline.saturating_duration_since(tokio::time::Instant::now()),
                     )
-                    .await?;
+                    .await
+                    .map_err(|e| {
+                        e.with_source(ErrorSource::Helper)
+                            .at(crate::system_log::EventStage::CheckinPreflight, None)
+                    })?;
                 if credentials.api_user != active.upstream_user_id || !credentials.validate() {
                     return Err(SafeError::new("upstream_session_unverified"));
                 }
@@ -1429,35 +1640,37 @@ async fn execute(app: &App, active: Arc<Entry>, mut record: Record) {
             Ok(_) => {}
         }
         post_started = true;
-        request(app, &credentials, true).await?;
-        Ok(())
+        request(app, &credentials, true)
+            .await
+            .map(|status| status.expect("POST result"))
     }))
     .catch_unwind()
     .await;
-    let panicked = outcome.is_err();
     let result = outcome
         .unwrap_or_else(|_| Ok(Err(SafeError::new("checkin_outcome_unknown"))))
         .unwrap_or_else(|_| Err(SafeError::new("upstream_timeout")));
     let now = (app.checkin_clock)();
     record.finished_at = Some(now.to_rfc3339());
-    record.status = if result.is_ok() {
-        Status::Success
-    } else if post_started || panicked {
+    record.status = if let Ok(status) = &result {
+        *status
+    } else if post_started {
         Status::Unknown
     } else {
         Status::Failed
     };
     record.code = result.as_ref().err().map(|e| {
-        if post_started || panicked {
+        if post_started {
             Code::OutcomeUnknown
         } else if e.code == "upstream_session_expired" {
             Code::SessionExpired
+        } else if e.code == "persistence_failed" {
+            Code::PersistenceFailed
         } else {
             Code::PreflightFailed
         }
     });
     let mut saved = app.checkin.lock().await;
-    if (post_started || panicked) && record.date != cycle(now) {
+    if post_started && record.date != cycle(now) {
         record.status = Status::Unknown;
         record.code = Some(Code::CycleAmbiguous);
         let mut blocked = record.clone();
@@ -1484,16 +1697,62 @@ async fn execute(app: &App, active: Arc<Entry>, mut record: Record) {
         }
     }
     drop(saved);
-    app.finish(if record.status == Status::Success {
+    let completed = matches!(record.status, Status::Success | Status::AlreadyDone);
+    let operation_result = if completed {
         Ok(())
     } else {
-        Err(SafeError::new(if persisted.is_err() {
-            "persistence_failed"
+        let code = match record.code {
+            Some(Code::SessionExpired) => "upstream_session_expired",
+            Some(Code::PreflightFailed) => "checkin_preflight_failed",
+            Some(Code::PersistenceFailed) => "persistence_failed",
+            Some(Code::CycleAmbiguous) => "checkin_cycle_ambiguous",
+            _ => "checkin_outcome_unknown",
+        };
+        let mut error = SafeError::new(code);
+        if code == "persistence_failed" {
+            error.source = Some(ErrorSource::Persistence);
+        } else if !post_started {
+            if let Err(cause) = &result {
+                error.source = cause.source;
+                error.stage = cause.stage;
+                error.reason = cause.reason;
+                error.http_status = cause.http_status;
+            }
+            error
+                .stage
+                .get_or_insert(crate::system_log::EventStage::CheckinPreflight);
         } else {
-            "checkin_outcome_unknown"
-        }))
-    })
-    .await;
+            error.stage = Some(crate::system_log::EventStage::Checkin);
+            error.http_status = result.as_ref().err().and_then(|cause| cause.http_status);
+        }
+        Err(error)
+    };
+    let (stage, reason) = operation_result
+        .as_ref()
+        .err()
+        .map(SafeError::log_context)
+        .unwrap_or((
+            crate::system_log::EventStage::Checkin,
+            if record.status == Status::AlreadyDone {
+                crate::system_log::EventReason::AlreadyDone
+            } else {
+                crate::system_log::EventReason::Success
+            },
+        ));
+    crate::logging::emit(
+        if persisted.is_err() {
+            crate::log_settings::LogLevel::Error
+        } else if completed {
+            crate::log_settings::LogLevel::Info
+        } else {
+            crate::log_settings::LogLevel::Warn
+        },
+        crate::system_log::EventKind::CheckinFinish,
+        stage,
+        Some(reason),
+        operation_result.as_ref().err().and_then(|e| e.http_status),
+    );
+    app.finish(operation_result).await;
 }
 
 fn save_result(app: &App, saved: &Saved) -> Result<(), SafeError> {

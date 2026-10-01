@@ -29,6 +29,8 @@ use tower::ServiceExt;
 
 #[path = "gateway_tests.rs"]
 mod gateway_tests;
+#[path = "refresh_tests.rs"]
+mod refresh_tests;
 
 const ROOT: &str = "Test-Only-Root-91c7e8aa-2345-SufficientEntropy";
 const KEY: &str = "exact-token-no-invented-prefix";
@@ -1589,7 +1591,7 @@ async fn upstream_challenge_unexpected_shapes_and_key_bounds() {
     for (mode, expected) in [
         ("challenge", "upstream_challenge"),
         ("html", "upstream_unexpected_response"),
-        ("wrong-id", "upstream_unexpected_response"),
+        ("wrong-id", "upstream_session_unverified"),
         ("empty", "ok"),
         ("bad-shape", "upstream_unexpected_response"),
         ("too-many", "too_many_keys"),

@@ -7,7 +7,7 @@ import os
 import signal
 import sys
 
-from .core import Failure, MAX_INPUT_BYTES, failure_result, parse_input, run_login
+from .core import CLEANUP_SECONDS, Failure, MAX_INPUT_BYTES, failure_result, parse_input, run_login
 
 
 class Discard:
@@ -64,14 +64,34 @@ def read_request(stream):
 
 def main(protocol_fd):
     result = failure_result('login_failed')
+    state = {'phase': 'launch'}
+    previous = signal.getsignal(signal.SIGALRM)
+
+    def expired(signum, frame):
+        # Last-resort process deadline also covers synchronous wrapper startup
+        # and asyncio teardown. One fixed-schema final result, never progress
+        # logs. The Rust lifecycle owner still kills/reaps all descendants.
+        state['exception'] = 'timeout'
+        payload = failure_result('timeout', state)
+        try:
+            write_all(protocol_fd, (json.dumps(payload, ensure_ascii=True, allow_nan=False,
+                      separators=(',', ':')) + '\n').encode('ascii'))
+        finally:
+            os._exit(1)
+
     try:
         credentials = read_request(sys.stdin.buffer)
-        result = asyncio.run(run_login(credentials))
+        signal.signal(signal.SIGALRM, expired)
+        signal.setitimer(signal.ITIMER_REAL, credentials.timeout_ms / 1000 + CLEANUP_SECONDS + 0.25)
+        result = asyncio.run(run_login(credentials, state))
     except Failure as exc:
-        result = failure_result(str(exc))
+        result = failure_result(str(exc), state)
     except (KeyboardInterrupt, Exception):
         # Do not propagate wrapper/browser exception strings or tracebacks.
-        pass
+        result = failure_result('login_failed', state)
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
     write_all(protocol_fd, (json.dumps(result, ensure_ascii=True, allow_nan=False, separators=(',', ':')) + '\n').encode('ascii'))
     return 0 if result['ok'] else 1
 

@@ -6,13 +6,22 @@ mod error;
 mod gateway;
 mod helper;
 mod hybrid;
+mod log_api;
+mod log_settings;
+mod logging;
 mod model;
 mod model_filter;
 mod request_log;
 mod store;
 mod supervisor;
+mod system_log;
 mod upstream;
+mod upstream_body;
 
+#[cfg(test)]
+mod live_probe;
+#[cfg(test)]
+mod logging_tests;
 #[cfg(test)]
 mod tests;
 
@@ -41,6 +50,15 @@ async fn run() -> Result<(), &'static str> {
         return Err("Usage: backend [--config PATH]");
     }
     let config = config::Config::load(&path)?;
+    let preferences = log_settings::SharedLogSettings::open(config.log_settings_path()).await?;
+    let system =
+        system_log::SystemLogSink::open(config.system_log_path(), preferences.clone()).await?;
+    system.flush().await?;
+    use tracing_subscriber::prelude::*;
+    tracing::subscriber::set_global_default(
+        tracing_subscriber::registry().with(system_log::SystemLogLayer::new(system.clone())),
+    )
+    .map_err(|_| "Cannot initialize system logging.")?;
     let active = store::load(&config.state_path)?;
     let browser = Arc::new(helper::BrowserLogin {
         directory: config.browser_helper_dir.clone(),
@@ -56,13 +74,24 @@ async fn run() -> Result<(), &'static str> {
     let upstream =
         upstream::Upstream::production().map_err(|_| "Cannot initialize upstream transport.")?;
     let bind = config.bind;
-    let logs = request_log::LogSink::open(config.request_log_path())
-        .await
-        .map_err(|_| "Cannot initialize private request log.")?;
+    let logs = request_log::LogSink::open_with_retention_days(
+        config.request_log_path(),
+        preferences.snapshot().request_retention_days as u8,
+    )
+    .await
+    .map_err(|_| "Cannot initialize private request log.")?;
     logs.flush()
         .await
         .map_err(|_| "Cannot initialize private request log.")?;
-    let app = app::App::new_with_logs(config, active, upstream, login, Some(logs));
+    let app = app::App::new_with_system_logs(
+        config,
+        active,
+        upstream,
+        login,
+        Some(logs),
+        Some(preferences),
+        Some(system),
+    );
     *app.checkin.lock().await = checkin::load(&app.config.checkin_path())?;
     {
         let accounts = app.accounts.lock().await;
@@ -83,6 +112,10 @@ async fn run() -> Result<(), &'static str> {
         .map_err(|_| "Cannot bind local server.")?;
     checkin::scheduler(&app);
     println!("AnyRouter Manager listening at http://{bind}");
+    let _ = system_log::emit_tracing(&system_log::SystemEvent::new(
+        log_settings::LogLevel::Info,
+        system_log::EventKind::AppStartup,
+    ));
     serve_runtime(app, listener).await
 }
 

@@ -26,6 +26,13 @@ pub struct SafeError {
     pub source: Option<ErrorSource>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub diagnostics: Option<LoginDiagnostics>,
+    // Internal typed failure context: never includes the response body or parameters.
+    #[serde(skip)]
+    pub stage: Option<crate::system_log::EventStage>,
+    #[serde(skip)]
+    pub reason: Option<crate::system_log::EventReason>,
+    #[serde(skip)]
+    pub http_status: Option<u16>,
 }
 
 impl SafeError {
@@ -40,6 +47,8 @@ impl SafeError {
             "invalid_credentials" => "The upstream explicitly rejected the login credentials.",
             "upstream_challenge" => "The upstream browser challenge could not be completed.",
             "upstream_session_expired" => "The upstream session is no longer valid.",
+            "checkin_preflight_failed" => "签到前会话检查失败，未发送签到请求。",
+            "checkin_cycle_ambiguous" => "签到跨越周期边界，结果需要确认。",
             "upstream_unavailable" => "The upstream service is unavailable.",
             "login_form_unavailable" => "未能识别上游登录表单，未确认账号凭据是否有效。",
             "upstream_session_unverified" => "未能验证上游登录会话与账号身份。",
@@ -71,12 +80,58 @@ impl SafeError {
             message,
             source: None,
             diagnostics: None,
+            stage: None,
+            reason: None,
+            http_status: None,
         }
     }
 
     pub fn with_source(mut self, source: ErrorSource) -> Self {
         self.source = Some(source);
         self
+    }
+
+    pub fn with_reason(mut self, reason: crate::system_log::EventReason) -> Self {
+        self.reason = Some(reason);
+        self
+    }
+
+    pub fn at(mut self, stage: crate::system_log::EventStage, status: Option<u16>) -> Self {
+        self.stage = Some(stage);
+        self.http_status = status;
+        self
+    }
+
+    pub fn log_context(
+        &self,
+    ) -> (
+        crate::system_log::EventStage,
+        crate::system_log::EventReason,
+    ) {
+        use crate::system_log::{EventReason as R, EventStage as S};
+        let stage = self.stage.unwrap_or(match self.source {
+            Some(ErrorSource::SelfAccount) => S::SelfAccount,
+            Some(ErrorSource::Tokens) => S::Tokens,
+            Some(ErrorSource::Key) => S::Key,
+            Some(ErrorSource::Persistence) => S::Storage,
+            Some(ErrorSource::Credentials) => S::HttpLogin,
+            Some(ErrorSource::Helper) => S::HelperResult,
+            None => S::Admission,
+        });
+        let reason = self.reason.unwrap_or(match self.code {
+            "upstream_timeout" => R::DeadlineExpired,
+            "upstream_challenge" => R::KnownChallenge,
+            "upstream_session_expired" => R::SessionExpired,
+            "upstream_session_unverified" => R::IdentityMismatch,
+            "upstream_unavailable" => R::NetworkFailure,
+            "persistence_failed" => R::StorageUnavailable,
+            "checkin_preflight_failed" => R::PreflightFailed,
+            "checkin_outcome_unknown" | "checkin_cycle_ambiguous" => R::OutcomeUnknown,
+            "invalid_credentials" | "upstream_login_failed" => R::AuthenticationRejected,
+            _ if matches!(self.source, Some(ErrorSource::Helper)) => R::HelperFailed,
+            _ => R::UnsupportedResponse,
+        });
+        (stage, reason)
     }
 }
 

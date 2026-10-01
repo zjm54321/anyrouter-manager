@@ -7,7 +7,6 @@ use crate::{
     upstream::{UPSTREAM, USER_AGENT, identifier, profile_data},
 };
 use async_trait::async_trait;
-use futures_util::StreamExt;
 use reqwest_cookie_store::{CookieStore, CookieStoreMutex};
 use serde_json::Value;
 use std::{sync::Arc, time::Duration};
@@ -28,9 +27,21 @@ impl HybridLoginProvider {
     }
 
     async fn attempt(&self, username: String, password: String) -> Result<LoginOutcome, SafeError> {
+        use crate::{
+            log_settings::LogLevel,
+            system_log::{EventKind, EventReason, EventStage},
+        };
+        crate::logging::emit(
+            LogLevel::Debug,
+            EventKind::HttpLogin,
+            EventStage::HttpLogin,
+            None,
+            None,
+        );
         let deadline = tokio::time::Instant::now() + self.timeout;
         let jar = Arc::new(CookieStoreMutex::new(CookieStore::default()));
         let client = reqwest::Client::builder()
+            .retry(reqwest::retry::never())
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(15))
             .user_agent(USER_AGENT)
@@ -44,6 +55,13 @@ impl HybridLoginProvider {
             .await
             .map_err(transport)?;
         let status = response.status();
+        crate::logging::emit(
+            LogLevel::Debug,
+            EventKind::HttpLogin,
+            EventStage::HttpLogin,
+            None,
+            Some(status.as_u16()),
+        );
         let bytes = bounded(response).await?;
         // JSON refusals, network errors, redirects and 5xx never trigger Chrome.
         if status.is_redirection() || status.is_server_error() {
@@ -52,6 +70,13 @@ impl HybridLoginProvider {
         let value: Value = match serde_json::from_slice(&bytes) {
             Ok(value) => value,
             Err(_) if recognized_waf(&bytes) => {
+                crate::logging::emit(
+                    LogLevel::Info,
+                    EventKind::BrowserWait,
+                    EventStage::BrowserWait,
+                    Some(EventReason::UnsupportedResponse),
+                    Some(status.as_u16()),
+                );
                 let budget = deadline
                     .saturating_duration_since(tokio::time::Instant::now())
                     .saturating_sub(Duration::from_millis(250));
@@ -132,25 +157,11 @@ impl LoginProvider for HybridLoginProvider {
 }
 
 async fn bounded(response: reqwest::Response) -> Result<Vec<u8>, SafeError> {
-    let mut bytes = Vec::new();
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(transport)?;
-        if bytes.len() + chunk.len() > 256 * 1024 {
-            return Err(unexpected());
-        }
-        bytes.extend_from_slice(&chunk);
-    }
-    Ok(bytes)
+    crate::upstream_body::bounded(response, 256 * 1024).await
 }
 
 pub(crate) fn recognized_waf(bytes: &[u8]) -> bool {
-    let text = String::from_utf8_lossy(bytes).to_ascii_lowercase();
-    (text.contains("<html") || text.contains("<!doctype html") || text.contains("<script"))
-        && (text.contains("acw_sc__v2")
-            || (text.contains("checking your browser") && text.contains("<script"))
-            || text.contains("cf-chl-")
-            || text.contains("challenge-platform"))
+    crate::upstream_body::recognized_waf(bytes)
 }
 
 fn extract(jar: &CookieStoreMutex, user: &str, base: &str) -> Result<Credentials, SafeError> {
@@ -272,6 +283,24 @@ mod tests {
             .into_response(),
             "unknown" => "<html><script>unknown page</script></html>".into_response(),
             "waf" => "<html><script>acw_sc__v2</script></html>".into_response(),
+            "gzip_waf" | "gzip_unknown" | "gzip_false" | "gzip_server" | "gzip_redirect" => {
+                let body = match s.mode {
+                    "gzip_unknown" => "<html><script>unknown page</script></html>",
+                    "gzip_false" => r#"{"success":false,"message":"local-fake-password"}"#,
+                    _ => "<html><script>acw_sc__v2</script></html>",
+                };
+                let status = match s.mode {
+                    "gzip_server" => StatusCode::BAD_GATEWAY,
+                    "gzip_redirect" => StatusCode::FOUND,
+                    _ => StatusCode::OK,
+                };
+                (
+                    status,
+                    [(header::CONTENT_ENCODING, "gzip")],
+                    crate::upstream_body::gzip(body.as_bytes()),
+                )
+                    .into_response()
+            }
             "redirect" => (
                 StatusCode::FOUND,
                 [(header::LOCATION, "/api/user/self")],
@@ -286,6 +315,13 @@ mod tests {
             _ => {
                 let mut r =
                     axum::Json(serde_json::json!({"success":true,"data":{"id":7}})).into_response();
+                if s.mode == "gzip_ok" {
+                    *r.body_mut() = axum::body::Body::from(crate::upstream_body::gzip(
+                        br#"{"success":true,"data":{"id":7}}"#,
+                    ));
+                    r.headers_mut()
+                        .insert(header::CONTENT_ENCODING, "gzip".parse().unwrap());
+                }
                 for c in [
                     "session=local-fake-session; Path=/; HttpOnly",
                     "scoped=local-fake-scoped; Path=/api/user",
@@ -311,6 +347,13 @@ mod tests {
             assert!(!cookie.contains(name));
         }
         let mut r = axum::Json(serde_json::json!({"success":true,"data":{"id":if s.mode == "mismatch" {8} else {7},"username":"confirmed-local-user","quota":"123","used_quota":4}})).into_response();
+        if s.mode == "gzip_ok" {
+            *r.body_mut() = axum::body::Body::from(crate::upstream_body::gzip(
+                br#"{"success":true,"data":{"id":7,"username":"confirmed-local-user","quota":"123","used_quota":4}}"#,
+            ));
+            r.headers_mut()
+                .insert(header::CONTENT_ENCODING, "gzip".parse().unwrap());
+        }
         r.headers_mut().append(
             header::SET_COOKIE,
             "deleted=; Max-Age=0; Path=/".parse().unwrap(),
@@ -328,9 +371,15 @@ mod tests {
     async fn http_first_fallback_allowlist_and_fresh_cookie_jar() {
         for (mode, expected, browser_count, profile_count) in [
             ("ok", None, 0, 1),
+            ("gzip_ok", None, 0, 1),
             ("false", Some("upstream_login_failed"), 0, 0),
             ("unknown", Some("upstream_unexpected_response"), 0, 0),
             ("waf", None, 1, 0),
+            ("gzip_waf", None, 1, 0),
+            ("gzip_unknown", Some("upstream_unexpected_response"), 0, 0),
+            ("gzip_false", Some("upstream_login_failed"), 0, 0),
+            ("gzip_server", Some("upstream_unavailable"), 0, 0),
+            ("gzip_redirect", Some("upstream_unavailable"), 0, 0),
             ("redirect", Some("upstream_unavailable"), 0, 0),
             ("server", Some("upstream_unavailable"), 0, 0),
             ("large", Some("upstream_unexpected_response"), 0, 0),
@@ -375,7 +424,7 @@ mod tests {
                     }
                     (Ok(outcome), None) => {
                         assert!(outcome.credentials.validate());
-                        if mode == "ok" {
+                        if matches!(mode, "ok" | "gzip_ok") {
                             let profile = outcome.profile.unwrap();
                             assert_eq!(profile.1.as_deref(), Some("confirmed-local-user"));
                             assert_eq!(profile.0.quota_raw, "123");

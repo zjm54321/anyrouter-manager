@@ -21,6 +21,7 @@ struct LoggedStream {
     inner: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
     pending: Option<(LogEntry, ErrorBodyCapture)>,
     sink: Option<LogSink>,
+    generation: u64,
 }
 impl LoggedStream {
     fn finish(&mut self, incomplete: bool) {
@@ -30,7 +31,7 @@ impl LoggedStream {
             }
             entry.set_response(entry.http_status, capture);
             if let Some(sink) = &self.sink {
-                sink.try_enqueue(entry);
+                sink.try_enqueue_for(self.generation, entry);
             }
         }
     }
@@ -58,14 +59,15 @@ impl Drop for LoggedStream {
     }
 }
 
-fn enqueue(sink: &Option<LogSink>, entry: LogEntry) {
+fn enqueue(sink: &Option<LogSink>, generation: u64, entry: LogEntry) {
     if let Some(sink) = sink {
-        sink.try_enqueue(entry);
+        sink.try_enqueue_for(generation, entry);
     }
 }
 
 pub async fn proxy(State(app): State<Arc<App>>, request: Request) -> Result<Response, ApiError> {
     require_root(&app, request.headers())?;
+    let generation = app.logs.as_ref().map_or(0, LogSink::generation);
     let (active, mut entry) = {
         let accounts = app.accounts.lock().await;
         let route = accounts.portfolio.route();
@@ -78,7 +80,7 @@ pub async fn proxy(State(app): State<Arc<App>>, request: Request) -> Result<Resp
         )
     };
     let Some(active) = active else {
-        enqueue(&app.logs, entry);
+        enqueue(&app.logs, generation, entry);
         return Err(ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "account_not_configured",
@@ -119,7 +121,7 @@ pub async fn proxy(State(app): State<Arc<App>>, request: Request) -> Result<Resp
     let upstream = match upstream {
         Ok(upstream) => upstream,
         Err(_) => {
-            enqueue(&app.logs, entry);
+            enqueue(&app.logs, generation, entry);
             return Err(ApiError::new(
                 StatusCode::BAD_GATEWAY,
                 "upstream_unavailable",
@@ -132,7 +134,7 @@ pub async fn proxy(State(app): State<Arc<App>>, request: Request) -> Result<Resp
     let pending = if capture.enabled() {
         Some((entry, capture))
     } else {
-        enqueue(&app.logs, entry);
+        enqueue(&app.logs, generation, entry);
         None
     };
     let mut headers = upstream.headers().clone();
@@ -201,6 +203,7 @@ pub async fn proxy(State(app): State<Arc<App>>, request: Request) -> Result<Resp
             inner: Box::pin(upstream.bytes_stream()),
             pending,
             sink: app.logs.clone(),
+            generation,
         })
     };
     let mut response = Response::new(body);

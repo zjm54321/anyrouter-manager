@@ -29,6 +29,33 @@ pub struct LoginDiagnostics {
     exception: Exception,
 }
 
+impl LoginDiagnostics {
+    // Conservative last-known launcher phase if no Python result arrived.
+    // False flags mean no observed evidence, NOT proof Chrome never started.
+    pub(crate) fn launch_timeout() -> Self {
+        Self {
+            version: Version,
+            phase: Phase::Launch,
+            page: Page::Other,
+            login_requested: false,
+            login_status: None,
+            login_json: false,
+            login_success: None,
+            self_requested: false,
+            self_status: None,
+            self_json: false,
+            self_success: None,
+            self_id_type: IdType::Absent,
+            self_id_valid: false,
+            self_user_header_present: false,
+            user_state_ready: false,
+            pending_login: false,
+            failure_request: FailureRequest::None,
+            exception: Exception::Timeout,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(try_from = "u8", into = "u8")]
 struct Version;

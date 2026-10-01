@@ -9,7 +9,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
 };
 use tokio::sync::{mpsc, oneshot};
@@ -149,6 +149,14 @@ impl Default for Store {
     }
 }
 impl Store {
+    fn prune(&mut self, days: u8, now: chrono::DateTime<chrono::Utc>) {
+        let cutoff = now - chrono::Duration::days(i64::from(days));
+        let before = self.items.len();
+        self.items.retain(|entry| {
+            chrono::DateTime::parse_from_rfc3339(&entry.timestamp).is_ok_and(|time| time >= cutoff)
+        });
+        self.add_dropped((before - self.items.len()) as u64);
+    }
     fn add_dropped(&mut self, count: u64) {
         self.dropped_count = self.dropped_count.saturating_add(count);
     }
@@ -238,6 +246,13 @@ fn load(path: &Path) -> Result<Store, &'static str> {
     Ok(store)
 }
 fn persist(path: &Path, store: &Store) -> Result<(), &'static str> {
+    persist_before_rename(path, store, || Ok(()))
+}
+fn persist_before_rename(
+    path: &Path,
+    store: &Store,
+    before_rename: impl FnOnce() -> std::io::Result<()>,
+) -> Result<(), &'static str> {
     let directory = parent(path)?;
     if !directory.exists() {
         DirBuilder::new()
@@ -268,6 +283,7 @@ fn persist(path: &Path, store: &Store) -> Result<(), &'static str> {
         file.sync_all()?;
         let dir = File::open(directory)?;
         dir.sync_all()?;
+        before_rename()?;
         fs::rename(&tmp, path)?;
         let _ = dir.sync_all();
         Ok(())
@@ -277,8 +293,10 @@ fn persist(path: &Path, store: &Store) -> Result<(), &'static str> {
 }
 
 enum Message {
-    Append(LogEntry, usize),
+    Append(LogEntry, usize, u64),
     Barrier(oneshot::Sender<Result<(), &'static str>>, bool),
+    Clear(oneshot::Sender<Result<(), &'static str>>),
+    Prune,
 }
 struct Pending {
     closed: bool,
@@ -289,6 +307,11 @@ struct Shared {
     dropped: AtomicU64,
     failed: AtomicBool,
     pending: Mutex<Pending>,
+    generation: AtomicU64,
+    retention_days: AtomicU8,
+    wake: tokio::sync::Notify,
+    #[cfg(test)]
+    fail_clear_rename: AtomicBool,
 }
 #[derive(Clone)]
 pub struct LogSink {
@@ -296,15 +319,52 @@ pub struct LogSink {
     shared: Arc<Shared>,
 }
 impl LogSink {
+    #[cfg(test)]
     pub async fn open(path: PathBuf) -> Result<Self, &'static str> {
+        Self::open_with_retention_days(path, 7).await
+    }
+    /// Pass persisted settings at startup, before pruning; increasing retention
+    /// after default `open` cannot restore already-expired records.
+    #[allow(dead_code)] // Startup settings integration belongs to the caller.
+    pub async fn open_with_retention_days(path: PathBuf, days: u8) -> Result<Self, &'static str> {
+        Self::open_internal(
+            path,
+            days,
+            chrono::Utc::now,
+            std::time::Duration::from_secs(60),
+        )
+        .await
+    }
+    async fn open_internal(
+        path: PathBuf,
+        days: u8,
+        clock: fn() -> chrono::DateTime<chrono::Utc>,
+        prune_interval: std::time::Duration,
+    ) -> Result<Self, &'static str> {
+        if !(1..=90).contains(&days) {
+            return Err(LOG_ERROR);
+        }
         let source = path.clone();
-        let store = tokio::task::spawn_blocking(move || load(&source))
-            .await
-            .map_err(|_| LOG_ERROR)??;
+        let store = tokio::task::spawn_blocking(move || {
+            let mut store = load(&source)?;
+            let before = store.items.len();
+            store.prune(days, clock());
+            if before != store.items.len() {
+                persist(&source, &store)?;
+            }
+            Ok::<_, &'static str>(store)
+        })
+        .await
+        .map_err(|_| LOG_ERROR)??;
         let shared = Arc::new(Shared {
             store: Mutex::new(store),
             dropped: AtomicU64::new(0),
             failed: AtomicBool::new(false),
+            generation: AtomicU64::new(0),
+            retention_days: AtomicU8::new(days),
+            wake: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            fail_clear_rename: AtomicBool::new(false),
             pending: Mutex::new(Pending {
                 closed: false,
                 bytes: 0,
@@ -313,25 +373,68 @@ impl LogSink {
         let (sender, mut receiver) = mpsc::channel(QUEUE_CAPACITY);
         let worker = shared.clone();
         tokio::spawn(async move {
-            while let Some(message) = receiver.recv().await {
-                let (entry, size, barrier) = match message {
-                    Message::Append(entry, size) => (Some(entry), size, None),
-                    Message::Barrier(reply, shutdown) => (None, 0, Some((reply, shutdown))),
+            let mut timer = tokio::time::interval(prune_interval);
+            timer.tick().await;
+            loop {
+                let message = tokio::select! {
+                    message = receiver.recv() => match message { Some(message) => message, None => break },
+                    _ = timer.tick() => Message::Prune,
+                    _ = worker.wake.notified() => Message::Prune,
+                };
+                let (entry, size, barrier, clear) = match message {
+                    Message::Append(entry, size, generation) => {
+                        (Some((entry, generation)), size, None, false)
+                    }
+                    Message::Barrier(reply, shutdown) => (None, 0, Some((reply, shutdown)), false),
+                    Message::Clear(reply) => (None, 0, Some((reply, false)), true),
+                    Message::Prune => (None, 0, None, false),
                 };
                 let state = worker.clone();
                 let target = path.clone();
                 let result = tokio::task::spawn_blocking(move || {
-                    let mut store = state.store.lock().map_err(|_| LOG_ERROR)?;
-                    store.add_dropped(state.dropped.swap(0, Ordering::AcqRel));
-                    if let Some(entry) = entry {
-                        store.append(entry)?;
-                    } else {
-                        store.enforce_bounds()?;
+                    if clear {
+                        let generation = state
+                            .generation
+                            .load(Ordering::Acquire)
+                            .checked_add(1)
+                            .ok_or(LOG_ERROR)?;
+                        let empty = Store::default();
+                        persist_before_rename(&target, &empty, || {
+                            #[cfg(test)]
+                            if state.fail_clear_rename.load(Ordering::Acquire) {
+                                // Exercise the actual OS rename failure, not a post-commit error.
+                                fs::rename(&target, target.join("invalid-child"))?;
+                            }
+                            Ok(())
+                        })?;
+                        *state.store.lock().map_err(|_| LOG_ERROR)? = empty;
+                        state.dropped.store(0, Ordering::Release);
+                        state.generation.store(generation, Ordering::Release);
+                        return Ok(());
                     }
-                    // API readers never hold/wait on a mutex through filesystem IO.
-                    let snapshot = store.clone();
-                    drop(store);
-                    persist(&target, &snapshot)
+                    let mut snapshot = state.store.lock().map_err(|_| LOG_ERROR)?.clone();
+                    let dropped = state.dropped.swap(0, Ordering::AcqRel);
+                    snapshot.add_dropped(dropped);
+                    if let Some((entry, generation)) = entry {
+                        if generation == state.generation.load(Ordering::Acquire) {
+                            snapshot.append(entry)?;
+                        } else {
+                            snapshot.add_dropped(1);
+                        }
+                    }
+                    snapshot.prune(state.retention_days.load(Ordering::Acquire), clock());
+                    snapshot.enforce_bounds()?;
+                    if let Err(error) = persist(&target, &snapshot) {
+                        let _ =
+                            state
+                                .dropped
+                                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                                    Some(n.saturating_add(dropped))
+                                });
+                        return Err(error);
+                    }
+                    *state.store.lock().map_err(|_| LOG_ERROR)? = snapshot;
+                    Ok(())
                 })
                 .await
                 .unwrap_or(Err(LOG_ERROR));
@@ -344,7 +447,7 @@ impl LogSink {
                     worker.failed.store(true, Ordering::Release);
                 }
                 if let Some((reply, shutdown)) = barrier {
-                    let _ = reply.send(if worker.failed.load(Ordering::Acquire) {
+                    let _ = reply.send(if !clear && worker.failed.load(Ordering::Acquire) {
                         Err(LOG_ERROR)
                     } else {
                         result
@@ -359,7 +462,14 @@ impl LogSink {
     }
     /// Immediate queue admission only; never waits for filesystem/network/stream.
     /// False means dropped (invalid entry, full queue or closed sink).
+    #[allow(dead_code)] // Compatibility API; gateway uses admission generation explicitly.
     pub fn try_enqueue(&self, entry: LogEntry) -> bool {
+        self.try_enqueue_for(self.generation(), entry)
+    }
+    pub fn generation(&self) -> u64 {
+        self.shared.generation.load(Ordering::Acquire)
+    }
+    pub fn try_enqueue_for(&self, generation: u64, entry: LogEntry) -> bool {
         let size = if entry.valid() {
             serde_json::to_vec(&entry).map_or(MAX_PENDING_BYTES + 1, |bytes| bytes.len())
         } else {
@@ -370,8 +480,12 @@ impl LogSink {
             return false;
         };
         if pending.closed
+            || generation != self.generation()
             || size > MAX_PENDING_BYTES - pending.bytes
-            || self.sender.try_send(Message::Append(entry, size)).is_err()
+            || self
+                .sender
+                .try_send(Message::Append(entry, size, generation))
+                .is_err()
         {
             let _ = self
                 .shared
@@ -402,6 +516,28 @@ impl LogSink {
     pub fn failed(&self) -> bool {
         self.shared.failed.load(Ordering::Acquire)
     }
+    #[allow(dead_code)] // Management integration is owned by the caller's next phase.
+    pub fn set_retention_days(&self, days: u8) -> Result<(), &'static str> {
+        if !(1..=90).contains(&days) {
+            return Err(LOG_ERROR);
+        }
+        self.shared.retention_days.store(days, Ordering::Release);
+        self.shared.wake.notify_one();
+        Ok(())
+    }
+    #[allow(dead_code)] // Management integration is owned by the caller's next phase.
+    pub async fn clear(&self) -> Result<(), &'static str> {
+        let permit = self.sender.reserve().await.map_err(|_| LOG_ERROR)?;
+        let (reply, receive) = oneshot::channel();
+        {
+            let pending = self.shared.pending.lock().map_err(|_| LOG_ERROR)?;
+            if pending.closed {
+                return Err(LOG_ERROR);
+            }
+            permit.send(Message::Clear(reply));
+        }
+        receive.await.map_err(|_| LOG_ERROR)?
+    }
     pub async fn flush(&self) -> Result<(), &'static str> {
         self.barrier(false).await
     }
@@ -430,6 +566,136 @@ impl LogSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn fixed() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-10-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+    fn aged(days: i64) -> LogEntry {
+        let mut entry = LogEntry::new(None, None);
+        entry.timestamp = (fixed() - chrono::Duration::days(days))
+            .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        entry
+    }
+    #[tokio::test]
+    async fn retention_startup_settings_bounds_future_and_known_state_on_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("private/log.json");
+        let mut store = Store::default();
+        for days in [91, 8, 7, 1, -3] {
+            store.append(aged(days)).unwrap();
+        }
+        persist(&path, &store).unwrap();
+        let sink =
+            LogSink::open_internal(path.clone(), 7, fixed, std::time::Duration::from_secs(60))
+                .await
+                .unwrap();
+        assert_eq!(sink.page(None).unwrap().items.len(), 3);
+        assert_eq!(load(&path).unwrap().dropped_count, 2);
+        assert_eq!(sink.set_retention_days(0), Err(LOG_ERROR));
+        assert_eq!(sink.set_retention_days(91), Err(LOG_ERROR));
+        sink.set_retention_days(1).unwrap();
+        sink.flush().await.unwrap();
+        let page = sink.page(None).unwrap();
+        assert_eq!(page.items.len(), 2);
+        assert_eq!(page.dropped_count, 3);
+        assert!(page.items.iter().any(|e| e.timestamp == aged(-3).timestamp));
+        sink.set_retention_days(90).unwrap();
+        assert!(sink.try_enqueue(aged(89)));
+        sink.flush().await.unwrap();
+        assert_eq!(sink.page(None).unwrap().items.len(), 3);
+        sink.shutdown().await.unwrap();
+        let reopened =
+            LogSink::open_internal(path.clone(), 90, fixed, std::time::Duration::from_secs(60))
+                .await
+                .unwrap();
+        assert_eq!(reopened.page(None).unwrap().items.len(), 3);
+        let before = reopened.page(None).unwrap().items;
+        // A non-directory destination fails deterministically even for privileged test runners.
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        reopened.set_retention_days(1).unwrap();
+        assert!(reopened.flush().await.is_err());
+        assert_eq!(reopened.page(None).unwrap().items, before);
+        let _ = reopened.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn minute_prune_worker_can_be_tested_with_short_interval() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("private/log.json");
+        let sink =
+            LogSink::open_internal(path.clone(), 7, fixed, std::time::Duration::from_millis(5))
+                .await
+                .unwrap();
+        // Model passage of time by placing an expired entry in last-known memory.
+        sink.shared.store.lock().unwrap().append(aged(8)).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if sink.page(None).unwrap().items.is_empty() && path.exists() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(load(&path).unwrap().dropped_count, 1);
+        sink.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn clear_barrier_queued_and_late_old_generation_never_refill() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("private/log.json");
+        let sink = LogSink::open(path.clone()).await.unwrap();
+        let generation = sink.generation();
+        for _ in 0..20 {
+            assert!(sink.try_enqueue_for(generation, LogEntry::new(None, None)));
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), sink.clear())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(sink.generation(), generation + 1);
+        assert!(sink.page(None).unwrap().items.is_empty());
+        assert_eq!(sink.page(None).unwrap().dropped_count, 0);
+        assert!(!sink.try_enqueue_for(generation, error(b"old in-flight")));
+        // Queued before commit, but processed after clear: writer checks again.
+        sink.sender
+            .send(Message::Append(error(b"old queued"), 0, generation))
+            .await
+            .unwrap();
+        sink.flush().await.unwrap();
+        assert!(sink.page(None).unwrap().items.is_empty());
+        assert_eq!(sink.page(None).unwrap().dropped_count, 2);
+        assert!(sink.try_enqueue(error(b"new generation")));
+        sink.shutdown().await.unwrap();
+        assert_eq!(
+            load(&path).unwrap().items[0].error_body.as_deref(),
+            Some("new generation")
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_rename_failure_preserves_file_memory_and_generation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let directory = tmp.path().join("private");
+        let path = directory.join("log.json");
+        let sink = LogSink::open(path.clone()).await.unwrap();
+        assert!(sink.try_enqueue(error(b"original")));
+        sink.flush().await.unwrap();
+        let bytes = fs::read(&path).unwrap();
+        let entries = sink.page(None).unwrap().items;
+        let generation = sink.generation();
+        sink.shared.fail_clear_rename.store(true, Ordering::Release);
+        assert_eq!(sink.clear().await, Err(LOG_ERROR));
+        assert_eq!(sink.generation(), generation);
+        assert_eq!(sink.page(None).unwrap().items, entries);
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 1);
+        let _ = sink.shutdown().await;
+    }
     fn error(body: &[u8]) -> LogEntry {
         let mut entry = LogEntry::new(Some("fixture-id".into()), Some("fixture-name".into()));
         let mut capture = ErrorBodyCapture::new(Some(500));

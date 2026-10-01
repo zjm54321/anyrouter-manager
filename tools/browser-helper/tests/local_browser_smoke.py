@@ -54,6 +54,7 @@ async def ui_policy_cases(page, report, render):
         ('公告', '<iframe></iframe>', '', False), ('公告', '<div class="g-recaptcha"></div>', '', False),
         ('公告', '', '<div role="dialog">Unknown</div>', False),
         ('公告', close, '', False),
+        ('公告', '登录后可以查看服务通知 / Registration and login information', '', True),
     ]
     for index, (title, body, extra, expected) in enumerate(cases):
         report['phase'] = 'notice_' + str(index)
@@ -63,6 +64,16 @@ async def ui_policy_cases(page, report, render):
         assert not await core.dismiss_notice_once(page, state)
         assert await page.evaluate('window.closedCount') == int(expected)
     report['native_strict_notice_cases'] = len(cases)
+    for challenge in (False, True):
+        report['phase'] = 'nested_notice_challenge' if challenge else 'nested_notice_plain'
+        await render("<script>window.closedCount=0</script><div role='dialog'><div class='semi-modal-content'>"
+                     "<h2 class='semi-modal-title'>公告</h2><p>登录后的服务通知</p>"
+                     + ("<iframe></iframe>" if challenge else '')
+                     + close.replace('this.parentElement.remove()', 'this.closest("[role=dialog]").remove()') + '</div></div>')
+        state = dict(deadline=asyncio.get_running_loop().time()+2, submitted=False)
+        assert await core.dismiss_notice_once(page, state) == (not challenge)
+        assert await page.evaluate('window.closedCount') == int(not challenge)
+    report['native_nested_notice_cases'] = 2
     report.pop('phase', None)
 
 
@@ -132,7 +143,7 @@ async def probe(report):
                     form = f"<div id='login' class='semi-form'>{fields}<button id='submit' type='button'>Continue</button></div>"
                 wrong = "<button type='submit' onclick=\"fetch('/wrong-submit',{method:'POST'})\">Sign in</button><form id='wrong'><button type='submit'>Sign in</button></form>" if managed else ''
                 notice = ("<div role='dialog' class='semi-modal-content' style='position:fixed;inset:0;z-index:100;background:white'>"
-                          "<h2 class='semi-modal-title'>公告</h2><p>Maintenance information</p>"
+                          "<h2 class='semi-modal-title'>公告</h2><p>登录后可查看服务通知 / Maintenance information</p>"
                           "<button type='button' class='semi-modal-close' onclick='this.parentElement.remove()'><span class='semi-icon-close'>X</span></button></div>" if mode['kind'] == 'notice' else '')
                 event = "document.querySelector('#submit').onclick" if mode['kind'] == 'semi' else "document.querySelector('#login').onsubmit"
                 html = (wrong + form + notice + f"<script>{event}=async e=>{{e.preventDefault();" + js + "};</script>").encode()

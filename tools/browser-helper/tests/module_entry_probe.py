@@ -207,6 +207,7 @@ def configure_local_fixture():
                         original_add = context.add_cookies
                         async def add_cookies(cookies):
                             details['cookie_import_count'] += 1
+                            details['imported_cookie_count'] = len(cookies)
                             return await original_add(cookies)
                         context.add_cookies = add_cookies
                         return context
@@ -297,7 +298,7 @@ def main():
             and all(value.encode() not in rejected.stdout for value in ('private-user-sentinel', 'private-password-sentinel', 'private-body-sentinel', 'private-token-sentinel')))
         report['ok'] = report['ok'] and report['rejected_single_json_safe_diagnostics']
         session_results = {}
-        cases = {'success':None, 'expired401':'session_expired', 'expired403':'session_expired',
+        cases = {'success':None, 'expired_mix':None, 'expired401':'session_expired', 'expired403':'session_expired',
                  'false':'session_expired', 'mismatch':'user_self_unverified', 'missing':'user_self_unverified',
                  'html':'user_self_unverified', 'challenge':'challenge_or_block',
                  'oversize':'user_self_unverified', 'self307':'user_self_unverified', 'self308':'user_self_unverified',
@@ -307,12 +308,16 @@ def main():
                                      path='/api', secure=False, http_only=True, expires=-1)])
         for mode, expected in cases.items():
             env.update(HELPER_FIXTURE_SESSION=mode, BROWSER_HELPER_DIAGNOSTICS='0' if expected is None else '1')
-            native = subprocess.run(command, input=json.dumps(request).encode()+b'\n', capture_output=True, cwd=ROOT, env=env, timeout=25)
+            outgoing = dict(request)
+            if mode == 'expired_mix':
+                outgoing['cookies'] = [dict(request['cookies'][0], name=f'expired{i}', expires=i) for i in range(3)] + request['cookies']
+            native = subprocess.run(command, input=json.dumps(outgoing).encode()+b'\n', capture_output=True, cwd=ROOT, env=env, timeout=25)
             value = json.loads(native.stdout)
             evidence = json.loads(diagnostic.read_text())
             good = (native.stderr == b'' and native.stdout.count(b'\n') == 1
                     and evidence['private_pid_namespace'] and evidence['fd1_devnull'] and evidence['fd2_devnull']
-                    and evidence['browser_count'] == evidence['context_count'] == evidence['cookie_import_count'] == 1
+                     and evidence['browser_count'] == evidence['context_count'] == evidence['cookie_import_count'] == 1
+                     and evidence['imported_cookie_count'] == 1
                     and evidence['service_workers_blocked'] and evidence.get('actual_browser_closed')
                     and evidence['unsafe_request_count'] == evidence['sink_count'] == evidence['login_page_count'] == 0)
             if expected is None:

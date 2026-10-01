@@ -48,6 +48,8 @@ pub struct App {
     pub fail_account_save: AtomicBool,
     pub upstream: Upstream,
     pub logs: Option<crate::request_log::LogSink>,
+    pub system_logs: Option<crate::system_log::SystemLogSink>,
+    pub log_settings: Option<crate::log_settings::SharedLogSettings>,
     pub login: Arc<dyn LoginProvider>,
     pub stopping: AtomicBool,
     pub isolation_ready: AtomicBool,
@@ -65,12 +67,25 @@ impl App {
         Self::new_with_logs(config, portfolio, upstream, login, None)
     }
 
+    #[cfg(test)]
     pub fn new_with_logs(
+        config: Config,
+        portfolio: Portfolio,
+        upstream: Upstream,
+        login: Arc<dyn LoginProvider>,
+        logs: Option<crate::request_log::LogSink>,
+    ) -> Arc<Self> {
+        Self::new_with_system_logs(config, portfolio, upstream, login, logs, None, None)
+    }
+
+    pub fn new_with_system_logs(
         mut config: Config,
         portfolio: Portfolio,
         upstream: Upstream,
         login: Arc<dyn LoginProvider>,
         logs: Option<crate::request_log::LogSink>,
+        log_settings: Option<crate::log_settings::SharedLogSettings>,
+        system_logs: Option<crate::system_log::SystemLogSink>,
     ) -> Arc<Self> {
         let root = RootAuth::new(&config.root_key);
         config.root_key.clear();
@@ -94,6 +109,8 @@ impl App {
             fail_account_save: AtomicBool::new(false),
             upstream,
             logs,
+            log_settings,
+            system_logs,
             login,
             stopping: AtomicBool::new(false),
             isolation_ready: AtomicBool::new(false),
@@ -102,17 +119,75 @@ impl App {
     }
 
     async fn phase(&self, phase: &'static str) {
+        use crate::{
+            log_settings::LogLevel,
+            system_log::{EventKind, EventStage},
+        };
+        crate::logging::emit(
+            LogLevel::Debug,
+            EventKind::TaskStart,
+            if phase == "committing" {
+                EventStage::Storage
+            } else {
+                EventStage::ProfileWait
+            },
+            None,
+            None,
+        );
         if let Some(operation) = &mut self.accounts.lock().await.operation {
             operation.phase = phase;
         }
     }
 
     pub(crate) fn spawn_job(&self, future: impl std::future::Future<Output = ()> + Send + 'static) {
+        // Operation callers use spawn_operation after capturing IDs; scheduler
+        // jobs have no operation and intentionally do not inherit stale context.
         let mut jobs = self.jobs.lock().expect("job registry");
         jobs.retain(|job| !job.is_finished());
         if !self.stopping.load(Ordering::SeqCst) {
             jobs.push(tokio::spawn(future));
         }
+    }
+
+    pub(crate) fn spawn_operation(
+        &self,
+        context: Option<crate::logging::Context>,
+        future: impl std::future::Future<Output = ()> + Send + 'static,
+    ) {
+        self.spawn_job(async move {
+            if let Some(context) = context {
+                crate::logging::CONTEXT
+                    .scope(context, async move {
+                        let mut completion = crate::logging::Completion::new();
+                        crate::logging::emit(
+                            crate::log_settings::LogLevel::Info,
+                            crate::system_log::EventKind::TaskStart,
+                            crate::system_log::EventStage::Admission,
+                            None,
+                            None,
+                        );
+                        future.await;
+                        completion.finish();
+                    })
+                    .await;
+            } else {
+                future.await;
+            }
+        });
+    }
+    pub(crate) async fn operation_context(&self) -> Option<crate::logging::Context> {
+        let operation = self.accounts.lock().await.operation.clone()?;
+        let sink = self.system_logs.clone()?;
+        let detailed = self
+            .log_settings
+            .as_ref()
+            .is_some_and(|s| s.snapshot().level >= crate::log_settings::LogLevel::Debug);
+        Some(crate::logging::Context::new(
+            sink,
+            Some(operation.id),
+            operation.account_id,
+            detailed,
+        ))
     }
 
     pub async fn shutdown(&self) {
@@ -132,13 +207,79 @@ impl App {
 
     // HTTP streams must finish/drop before closing queue admission.
     pub async fn shutdown_logs(&self) {
-        if let Some(logs) = &self.logs {
-            let _ = logs.flush().await;
-            let _ = logs.shutdown().await;
+        if let Some(system) = &self.system_logs {
+            system.emit(crate::system_log::SystemEvent::new(
+                crate::log_settings::LogLevel::Info,
+                crate::system_log::EventKind::AppShutdown,
+            ));
         }
+        let bounded = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(
+                async {
+                    if let Some(logs) = &self.logs {
+                        return logs.shutdown().await.is_err();
+                    }
+                    false
+                },
+                async {
+                    if let Some(logs) = &self.system_logs {
+                        return logs.shutdown().await.is_err();
+                    }
+                    false
+                }
+            )
+        })
+        .await;
+        crate::logging::report_failure(
+            bounded.is_err()
+                || bounded.is_ok_and(|(request, system)| request || system)
+                || self.system_logs.as_ref().is_some_and(|l| l.failed())
+                || self.logs.as_ref().is_some_and(|l| l.failed()),
+        );
     }
 
     pub(crate) async fn finish(&self, result: Result<(), SafeError>) {
+        use crate::{
+            log_settings::LogLevel,
+            system_log::{EventKind, EventReason, EventStage},
+        };
+        let error = result.as_ref().err();
+        let (stage, reason) = error
+            .map(SafeError::log_context)
+            .unwrap_or((EventStage::Storage, EventReason::Success));
+        if let Some(operation) = self.accounts.lock().await.operation.as_ref() {
+            let kind = match operation.kind {
+                "refresh" => Some(EventKind::AccountRefresh),
+                "save" => Some(EventKind::AccountSave),
+                "select_key" => Some(EventKind::KeySelected),
+                "login" => Some(EventKind::LoginFinish),
+                _ => None,
+            };
+            if let Some(kind) = kind {
+                crate::logging::emit(
+                    if error.is_some() {
+                        LogLevel::Warn
+                    } else {
+                        LogLevel::Info
+                    },
+                    kind,
+                    stage,
+                    Some(reason),
+                    error.and_then(|e| e.http_status),
+                );
+            }
+        }
+        crate::logging::emit(
+            if error.is_some() {
+                LogLevel::Warn
+            } else {
+                LogLevel::Info
+            },
+            EventKind::TaskFinish,
+            stage,
+            Some(reason),
+            error.and_then(|e| e.http_status),
+        );
         if let Some(operation) = &mut self.accounts.lock().await.operation {
             operation.phase = "done";
             operation.status = if result.is_ok() {
@@ -168,6 +309,16 @@ pub fn router(app: Arc<App>) -> Router {
         )
         .route("/api/account", get(account))
         .route("/api/request-logs", get(request_logs))
+        .route(
+            "/api/request-logs/clear",
+            post(crate::log_api::clear_request),
+        )
+        .route(
+            "/api/log-settings",
+            get(crate::log_api::get_settings).put(crate::log_api::put_settings),
+        )
+        .route("/api/system-logs", get(crate::log_api::get_system))
+        .route("/api/system-logs/clear", post(crate::log_api::clear_system))
         .route("/api/checkin", get(crate::checkin::get_status))
         .route(
             "/api/checkin/settings",
@@ -534,7 +685,8 @@ async fn login(
         idle(&state)?;
         start(&mut state, "login", "authenticating")
     };
-    app.clone().spawn_job(async move {
+    let context = app.operation_context().await;
+    app.clone().spawn_operation(context, async move {
         let result = prepare_candidate(&app, input).await;
         app.finish(result).await;
     });
@@ -654,7 +806,8 @@ async fn save_candidate(
         let response = start_for(&mut state, "save", "reading_key", account_id);
         (candidate, key, response)
     };
-    app.clone().spawn_job(async move {
+    let context = app.operation_context().await;
+    app.clone().spawn_operation(context, async move {
         let result = async {
             let selected = match key {
                 Some(key) => Some(SelectedKey {
@@ -752,7 +905,10 @@ async fn refresh(
     bytes: axum::body::Bytes,
 ) -> Result<Response, ApiError> {
     require_session(&app, &headers).await?;
-    if !bytes.is_empty() {
+    if !bytes.is_empty()
+        && !serde_json::from_slice::<serde_json::Value>(&bytes)
+            .is_ok_and(|v| v.as_object().is_some_and(|object| object.is_empty()))
+    {
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "bad_request"));
     }
     let (active, response) = {
@@ -762,34 +918,91 @@ async fn refresh(
         let response = start_for(&mut state, "refresh", "reading_account", Some(id));
         (active, response)
     };
-    app.clone().spawn_job(async move {
+    let context = app.operation_context().await;
+    app.clone().spawn_operation(context, async move {
         let result = async {
-            let (balance, username) = app
-                .upstream
-                .profile(&active.credentials)
-                .await
-                .map_err(|e| e.with_source(ErrorSource::SelfAccount))?;
-            let keys = app
-                .upstream
-                .keys(&active.credentials)
-                .await
-                .map_err(|e| e.with_source(ErrorSource::Tokens))?;
+            let updated = refresh_snapshot(&app, &active).await?;
             app.phase("committing").await;
-            let mut updated = active.clone();
-            updated.balance = balance;
-            if let Some(username) = username {
-                updated.username = username;
-            }
-            updated.keys = keys.iter().map(ListedKey::summary).collect();
-            updated.revision = next_revision(Some(&active.revision))?;
             let mut state = app.accounts.lock().await;
-            replace_entry(&app, &mut state, updated)?;
+            replace_entry(&app, &mut state, updated)
+                .map_err(|e| e.with_source(ErrorSource::Persistence))?;
             Ok(())
         }
         .await;
         app.finish(result).await;
     });
     Ok(response)
+}
+
+// Refresh is read-only upstream. Exactly one session-only browser verification may
+// follow a recognized challenge; no password login, no retry on ordinary refusals.
+pub(crate) async fn refresh_snapshot(app: &App, active: &Entry) -> Result<Entry, SafeError> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(app.config.helper_timeout);
+    let mut source = ErrorSource::SelfAccount;
+    tokio::time::timeout_at(deadline, async {
+        let mut credentials = active.credentials.clone();
+        let mut verified = false;
+        loop {
+            source = ErrorSource::SelfAccount;
+            app.phase("reading_account").await;
+            let result = async {
+                let (balance, username) = app
+                    .upstream
+                    .profile(&credentials)
+                    .await
+                    .map_err(|e| e.with_source(ErrorSource::SelfAccount))?;
+                source = ErrorSource::Tokens;
+                app.phase("listing_keys").await;
+                let keys = app
+                    .upstream
+                    .keys(&credentials)
+                    .await
+                    .map_err(|e| e.with_source(ErrorSource::Tokens))?;
+                Ok::<_, SafeError>((balance, username, keys))
+            }
+            .await;
+            match result {
+                Err(e) if e.code == "upstream_challenge" && !verified => {
+                    let (stage, reason) = e.log_context();
+                    crate::logging::emit(
+                        crate::log_settings::LogLevel::Info,
+                        crate::system_log::EventKind::BrowserWait,
+                        stage,
+                        Some(reason),
+                        e.http_status,
+                    );
+                    verified = true;
+                    source = ErrorSource::Helper;
+                    credentials = app
+                        .login
+                        .verify_session(
+                            credentials,
+                            deadline.saturating_duration_since(tokio::time::Instant::now()),
+                        )
+                        .await
+                        .map_err(|e| e.with_source(ErrorSource::Helper))?;
+                    if credentials.api_user != active.upstream_user_id || !credentials.validate() {
+                        return Err(SafeError::new("upstream_session_unverified")
+                            .with_source(ErrorSource::SelfAccount));
+                    }
+                }
+                Err(e) => return Err(e),
+                Ok((balance, username, keys)) => {
+                    let mut updated = active.clone();
+                    updated.credentials = credentials;
+                    updated.balance = balance;
+                    if let Some(username) = username {
+                        updated.username = username;
+                    }
+                    updated.keys = keys.iter().map(ListedKey::summary).collect();
+                    updated.revision = next_revision(Some(&active.revision))?;
+                    return Ok(updated);
+                }
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| Err(SafeError::new("upstream_timeout").with_source(source)))
 }
 
 pub(crate) fn entry<'a>(state: &'a Accounts, id: &str) -> Result<&'a Entry, ApiError> {
@@ -814,10 +1027,25 @@ pub(crate) fn commit(
 ) -> Result<(), SafeError> {
     #[cfg(test)]
     if app.fail_account_save.load(Ordering::SeqCst) {
-        return Err(SafeError::new("persistence_failed"));
+        return Err(SafeError::new("persistence_failed").with_source(ErrorSource::Persistence));
     }
-    store::save(&app.config.state_path, &portfolio)
-        .map_err(|e| e.with_source(ErrorSource::Persistence))?;
+    let persisted = store::save(&app.config.state_path, &portfolio);
+    crate::logging::emit(
+        if persisted.is_ok() {
+            crate::log_settings::LogLevel::Debug
+        } else {
+            crate::log_settings::LogLevel::Error
+        },
+        crate::system_log::EventKind::StorageWrite,
+        crate::system_log::EventStage::Storage,
+        Some(if persisted.is_ok() {
+            crate::system_log::EventReason::Success
+        } else {
+            crate::system_log::EventReason::StorageUnavailable
+        }),
+        None,
+    );
+    persisted.map_err(|e| e.with_source(ErrorSource::Persistence))?;
     state.active = portfolio.route().and_then(Entry::snapshot).map(Arc::new);
     state.portfolio = portfolio;
     Ok(())
@@ -887,9 +1115,18 @@ async fn select_route(
         return Err(ApiError::new(StatusCode::CONFLICT, "key_not_selected"));
     }
     let mut portfolio = state.portfolio.clone();
-    portfolio.route_account_id = Some(id);
+    portfolio.route_account_id = Some(id.clone());
     commit(&app, &mut state, portfolio)
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    if let Some(sink) = &app.system_logs {
+        let mut event = crate::system_log::SystemEvent::new(
+            crate::log_settings::LogLevel::Info,
+            crate::system_log::EventKind::AccountSelected,
+        );
+        event.account_id = Some(id);
+        event.stage = Some(crate::system_log::EventStage::Route);
+        sink.emit(event);
+    }
     Ok(Json(status(&mut state)))
 }
 #[derive(Deserialize)]
@@ -921,7 +1158,8 @@ async fn select_key(
         let response = start_for(&mut state, "select_key", "reading_key", Some(id));
         (account, response)
     };
-    app.clone().spawn_job(async move {
+    let context = app.operation_context().await;
+    app.clone().spawn_operation(context, async move {
         let result = async {
             app.upstream.profile(&account.credentials).await?;
             let keys = app.upstream.keys(&account.credentials).await?;

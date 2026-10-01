@@ -158,7 +158,7 @@ class SessionInput:
 
 
 def validated_session_cookies(cookies):
-    if type(cookies) is not list or not 1 <= len(cookies) <= MAX_COOKIES:
+    if type(cookies) is not list or len(cookies) > MAX_COOKIES:
         raise ValueError
     fields = {'name', 'value', 'domain', 'path', 'secure', 'http_only', 'expires'}
     total = 0
@@ -167,17 +167,19 @@ def validated_session_cookies(cookies):
     for cookie in cookies:
         if type(cookie) is not dict or set(cookie) != fields:
             raise ValueError
-        # Reuse the output validator, including native-clock expiry checks.
+        # Check structure before expiry: an expired malicious cookie is still
+        # invalid input. A valid cookie may expire during the Rust/pipe handoff.
         native = dict(cookie)
         native['httpOnly'] = native.pop('http_only')
-        if not filtered_cookies([native], ORIGIN + '/console'):
-            raise ValueError
-        if cookie['expires'] != -1 and cookie['expires'] <= now:
+        if not valid_cookie_structure(native):
             raise ValueError
         total += len(json.dumps(cookie, ensure_ascii=True, separators=(',', ':')).encode('ascii'))
         if total > MAX_COOKIE_BYTES:
             raise ValueError
-        result.append(native)
+        if cookie['expires'] == -1 or cookie['expires'] > now:
+            result.append(native)
+    if not result:
+        raise Failure('session_expired')
     return result
 
 
@@ -269,30 +271,34 @@ async def verified_response(response) -> str | None:
         return None
 
 
+def valid_cookie_structure(cookie):
+    if not isinstance(cookie, dict):
+        return False
+    name, value = cookie.get('name'), cookie.get('value')
+    path, expires = cookie.get('path'), cookie.get('expires')
+    return (
+        cookie.get('domain') in ('anyrouter.top', '.anyrouter.top')
+        and isinstance(name, str) and COOKIE_NAME.fullmatch(name) is not None
+        and isinstance(value, str) and COOKIE_VALUE.fullmatch(value) is not None
+        and isinstance(path, str) and path.startswith('/')
+        and not any(ord(c) < 32 or ord(c) == 127 for c in path)
+        and type(expires) in (int, float) and math.isfinite(expires)
+        and (expires == -1 or expires >= 0)
+        and type(cookie.get('secure')) is bool and type(cookie.get('httpOnly')) is bool
+    )
+
+
 def filtered_cookies(cookies: list[dict], source_url: str) -> list[dict]:
     if not safe_url(source_url, '/console'):
         return []
     result = []
     for cookie in cookies:
-        if not isinstance(cookie, dict):
+        if not valid_cookie_structure(cookie):
             continue
-        name, value = cookie.get('name'), cookie.get('value')
-        path, expires = cookie.get('path'), cookie.get('expires')
-        if cookie.get('domain') not in ('anyrouter.top', '.anyrouter.top'):
-            continue
-        if not isinstance(name, str) or not COOKIE_NAME.fullmatch(name):
-            continue
-        if not isinstance(value, str) or not COOKIE_VALUE.fullmatch(value):
-            continue
-        if not isinstance(path, str) or not path.startswith('/') or any(ord(c) < 32 or ord(c) == 127 for c in path):
-            continue
-        if type(expires) not in (int, float) or not math.isfinite(expires) or expires < -1:
-            continue
+        expires = cookie['expires']
         if expires != -1 and expires <= time.time():
             continue
-        if type(cookie.get('secure')) is not bool or type(cookie.get('httpOnly')) is not bool:
-            continue
-        result.append(dict(name=name, value=value, domain=cookie['domain'], path=path,
+        result.append(dict(name=cookie['name'], value=cookie['value'], domain=cookie['domain'], path=cookie['path'],
                            secure=cookie['secure'], http_only=cookie['httpOnly'], expires=expires))
     return result
 
@@ -351,7 +357,9 @@ async def owned_submit(page, username, password):
 NOTICE_ELIGIBLE_JS = r"""d => {
     const titles=d.querySelectorAll('.semi-modal-title');
     if (titles.length!==1 || !/^(公告|通知|Notice|Announcement)$/i.test(titles[0].innerText.trim())) return false;
-    if (/登录|注册|验证码|验证|协议|条款|同意|sign\s*in|log\s*in|captcha|verify|agreement|terms|consent/i.test(d.innerText)) return false;
+    // Informational notices may mention login/registration. Challenge and
+    // agreement content still forbids dismissal; title remains exact above.
+    if (/验证码|验证|协议|条款|同意|captcha|verify|agreement|terms|consent/i.test(d.innerText)) return false;
     if (d.querySelector('input,textarea,select,form,iframe,[contenteditable="true"],.nc-container,#nocaptcha,.cf-turnstile,.g-recaptcha')) return false;
     const close=d.querySelectorAll('button.semi-modal-close:has(.semi-icon-close)');
     return close.length===1 && !close[0].form && close[0].type!=='submit';
@@ -363,7 +371,11 @@ async def dismiss_notice_once(page, state):
         return False
     if await require_safe_page(page, state):
         return False
-    dialogs = page.locator('[role="dialog"],dialog,.semi-modal-content')
+    # Semi often wraps one logical modal in both role=dialog and content nodes.
+    # Count outer modal roots, not every nested rendering node. Eligibility
+    # still checks the whole root for controls, challenges and unique title.
+    modal = ':is([role="dialog"],dialog,.semi-modal-content)'
+    dialogs = page.locator(f'{modal}:not({modal} {modal})')
     count = await dialogs.count()
     if count > 12:
         return False
@@ -802,9 +814,10 @@ async def session_work(credentials, launch, resources, state):
         return {'ok': True, 'cookies': cookies, 'api_user': user}
 
 
-async def run_session(credentials: SessionInput) -> dict:
+async def run_session(credentials: SessionInput, state=None) -> dict:
     resources = {}
-    state = dict(deadline=asyncio.get_running_loop().time() + credentials.timeout_ms / 1000,
+    state = {} if state is None else state
+    state.update(deadline=asyncio.get_running_loop().time() + credentials.timeout_ms / 1000,
                  submitted=False, phase='launch', challenge=False, http_block=False)
     try:
         return await asyncio.wait_for(session_work(credentials, browser_launcher(), resources, state), credentials.timeout_ms / 1000)
@@ -819,11 +832,12 @@ async def run_session(credentials: SessionInput) -> dict:
         await close_resources(resources)
 
 
-async def run_login(credentials: LoginInput | SessionInput) -> dict:
+async def run_login(credentials: LoginInput | SessionInput, state=None) -> dict:
     if isinstance(credentials, SessionInput):
-        return await run_session(credentials)
+        return await run_session(credentials, state)
     resources = {}
-    state = dict(deadline=asyncio.get_running_loop().time() + credentials.timeout_ms / 1000,
+    state = {} if state is None else state
+    state.update(deadline=asyncio.get_running_loop().time() + credentials.timeout_ms / 1000,
                  submitted=False, pending_login=False, network_failed=False, challenge=False,
                  http_block=False, phase='launch', login_success=None)
     try:

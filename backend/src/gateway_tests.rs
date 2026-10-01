@@ -178,6 +178,45 @@ async fn successful_sse_metadata_is_logged_at_headers_without_waiting_for_eof() 
 }
 
 #[tokio::test]
+async fn clear_during_error_stream_blocks_old_eof_and_drop_without_changing_bytes() {
+    let h = Harness::new(StatusCode::BAD_REQUEST, b"original-stream-FAKE").await;
+    let logs = h.app.logs.as_ref().unwrap();
+    for eof in [true, false] {
+        h.state.hold.store(true, Ordering::SeqCst);
+        let r = h.send("GET", "/v1/error", &[], b"").await;
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+        let mut stream = r.into_body().into_data_stream();
+        assert_eq!(
+            stream.next().await.unwrap().unwrap(),
+            "original-stream-FAKE"
+        );
+        logs.clear().await.unwrap();
+        if eof {
+            h.state.release.notify_one();
+            while let Some(chunk) = stream.next().await {
+                assert!(chunk.unwrap().is_empty());
+            }
+        }
+        drop(stream);
+        assert!(h.entries().await.is_empty());
+    }
+    h.state.hold.store(false, Ordering::SeqCst);
+    let r = h.send("GET", "/v1/error", &[], b"").await;
+    assert_eq!(
+        to_bytes(r.into_body(), 1024).await.unwrap(),
+        "original-stream-FAKE"
+    );
+    let entries = h.entries().await;
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0].error_body.as_deref(),
+        Some("original-stream-FAKE")
+    );
+    assert!(!entries[0].truncated);
+    h.app.shutdown_logs().await;
+}
+
+#[tokio::test]
 async fn error_raw_prefix_eof_large_body_and_drop_are_logged_once() {
     let raw = b"FAKE-key=raw-secret\n\xff bytes";
     let h = Harness::new(StatusCode::FORBIDDEN, raw).await;
