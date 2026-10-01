@@ -3,6 +3,12 @@
 此目录是 Rust subprocess 的 Python stdin/stdout 登录适配器，仅允许固定
 `https://anyrouter.top`。不负责部署浏览器、签到或余额请求。
 
+**Managed login does not automatically sign in; the check-in engine owns the action.**
+托管登录在网络发送前拒绝页面自动发起的 `/api/user/sign_in` 写请求（包括任何
+query），不会因这一可选请求被拒绝而否定已验证的 login/self。只有 Rust 签到引擎
+持久化 intent 后才能执行签到 POST；helper 不点击签到，也不据页面提示宣称奖励。
+`session_verify` 保持只读，拒绝所有非 GET/HEAD 请求。
+
 ## 环境与调用
 
 从项目根进入 `nix develop`，然后在 `tools/browser-helper` 工作目录执行：
@@ -30,12 +36,14 @@ helper 原样保留该环境变量，缺失时在 import wrapper 前返回
 {"username":"<username>","password":"<password>","timeout_ms":60000}
 ```
 
-仅接受这三个字段；`timeout_ms` 可省略（默认 60000），必须为整数
-1000–120000，不会静默扩展时限。请求最大 16384 字节，用户名最大 320 UTF-8
+登录可显式增加 `"mode":"login"`，省略 mode 保持兼容；`timeout_ms` 可省略
+（默认 60000），必须为整数 1000–120000，不会静默扩展时限。
+请求最大 65536 字节，用户名最大 320 UTF-8
 字节、密码最大 4096 UTF-8 字节，禁止控制字符和重复 JSON 键。读首行有 5 秒
 时限；一次进程只处理一个请求，不是多行服务。浏览器流 overall 时限包含启动、
 导航、表单及 profile 验证，结束额外最多 2 秒用于 context/browser 顺序关闭。
-Rust 应保持 subprocess 总时限并在超时终止进程组（包含浏览器子进程）；Python
+Rust 应保持 subprocess 总时限并通过其生命周期管理回收全部派生进程；仅 killpg
+不足以回收 setsid/Crashpad。Python
 超时是协作式取消，不能保证中断卡死的原生代码或阻塞的 wrapper。
 
 stdout 严格输出一行 JSON，成功退出码 0，失败退出码 1：
@@ -53,6 +61,7 @@ stdout 严格输出一行 JSON，成功退出码 0，失败退出码 1：
 
 错误码：`login_form_unavailable`、`challenge_or_block`、`timeout`、
 `user_self_unverified`、`browser_unavailable`、`invalid_input`、`login_failed`。
+已有 `session_verify` 模式还可返回 `session_expired`；本次没有增加协议错误码。
 进程入口将 fd 1/2 永久指向 `/dev/null`（退出前不恢复），仅保留不向子进程继承
 的专用 fd 输出最终 JSON，并处理 partial write。浏览器、wrapper、Python logging、
 原生缓冲及 exit hooks 的 stdout/stderr 均丢弃，不输出异常正文。不会截图、录屏、trace、保存 cookie 或创建
@@ -72,6 +81,13 @@ stdout 严格输出一行 JSON，成功退出码 0，失败退出码 1：
   正常表单；只在 overall 时限耗尽且仍被阻断时返回 `challenge_or_block`。
   未知 DOM 返回 `login_form_unavailable`；不声称密码错误。每次填凭据和点击提交前
   要求当前页面为精确 HTTPS `anyrouter.top` 的 `/login`（不接受其它同源路径）。
+- 提交按钮须有明确登录标签（含 `Continue`），并与用户名、密码共享 HTML5
+  `.form` owner（支持外置 `form=id` 按钮）；三者都没有原生 owner 时，仅允许
+  同一个 Semi 表单。忽略 header 或其它表单的 Sign in，不执行 JS submit/force click。
+  正常 trial 后只提交一次，保留页面生成的 login query。
+- 提交 trial 前仅可关闭唯一可见、标题精确为 `公告`/`通知`/`Notice`/`Announcement`
+  的公告 dialog，且须无输入/form/iframe/验证码、登录或协议内容，只有一个明确
+  close icon。仅尝试关闭一次；未知弹窗、同意按钮和验证框不自动处理。
 - 在点击登录前注册本轮 response listener，保留提交时同步触发的 self 响应。
   只跟踪精确同源 `POST /api/user/login`；必须 HTTP 200 JSON `success: true`，
   `success: false` 返回 `login_failed`，不猜密码错误。无关 POST、可选资源失败或
@@ -237,4 +253,14 @@ sentinel 脱敏。local fixture 已改精确 `/api/user/login` JSON 与延迟 SP
 - 真实登录通过：通过浏览器完成本次防护页加载和登录，成功提交表单并获取会话 (`login=succeeded`)。
 - 数据提取正常：成功读取原始额度（raw unit）及已有 1 个 Key (`key_count=1`)。
 - 网关代理验证：本地 `/v1/models` 请求成功替换 Bearer 凭据，上游返回 HTTP 200 及 16 个模型列表 JSON。
-- 运行约束：未调用付费推理模型，未创建新 Key，无自动签到。测试结束临时配置和会话文件已删除。
+- 运行约束：未调用付费推理模型，未创建新 Key。旧记录不能证明页面没有自动签到；
+  托管登录的自动签到拦截由下述新回归验证。测试结束临时配置和会话文件已删除。
+
+## 托管登录行为回归（2026-10-01）
+
+保留既有 69 项单元测试，新增 8 项策略回归；真实本地 fixture 保留早到 self、
+慢登录、SPA、307/308 零跨源 sink、失败诊断及模块入口场景。新增本地页面模拟
+自动签到（有/无 query），要求签到 sink 为零、login POST 恰好一次、identity
+仍有效；另外验证 6 个 HTML5/Semi owner 场景及 12 个严格公告边界场景。
+均仅 loopback、虚构 sentinel，未读取用户凭据、未访问真实 AnyRouter；这些结果
+不证明修改后的 helper 已通过真实账号登录或 WAF。

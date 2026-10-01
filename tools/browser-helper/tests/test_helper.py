@@ -32,6 +32,13 @@ def response(payload=None, *, url=core.ORIGIN + '/api/user/self', status=200, re
                            json=AsyncMock(return_value=payload if payload is not None else {'success': True, 'data': {'id': 42}}))
 
 
+class ActionClick(AsyncMock):
+    def __call__(self, *args, **kwargs):
+        if kwargs.get('trial'):
+            return asyncio.sleep(0)  # Trial never dispatches a click event.
+        return super().__call__(*args, **kwargs)
+
+
 class Locator:
     def __init__(self, visible=True, click=None):
         self.first = self
@@ -39,7 +46,14 @@ class Locator:
         self.is_enabled = AsyncMock(return_value=True)
         self.is_editable = AsyncMock(return_value=True)
         self.fill = AsyncMock()
-        self.click = AsyncMock(side_effect=click)
+        self.click = ActionClick(side_effect=click)
+        self.count = AsyncMock(return_value=1 if visible else 0)
+        self.inner_text = AsyncMock(return_value='Continue')
+        self.evaluate = AsyncMock(return_value=True)
+        self.element_handle = AsyncMock(return_value=SimpleNamespace(dispose=AsyncMock()))
+
+    def nth(self, index):
+        return self
 
 
 class FakePage:

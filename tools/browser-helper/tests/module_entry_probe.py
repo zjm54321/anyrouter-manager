@@ -24,12 +24,18 @@ def configure_local_fixture():
     from browser_helper import core
 
     diagnostic_path = os.environ['HELPER_ENTRY_DIAGNOSTIC']
+    session_mode = os.environ.get('HELPER_FIXTURE_SESSION')
     details = {'fixture_loaded': True, 'binary_exists': Path(os.environ.get('CLOAKBROWSER_BINARY_PATH', '')).is_file(),
                'binary_executable': os.access(os.environ.get('CLOAKBROWSER_BINARY_PATH', ''), os.X_OK),
                'node_exists': Path(os.environ.get('PLAYWRIGHT_NODEJS_PATH', '')).is_file(),
                'ld_library_path_present': bool(os.environ.get('LD_LIBRARY_PATH')),
                'private_pid_namespace': os.readlink('/proc/self/ns/pid') != os.environ['HELPER_SMOKE_HOST_PIDNS'],
-               'proxy_env_present': any(os.environ.get(k) for k in ('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy'))}
+                'proxy_env_present': any(os.environ.get(k) for k in ('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy'))}
+    if session_mode:
+        details.update(browser_count=0, context_count=0, cookie_import_count=0,
+                       unsafe_request_count=0, sink_count=0, login_page_count=0,
+                       self_count=0, imported_cookie_seen=False, correct_user_header=False,
+                       correlation_header_absent=True)
 
     def save():
         Path(diagnostic_path).write_text(json.dumps(details))
@@ -37,8 +43,66 @@ def configure_local_fixture():
 
     class Local(BaseHTTPRequestHandler):
         def do_GET(self):
+            if session_mode:
+                if self.path.startswith('/sink') or self.headers.get('Upgrade'):
+                    details['sink_count'] += 1
+                if self.path == '/login':
+                    details['login_page_count'] += 1
+                if self.path in ('/307', '/308') or (self.path == '/api/user/self' and session_mode in ('self307', 'self308')) or (self.path == '/console' and session_mode == 'redirect_login'):
+                    self.send_response(302 if session_mode == 'redirect_login' else int(session_mode[-3:]) if self.path == '/api/user/self' else int(self.path[1:]))
+                    self.send_header('Location', '/login' if session_mode == 'redirect_login' else '/sink')
+                    self.send_header('Content-Length', '0')
+                    self.end_headers()
+                    return
+                status, content_type = 200, 'text/html'
+                if self.path == '/console':
+                    # Auto-signin, form, beacon, and sockets must all remain local
+                    # and never reach the fixture HTTP handlers.
+                    body = b'''<form method="POST" action="/api/user/sign_in"><input id="password"><button>login</button></form><script>
+                    for(const method of ['POST','PUT','PATCH','DELETE']) for(const path of ['/api/user/sign_in','/api/user/login','/307','/308']) fetch(path,{method,body:'private-write-sentinel'}).catch(()=>{});
+                    navigator.sendBeacon('/api/user/sign_in','private-beacon-sentinel');
+                    new WebSocket(location.origin.replace('http','ws')+'/sink');
+                    fetch('/307').catch(()=>{});fetch('/308').catch(()=>{});
+                    </script>'''
+                    if session_mode == 'spa_login':
+                        body += b"<script>location.href='/login'</script>"
+                elif self.path == '/api/user/self':
+                    details['self_count'] += 1
+                    details['imported_cookie_seen'] = 'fixture_session=private-cookie-sentinel' in self.headers.get('Cookie', '')
+                    details['correct_user_header'] = self.headers.get('New-Api-User') == '42'
+                    details['correlation_header_absent'] &= self.headers.get('X-Helper-Proof') is None
+                    content_type = 'application/json'
+                    body = b'{"success":true,"data":{"id":42}}'
+                    if session_mode in ('expired401', 'expired403'):
+                        status = int(session_mode[-3:])
+                        body = b'{"success":false,"message":"private-body-sentinel","token":"private-token-sentinel"}'
+                    elif session_mode == 'false':
+                        body = b'{"success":false,"message":"private-body-sentinel"}'
+                    elif session_mode == 'mismatch':
+                        body = b'{"success":true,"data":{"id":43}}'
+                    elif session_mode == 'missing':
+                        body = b'{"success":true,"data":{}}'
+                    elif session_mode == 'html':
+                        body, content_type = b'private-body-sentinel', 'text/html'
+                    elif session_mode == 'challenge':
+                        status, body, content_type = 403, b'<html>private-body-sentinel</html>', 'text/html'
+                    elif session_mode == 'oversize':
+                        body = b' ' * (262144 + 1) + body
+                else:
+                    body = b''
+                self.send_response(status)
+                self.send_header('Content-Type', content_type)
+                self.send_header('Content-Length', str(len(body)))
+                if self.path == '/api/user/self':
+                    self.send_header('Set-Cookie', 'refreshed_session=private-refreshed-cookie; Path=/api; HttpOnly')
+                self.end_headers()
+                try:
+                    self.wfile.write(body)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                return
             if self.path == '/login':
-                body = b"<form class='semi-form'><input id='username'><input id='password' type='password'><button type='submit'>fixture</button></form><script>document.querySelector('form').onsubmit=async e=>{e.preventDefault();const reply=await fetch('/api/user/login',{method:'POST',body:'fictional-sentinel'});if(!(await reply.json()).success)return;await new Promise(resolve=>setTimeout(resolve,400));localStorage.setItem('user',JSON.stringify({id:42,token:'private-storage-sentinel'}));await fetch('/api/user/self');};</script>"
+                body = b"<form class='semi-form'><input id='username'><input id='password' type='password'><button type='submit'>Continue</button></form><script>document.querySelector('form').onsubmit=async e=>{e.preventDefault();const reply=await fetch('/api/user/login',{method:'POST',body:'fictional-sentinel'});if(!(await reply.json()).success)return;await new Promise(resolve=>setTimeout(resolve,400));localStorage.setItem('user',JSON.stringify({id:42,token:'private-storage-sentinel'}));await fetch('/api/user/self');};</script>"
                 content_type = 'text/html'
             elif self.path == '/console':
                 body = b"<script>fetch('/api/user/self')</script>"
@@ -57,6 +121,13 @@ def configure_local_fixture():
             self.end_headers()
             self.wfile.write(body)
         def do_POST(self):
+            if session_mode:
+                details['unsafe_request_count'] += 1
+                self.send_response(307)
+                self.send_header('Location', '/sink')
+                self.send_header('Content-Length', '0')
+                self.end_headers()
+                return
             self.rfile.read(int(self.headers.get('Content-Length', 0)))
             assert self.path == '/api/user/login'
             details['local_login_requested'] = True
@@ -68,6 +139,11 @@ def configure_local_fixture():
             self.wfile.write(body)
         def log_message(self, *args):
             pass
+
+        do_PUT = do_POST
+        do_PATCH = do_POST
+        do_DELETE = do_POST
+        do_OPTIONS = do_POST
 
     server = ThreadingHTTPServer(('127.0.0.1', 0), Local)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -86,6 +162,8 @@ def configure_local_fixture():
                 and (path is None or parsed.path == path))
 
     original_filter, original_safe = core.filtered_cookies, core.safe_url
+    original_origin = core.ORIGIN
+    original_validate = core.validated_session_cookies
     def local_filter(cookies, source):
         if not local_safe(source, '/console'):
             return []
@@ -119,6 +197,20 @@ def configure_local_fixture():
                     '--proxy-server=http://127.0.0.1:9', '--proxy-bypass-list=127.0.0.1',
                     '--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1'])
                 details['actual_browser_launched'] = True
+                if session_mode:
+                    details['browser_count'] += 1
+                    original_context = browser.new_context
+                    async def new_context(**options):
+                        details['context_count'] += 1
+                        details['service_workers_blocked'] = options.get('service_workers') == 'block'
+                        context = await original_context(**options)
+                        original_add = context.add_cookies
+                        async def add_cookies(cookies):
+                            details['cookie_import_count'] += 1
+                            return await original_add(cookies)
+                        context.add_cookies = add_cookies
+                        return context
+                    browser.new_context = new_context
                 original_close = browser.close
                 async def close(*args, **kwargs):
                     await original_close(*args, **kwargs)
@@ -149,6 +241,18 @@ def configure_local_fixture():
     core.safe_url = local_safe
     core.filtered_cookies = local_filter
     core.browser_launcher = diagnosed_launcher
+    if session_mode:
+        core.safe_session_url = local_safe
+        # Parse under the PRODUCTION validator/domain, then translate exclusively
+        # for this loopback fixture. Never permit loopback input in production.
+        def validate_for_local(cookies):
+            core.ORIGIN, core.safe_url, core.filtered_cookies = original_origin, original_safe, original_filter
+            try:
+                validated = original_validate(cookies)
+            finally:
+                core.ORIGIN, core.safe_url, core.filtered_cookies = origin, local_safe, local_filter
+            return [dict(c, domain='127.0.0.1') for c in validated]
+        core.validated_session_cookies = validate_for_local
 
 
 def main():
@@ -192,6 +296,43 @@ def main():
             and failure['diagnostics'] == core.diagnostics(dict(phase='profile_wait', page='login', login_requested=True, login_status=200, login_json=True, login_success=False))
             and all(value.encode() not in rejected.stdout for value in ('private-user-sentinel', 'private-password-sentinel', 'private-body-sentinel', 'private-token-sentinel')))
         report['ok'] = report['ok'] and report['rejected_single_json_safe_diagnostics']
+        session_results = {}
+        cases = {'success':None, 'expired401':'session_expired', 'expired403':'session_expired',
+                 'false':'session_expired', 'mismatch':'user_self_unverified', 'missing':'user_self_unverified',
+                 'html':'user_self_unverified', 'challenge':'challenge_or_block',
+                 'oversize':'user_self_unverified', 'self307':'user_self_unverified', 'self308':'user_self_unverified',
+                 'redirect_login':'session_expired', 'spa_login':'session_expired'}
+        request = dict(mode='session_verify', api_user='42', timeout_ms=6000,
+                       cookies=[dict(name='fixture_session', value='private-cookie-sentinel', domain='anyrouter.top',
+                                     path='/api', secure=False, http_only=True, expires=-1)])
+        for mode, expected in cases.items():
+            env.update(HELPER_FIXTURE_SESSION=mode, BROWSER_HELPER_DIAGNOSTICS='0' if expected is None else '1')
+            native = subprocess.run(command, input=json.dumps(request).encode()+b'\n', capture_output=True, cwd=ROOT, env=env, timeout=25)
+            value = json.loads(native.stdout)
+            evidence = json.loads(diagnostic.read_text())
+            good = (native.stderr == b'' and native.stdout.count(b'\n') == 1
+                    and evidence['private_pid_namespace'] and evidence['fd1_devnull'] and evidence['fd2_devnull']
+                    and evidence['browser_count'] == evidence['context_count'] == evidence['cookie_import_count'] == 1
+                    and evidence['service_workers_blocked'] and evidence.get('actual_browser_closed')
+                    and evidence['unsafe_request_count'] == evidence['sink_count'] == evidence['login_page_count'] == 0)
+            if expected is None:
+                good &= (native.returncode == 0 and value.get('ok') and value.get('api_user') == '42'
+                         and evidence['imported_cookie_seen'] and evidence['correct_user_header']
+                         and evidence['correlation_header_absent'] and 'diagnostics' not in value
+                         and len(value['cookies']) == 2 and all(c['path'] == '/api' for c in value['cookies']))
+            else:
+                good &= (native.returncode == 1 and value.get('error') == expected and 'cookies' not in value
+                         and set(value['diagnostics']) == set(core.diagnostics({}))
+                         and all(secret.encode() not in native.stdout for secret in
+                                 ('private-cookie-sentinel', 'private-refreshed-cookie', 'private-body-sentinel',
+                                  'private-token-sentinel', 'private-write-sentinel', 'private-beacon-sentinel')))
+            session_results[mode] = bool(good)
+            if not good:
+                # Only fixed codes/counts/booleans; never disclose input/output.
+                session_results[mode+'_error'] = value.get('error', 'unexpected_success')
+                session_results[mode+'_evidence'] = evidence
+        report['session_verify_cases'] = session_results
+        report['ok'] = report['ok'] and all(session_results.get(mode) is True for mode in cases)
     print(json.dumps(report, separators=(',', ':')))
     return 0 if report['ok'] else 1
 

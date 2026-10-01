@@ -1,4 +1,4 @@
-"""Login flow with bounded lifetime and positively verified profile responses."""
+"""Bounded login and read-only session flows with positively verified profiles."""
 
 from __future__ import annotations
 
@@ -8,12 +8,17 @@ import json
 import math
 import os
 import re
+import secrets
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 
 ORIGIN = "https://anyrouter.top"
-MAX_INPUT_BYTES = 16_384
+MAX_INPUT_BYTES = 65_536
+MAX_COOKIES = 128
+MAX_COOKIE_BYTES = 32_768
+MAX_PROFILE_BYTES = 262_144
 DEFAULT_TIMEOUT_MS = 60_000
 MAX_TIMEOUT_MS = 120_000
 FORM_WAIT_SECONDS = 15
@@ -21,6 +26,7 @@ CLEANUP_SECONDS = 2
 USERNAME_SELECTORS = ('#username', 'input[name="username"]', 'input[name="email"]', 'input[type="email"]')
 PASSWORD_SELECTORS = ('#password', 'input[name="password"]', 'input[type="password"]')
 SUBMIT_SELECTORS = ('form.semi-form button[type="submit"]', 'button[type="submit"]')
+LOGIN_NAMES = re.compile(r'^(登录|登\s*录|登入|Log\s*in|Login|Sign\s*in|Continue)$', re.I)
 ENTRY_SELECTORS = (
     '.semi-card button:has(.semi-icon-mail)',
     '.semi-card button:has([aria-label="mail"])',
@@ -144,7 +150,38 @@ class LoginInput:
     timeout_ms: int
 
 
-def parse_input(raw: bytes) -> LoginInput:
+@dataclass(frozen=True, repr=False)
+class SessionInput:
+    cookies: list[dict]
+    api_user: str
+    timeout_ms: int
+
+
+def validated_session_cookies(cookies):
+    if type(cookies) is not list or not 1 <= len(cookies) <= MAX_COOKIES:
+        raise ValueError
+    fields = {'name', 'value', 'domain', 'path', 'secure', 'http_only', 'expires'}
+    total = 0
+    result = []
+    now = time.time()
+    for cookie in cookies:
+        if type(cookie) is not dict or set(cookie) != fields:
+            raise ValueError
+        # Reuse the output validator, including native-clock expiry checks.
+        native = dict(cookie)
+        native['httpOnly'] = native.pop('http_only')
+        if not filtered_cookies([native], ORIGIN + '/console'):
+            raise ValueError
+        if cookie['expires'] != -1 and cookie['expires'] <= now:
+            raise ValueError
+        total += len(json.dumps(cookie, ensure_ascii=True, separators=(',', ':')).encode('ascii'))
+        if total > MAX_COOKIE_BYTES:
+            raise ValueError
+        result.append(native)
+    return result
+
+
+def parse_input(raw: bytes) -> LoginInput | SessionInput:
     if not raw or len(raw) > MAX_INPUT_BYTES or b'\n' in raw.rstrip(b'\r\n'):
         raise Failure("invalid_input")
     try:
@@ -156,19 +193,31 @@ def parse_input(raw: bytes) -> LoginInput:
                 result[key] = value
             return result
         data = json.loads(raw.decode('utf-8'), object_pairs_hook=unique_object)
-        if not isinstance(data, dict) or set(data) - {'username', 'password', 'timeout_ms'}:
+        if not isinstance(data, dict):
+            raise ValueError
+        mode = data.get('mode', 'login')
+        if mode not in ('login', 'session_verify'):
+            raise ValueError
+        timeout = data.get('timeout_ms', DEFAULT_TIMEOUT_MS)
+        if type(timeout) is not int or not 1000 <= timeout <= MAX_TIMEOUT_MS:
+            raise ValueError
+        if mode == 'session_verify':
+            if set(data) != {'mode', 'cookies', 'api_user', 'timeout_ms'}:
+                raise ValueError
+            user = data['api_user']
+            if type(user) is not str or not re.fullmatch(r'[0-9]{1,19}', user) or not 0 < int(user) <= 2**63 - 1:
+                raise ValueError
+            return SessionInput(validated_session_cookies(data['cookies']), str(int(user)), timeout)
+        if set(data) - {'mode', 'username', 'password', 'timeout_ms'}:
             raise ValueError
         username, password = data['username'], data['password']
-        timeout = data.get('timeout_ms', DEFAULT_TIMEOUT_MS)
         if not isinstance(username, str) or not username.strip() or len(username.encode('utf-8')) > 320:
             raise ValueError
         if not isinstance(password, str) or not password or len(password.encode('utf-8')) > 4096:
             raise ValueError
         if any(ord(c) < 32 or ord(c) == 127 for c in username + password):
             raise ValueError
-        if type(timeout) is not int or not 1000 <= timeout <= MAX_TIMEOUT_MS:
-            raise ValueError
-    except (ValueError, KeyError, TypeError, UnicodeError, RecursionError):
+    except (ValueError, KeyError, TypeError, UnicodeError, RecursionError, OverflowError):
         raise Failure("invalid_input") from None
     return LoginInput(username, password, timeout)
 
@@ -186,6 +235,15 @@ def safe_url(url: str, path: str | None = None) -> bool:
         )
     except (ValueError, TypeError):
         return False
+
+
+def safe_session_url(url: str, path: str | None = None) -> bool:
+    if not safe_url(url, path):
+        return False
+    parsed = urlsplit(url)
+    return (parsed.netloc == 'anyrouter.top' and '#' not in url and '%' not in parsed.path
+            and '\\' not in url and '//' not in parsed.path
+            and all(part not in ('.', '..') for part in parsed.path.split('/')))
 
 
 def profile_id(payload: object) -> str | None:
@@ -230,6 +288,8 @@ def filtered_cookies(cookies: list[dict], source_url: str) -> list[dict]:
             continue
         if type(expires) not in (int, float) or not math.isfinite(expires) or expires < -1:
             continue
+        if expires != -1 and expires <= time.time():
+            continue
         if type(cookie.get('secure')) is not bool or type(cookie.get('httpOnly')) is not bool:
             continue
         result.append(dict(name=name, value=value, domain=cookie['domain'], path=path,
@@ -256,6 +316,72 @@ async def first_visible(page, selectors):
     return None
 
 
+FORM_OWNER_JS = r"""(b, {u, p}) => {
+    if (!u || !p || !b.isConnected || !u.isConnected || !p.isConnected) return false;
+    const uf=u.form, pf=p.form, bf=b.form;
+    if (uf || pf || bf) return !!uf && uf===pf && uf===bf;
+    const semi=u.closest('.semi-form');
+    return !!semi && semi===p.closest('.semi-form') && semi===b.closest('.semi-form');
+}"""
+
+
+async def owned_submit(page, username, password):
+    if username is None or password is None:
+        return None
+    handles = []
+    try:
+        for item in (username, password):
+            handles.append(await item.element_handle())
+        candidates = [page.locator(selector) for selector in SUBMIT_SELECTORS]
+        candidates.append(page.get_by_role('button', name=LOGIN_NAMES))
+        for group in candidates:
+            for index in range(min(await group.count(), 12)):
+                button = group.nth(index)
+                if (await button.is_visible() and await button.is_enabled()
+                        and LOGIN_NAMES.fullmatch((await button.inner_text()).strip())
+                        and await button.evaluate(FORM_OWNER_JS, dict(u=handles[0], p=handles[1]))):
+                    return button
+        return None
+    finally:
+        for handle in handles:
+            if handle is not None:
+                await handle.dispose()
+
+
+NOTICE_ELIGIBLE_JS = r"""d => {
+    const titles=d.querySelectorAll('.semi-modal-title');
+    if (titles.length!==1 || !/^(公告|通知|Notice|Announcement)$/i.test(titles[0].innerText.trim())) return false;
+    if (/登录|注册|验证码|验证|协议|条款|同意|sign\s*in|log\s*in|captcha|verify|agreement|terms|consent/i.test(d.innerText)) return false;
+    if (d.querySelector('input,textarea,select,form,iframe,[contenteditable="true"],.nc-container,#nocaptcha,.cf-turnstile,.g-recaptcha')) return false;
+    const close=d.querySelectorAll('button.semi-modal-close:has(.semi-icon-close)');
+    return close.length===1 && !close[0].form && close[0].type!=='submit';
+}"""
+
+
+async def dismiss_notice_once(page, state):
+    if state.get('notice_dismiss_attempted') or not safe_url(page.url, '/login'):
+        return False
+    if await require_safe_page(page, state):
+        return False
+    dialogs = page.locator('[role="dialog"],dialog,.semi-modal-content')
+    count = await dialogs.count()
+    if count > 12:
+        return False
+    visible = [dialogs.nth(i) for i in range(count) if await dialogs.nth(i).is_visible()]
+    if len(visible) != 1:
+        return False
+    dialog = visible[0]
+    if not await dialog.evaluate(NOTICE_ELIGIBLE_JS):
+        return False
+    close = dialog.locator('button.semi-modal-close:has(.semi-icon-close)')
+    if not await close.is_visible() or not await close.is_enabled():
+        return False
+    state['notice_dismiss_attempted'] = True
+    await close.click(timeout=action_timeout(state))
+    await dialog.wait_for(state='hidden', timeout=action_timeout(state))
+    return True
+
+
 async def require_safe_page(page, state):
     if not safe_url(page.url):
         raise Failure('challenge_or_block')
@@ -280,7 +406,7 @@ async def find_form(page, state):
             continue
         username = await first_visible(page, USERNAME_SELECTORS)
         password = await first_visible(page, PASSWORD_SELECTORS)
-        submit = await first_visible(page, SUBMIT_SELECTORS)
+        submit = await owned_submit(page, username, password)
         if username and password and submit and await username.is_editable() and await password.is_editable():
             state['challenge'] = False
             state['http_block'] = False
@@ -326,6 +452,13 @@ async def login_work(credentials, launch, resources, state):
         if not safe_url(request.url):
             if critical:
                 state.update(network_failed=True, failure_request=kind, exception='network')
+            await route.abort()
+            return
+        # Managed login never signs in for rewards. This optional page write must
+        # be denied BEFORE fetch, with any query, without poisoning login/self.
+        # The Rust check-in engine alone owns persisted intent and the POST.
+        if (getattr(request, 'method', '') not in ('GET', 'HEAD')
+                and safe_url(request.url, '/api/user/sign_in')):
             await route.abort()
             return
         login = kind == 'login' and state['submitted']
@@ -426,8 +559,12 @@ async def login_work(credentials, launch, resources, state):
         _, _, submit = await find_form(page, state)
         if not safe_url(page.url, '/login'):
             raise Failure('login_form_unavailable')
-        state['submitted'] = True
         state['phase'] = 'submit'
+        await dismiss_notice_once(page, state)
+        await submit.click(trial=True, timeout=action_timeout(state))
+        if not safe_url(page.url, '/login') or await require_safe_page(page, state):
+            raise Failure('challenge_or_block')
+        state['submitted'] = True
         # Never retry submit: a timed out click may already have sent credentials.
         await submit.click(timeout=action_timeout(state))
         state['phase'] = 'profile_wait'
@@ -492,7 +629,199 @@ async def close_resources(resources):
                 pass
 
 
-async def run_login(credentials: LoginInput) -> dict:
+# Browser-side bounded decoding. Return text to Python, not JSON.parse's rounded
+# JS number: profile IDs may span the full signed 64-bit integer range.
+SESSION_PROFILE_JS = r"""async ({url, user, timeout, limit, proof}) => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeout);
+    let reader;
+    try {
+        const response = await fetch(url, {method:'GET', credentials:'include',
+            headers:{'New-Api-User':user, 'X-Helper-Proof':proof}, redirect:'error', cache:'no-store', signal:controller.signal});
+        reader = response.body.getReader();
+        const chunks = []; let size = 0;
+        while (true) {
+            const {done, value} = await reader.read();
+            if (done) break;
+            size += value.byteLength;
+            if (size > limit) { controller.abort(); return {error:'oversize'}; }
+            chunks.push(value);
+        }
+        const body = new Uint8Array(size); let offset = 0;
+        for (const chunk of chunks) { body.set(chunk, offset); offset += chunk.byteLength; }
+        return {status:response.status, type:response.headers.get('content-type') || '',
+            body:new TextDecoder('utf-8', {fatal:true}).decode(body)};
+    } catch { return {error:'network'}; }
+    finally { clearTimeout(timer); if (reader) await reader.cancel().catch(() => {}); }
+}"""
+
+
+def session_profile(reply, expected, state):
+    """Classify only bounded self proof; never retain untrusted body in state."""
+    if not isinstance(reply, dict) or 'error' in reply:
+        raise Failure('user_self_unverified')
+    status, body, content_type = reply.get('status'), reply.get('body'), reply.get('type')
+    state['self_status'] = status
+    if type(body) is not str or len(body.encode('utf-8')) > MAX_PROFILE_BYTES:
+        raise Failure('user_self_unverified')
+    if type(content_type) is not str or content_type.split(';')[0].strip().lower() != 'application/json':
+        raise Failure('challenge_or_block' if status in (401, 403, 429, 503) else 'user_self_unverified')
+    try:
+        payload = json.loads(body)
+    except (ValueError, RecursionError):
+        raise Failure('user_self_unverified') from None
+    state['self_json'] = True
+    success = payload.get('success') if isinstance(payload, dict) else None
+    state['self_success'] = success if type(success) is bool else None
+    if status in (401, 403) or success is False:
+        raise Failure('session_expired')
+    user = profile_id(payload) if status == 200 else None
+    state['self_id_valid'] = user is not None
+    state['self_id_type'] = 'integer' if user is not None else 'absent'
+    if user is None or user != expected:
+        raise Failure('user_self_unverified')
+    return user
+
+
+async def session_work(credentials, launch, resources, state):
+    try:
+        resources['browser'] = await launch(headless=True)
+    except Exception as exc:
+        if exception_kind(exc) == 'timeout':
+            raise
+        raise Failure('browser_unavailable') from None
+    resources['context'] = await resources['browser'].new_context(service_workers='block')
+    context = resources['context']
+    proof = secrets.token_hex(32)
+    await context.add_cookies(credentials.cookies)
+    # Only SPA readiness/header support, never identity evidence. No token/user
+    # profile or password is persisted, and no persistent browser profile exists.
+    await context.add_init_script(script="localStorage.setItem('user', " +
+                                  json.dumps(json.dumps({'id': int(credentials.api_user)})) + ");")
+
+    async def guard_route(route):
+        request = route.request
+        # Includes beacon/form/fetch writes; abort BEFORE fetch, even same-origin
+        # signin/checkin. Optional denied writes must not poison self verification.
+        if getattr(request, 'method', '') not in ('GET', 'HEAD') or not safe_session_url(request.url):
+            await route.abort()
+            return
+        kind = request_kind(request)
+        if kind == 'navigation' and safe_session_url(request.url, '/login'):
+            state['session_redirect'] = True
+            await route.abort()
+            return
+        if kind == 'self':
+            state.update(self_requested=True, self_user_header_present='new-api-user' in request.headers)
+            if request.headers.get('x-helper-proof') == proof and request.method == 'GET':
+                # Only our fixed-URL browser fetch uses this private correlation.
+                # Its redirect:'error' rejects ALL redirects in Chromium. Unlike
+                # route.fetch (which buffers), continue_ preserves streaming and
+                # AbortController's byte cap. Never use this for SPA requests.
+                headers = dict(request.headers)
+                headers.pop('x-helper-proof', None)
+                await route.continue_(headers=headers)
+                return
+        try:
+            fetched = await route.fetch(max_redirects=0, max_retries=0, timeout=action_timeout(state, MAX_TIMEOUT_MS))
+            if 300 <= fetched.status < 400 or not safe_session_url(fetched.url):
+                location = fetched.headers.get('location', '')
+                if kind == 'navigation' and (location == '/login' or safe_session_url(location, '/login')):
+                    state['session_redirect'] = True
+                await route.abort()
+            else:
+                await route.fulfill(response=fetched)
+        except Exception:
+            await route.abort()
+
+    async def reject_socket(socket):
+        # route_web_socket does not connect unless connect_to_server is called.
+        await socket.close(code=1008, reason='read_only')
+
+    await context.route('**/*', guard_route)
+    await context.route_web_socket('**/*', reject_socket)
+    page = await context.new_page()
+    page.set_default_timeout(5000)
+    state['phase'] = 'navigation'
+    try:
+        response = await page.goto(ORIGIN + '/console', wait_until='domcontentloaded', timeout=action_timeout(state, 20_000))
+    except Exception:
+        if state.get('session_redirect'):
+            raise Failure('session_expired') from None
+        raise
+    state['http_block'] = response is not None and response.status in (403, 429, 503)
+    state['phase'] = 'profile_wait'
+    while True:
+        if state.get('session_redirect'):
+            raise Failure('session_expired')
+        if not safe_session_url(page.url):
+            raise Failure('user_self_unverified')
+        state['challenge'] = await require_safe_page(page, state)
+        if state['challenge']:
+            await asyncio.sleep(0.1)
+            continue
+        if safe_session_url(page.url, '/login') or state.get('session_redirect'):
+            raise Failure('session_expired')
+        if not safe_session_url(page.url, '/console'):
+            raise Failure('user_self_unverified')
+        state.update(self_requested=True, self_user_header_present=True)
+        try:
+            reply = await page.evaluate(SESSION_PROFILE_JS, dict(url=ORIGIN + '/api/user/self',
+                                       user=credentials.api_user, timeout=action_timeout(state, MAX_TIMEOUT_MS),
+                                       limit=MAX_PROFILE_BYTES, proof=proof))
+        except Exception as exc:
+            if state.get('session_redirect'):
+                raise Failure('session_expired') from None
+            if exception_kind(exc) != 'navigation_transient':
+                raise
+            # Challenge-driven same-origin reloads may invalidate an evaluation;
+            # the overall timeout still owns this passive retry loop.
+            await asyncio.sleep(0.05)
+            continue
+        try:
+            user = session_profile(reply, credentials.api_user, state)
+        except Failure as exc:
+            if state.get('session_redirect'):
+                raise Failure('session_expired') from None
+            if str(exc) != 'challenge_or_block':
+                if state['http_block'] and isinstance(reply, dict) and reply.get('error') == 'network':
+                    raise Failure('challenge_or_block') from None
+                raise
+            state['http_block'] = True
+            await asyncio.sleep(0.1)
+            continue
+        if state.get('session_redirect') or not safe_session_url(page.url, '/console'):
+            if state.get('session_redirect'):
+                raise Failure('session_expired')
+            raise Failure('session_expired' if safe_session_url(page.url, '/login') else 'user_self_unverified')
+        state.update(phase='cookie_read', http_block=False)
+        cookies = filtered_cookies(await context.cookies(), page.url)
+        if not cookies:
+            raise Failure('user_self_unverified')
+        state['phase'] = 'done'
+        return {'ok': True, 'cookies': cookies, 'api_user': user}
+
+
+async def run_session(credentials: SessionInput) -> dict:
+    resources = {}
+    state = dict(deadline=asyncio.get_running_loop().time() + credentials.timeout_ms / 1000,
+                 submitted=False, phase='launch', challenge=False, http_block=False)
+    try:
+        return await asyncio.wait_for(session_work(credentials, browser_launcher(), resources, state), credentials.timeout_ms / 1000)
+    except Failure as exc:
+        return failure_result(str(exc), state)
+    except Exception as exc:
+        state['exception'] = exception_kind(exc)
+        code = ('challenge_or_block' if state['challenge'] or state['http_block'] else
+                ('timeout' if state['exception'] == 'timeout' and state['phase'] in ('launch', 'navigation') else 'user_self_unverified'))
+        return failure_result(code, state)
+    finally:
+        await close_resources(resources)
+
+
+async def run_login(credentials: LoginInput | SessionInput) -> dict:
+    if isinstance(credentials, SessionInput):
+        return await run_session(credentials)
     resources = {}
     state = dict(deadline=asyncio.get_running_loop().time() + credentials.timeout_ms / 1000,
                  submitted=False, pending_login=False, network_failed=False, challenge=False,

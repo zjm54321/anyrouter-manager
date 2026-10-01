@@ -22,6 +22,50 @@ from browser_helper.__main__ import reserve_protocol_fd, write_all
 BINARY = '/nix/store/sv231g34qjil8r23fc43i1mnlmyvgzhn-cloakbrowser-chromium-146.0.7680.177.5/bin/cloakbrowser-chrome'
 
 
+async def ui_policy_cases(page, report, render):
+    # Actual browser HTML5 .form resolution, including explicit external owners.
+    fields = "<input id='username'><input id='password' type='password'>"
+    wrong = "<button id='header' type='submit'>Sign in</button><form id='wrong'><button type='submit'>Login</button></form>"
+    forms = [
+        (f"<form id='login' class='semi-form'>{fields}<button id='good' type='submit'>Continue</button></form>", True),
+        (f"<form id='login'>{fields}</form><button id='good' form='login' type='submit'>Continue</button>", True),
+        (f"<div class='semi-form'>{fields}<button id='good' type='button'>Continue</button></div>", True),
+        (f"<form id='login'>{fields}<button id='good' form='wrong' type='submit'>Continue</button></form>", False),
+        ("<form id='login'><input id='username'><input id='password' form='wrong'><button type='submit'>Continue</button></form>", False),
+        (f"{fields}<button type='submit'>Continue</button>", False),
+    ]
+    for index, (html, expected) in enumerate(forms):
+        report['phase'] = 'form_owner_' + str(index)
+        await render(wrong+html)
+        report['phase'] += '_select'
+        page.set_default_timeout(3000)
+        button = await core.owned_submit(page, page.locator('#username'), page.locator('#password'))
+        report['phase'] += '_assert'
+        assert (button is not None) == expected
+        if expected:
+            assert await button.get_attribute('id') == 'good'
+    report['native_form_owner_cases'] = len(forms)
+    close = "<button type='button' class='semi-modal-close' onclick='window.closedCount++;this.parentElement.remove()'><span class='semi-icon-close'></span></button>"
+    cases = [
+        ('公告', '', '', True), ('通知', '', '', True), ('Notice', '', '', True),
+        ('Unknown', '', '', False), ('公告验证', '', '', False),
+        ('公告', 'Please accept the agreement', '', False),
+        ('公告', '<input>', '', False), ('公告', '<form></form>', '', False),
+        ('公告', '<iframe></iframe>', '', False), ('公告', '<div class="g-recaptcha"></div>', '', False),
+        ('公告', '', '<div role="dialog">Unknown</div>', False),
+        ('公告', close, '', False),
+    ]
+    for index, (title, body, extra, expected) in enumerate(cases):
+        report['phase'] = 'notice_' + str(index)
+        await render(f"<script>window.closedCount=0</script><div role='dialog' class='semi-modal-content'><h2 class='semi-modal-title'>{title}</h2>{body}{close}</div>{extra}")
+        state = dict(deadline=asyncio.get_running_loop().time()+2, submitted=False)
+        assert await core.dismiss_notice_once(page, state) == expected
+        assert not await core.dismiss_notice_once(page, state)
+        assert await page.evaluate('window.closedCount') == int(expected)
+    report['native_strict_notice_cases'] = len(cases)
+    report.pop('phase', None)
+
+
 def audit(event, args):
     if event == 'socket.connect':
         address = args[1]
@@ -64,19 +108,35 @@ async def probe(report):
 
         def do_GET(self):
             requests.append(('GET', self.path))
+            if self.path == '/login?ui=1':
+                self.reply(200, mode['ui_html'].encode(), [('Content-Type', 'text/html; charset=utf-8')])
+                return
             if self.path == '/login':
+                managed = mode['kind'] in ('managed', 'external', 'semi', 'notice')
+                login_path = '/api/user/login?generated=%2Fconsole&challenge=local' if managed else '/api/user/login'
                 js = ("await fetch('/unrelated', {method:'POST',body:'fictional-sentinel'});"
-                      "const reply=await fetch('/api/user/login',{method:'POST',body:'fictional-sentinel'});"
+                      f"const reply=await fetch('{login_path}',{{method:'POST',body:'fictional-sentinel'}});"
                       "const result=await reply.json();if(!result.success)return;"
+                      + ("for(const q of ['', '?auto=1']){try{await fetch('/api/user/sign_in'+q,{method:'POST'});}catch{await fetch('/auto-blocked',{method:'POST'});}}" if managed else '') +
                       "await new Promise(resolve=>setTimeout(resolve,400));"
                       "localStorage.setItem('user',JSON.stringify({id:42,token:'private-storage-sentinel'}));"
                       "await fetch('/ready',{method:'POST',body:'ready'});"
                       + ("history.replaceState({},'', '/console');await fetch('/optional.png').catch(()=>{});await fetch('/api/user/self');" if mode['kind'] == 'spa' else
                          ("await fetch('/api/user/self');" if mode['kind'] == 'early' else '')))
-                html = ("<form class='semi-form'><input id='username'><input id='password' type='password'>"
-                        "<button type='submit'>login</button></form><script>document.querySelector('form').onsubmit=async e=>{"
-                        "e.preventDefault();" + js + "};</script>").encode()
-                self.reply(200, html, [('Content-Type', 'text/html')])
+                fields = "<input id='username'><input id='password' type='password'>"
+                button = "<button id='submit' type='submit' form='login'>Continue</button>"
+                form = f"<form id='login' class='semi-form'>{fields}{button}</form>"
+                if mode['kind'] == 'external':
+                    form = f"<form id='login'>{fields}</form>{button}"
+                if mode['kind'] == 'semi':
+                    form = f"<div id='login' class='semi-form'>{fields}<button id='submit' type='button'>Continue</button></div>"
+                wrong = "<button type='submit' onclick=\"fetch('/wrong-submit',{method:'POST'})\">Sign in</button><form id='wrong'><button type='submit'>Sign in</button></form>" if managed else ''
+                notice = ("<div role='dialog' class='semi-modal-content' style='position:fixed;inset:0;z-index:100;background:white'>"
+                          "<h2 class='semi-modal-title'>公告</h2><p>Maintenance information</p>"
+                          "<button type='button' class='semi-modal-close' onclick='this.parentElement.remove()'><span class='semi-icon-close'>X</span></button></div>" if mode['kind'] == 'notice' else '')
+                event = "document.querySelector('#submit').onclick" if mode['kind'] == 'semi' else "document.querySelector('#login').onsubmit"
+                html = (wrong + form + notice + f"<script>{event}=async e=>{{e.preventDefault();" + js + "};</script>").encode()
+                self.reply(200, html, [('Content-Type', 'text/html; charset=utf-8')])
             elif self.path == '/console':
                 if not mode.get('spa_ready', False) or mode['kind'] == 'slow' and not mode['slow_finished']:
                     mode['premature_console'] = True
@@ -94,7 +154,7 @@ async def probe(report):
             requests.append(('POST', self.path))
             if self.path in ('/307', '/308'):
                 self.reply(int(self.path[1:]), headers=[('Location', f'http://127.0.0.1:{second.server_port}/sink')])
-            elif self.path == '/api/user/login':
+            elif urlsplit(self.path).path == '/api/user/login':
                 if mode['kind'] == 'slow':
                     time.sleep(6)
                 mode['slow_finished'] = True
@@ -106,6 +166,8 @@ async def probe(report):
             elif self.path == '/ready':
                 mode['spa_ready'] = True
                 self.reply(200, b'{}', [('Content-Type', 'application/json')])
+            elif self.path == '/auto-blocked':
+                self.reply(200)
             else:
                 self.reply(404)
 
@@ -172,13 +234,19 @@ async def probe(report):
         assert redirected == [307, 308]
         assert second_requests == []
         report['real_307_308_second_origin_requests'] = 0
+        # Safe-page restriction stays production-only; this fixture uses loopback.
+        with patch.object(core, 'safe_url', local_safe):
+            async def render(html):
+                mode['ui_html'] = html
+                await page.goto(origin+'/login?ui=1', wait_until='domcontentloaded')
+            await ui_policy_cases(page, report, render)
         await context.close()
         context = None
         await browser.close()
         browser = None
         report['wrapper_close'] = True
 
-        # Production helper logic unchanged. ONLY this fixture temporarily swaps
+        # Exercise production helper logic. ONLY this fixture temporarily swaps
         # fixed origin validation/cookie fixture domain; never production URLs.
         original_filter = core.filtered_cookies
         original_safe = core.safe_url
@@ -188,10 +256,12 @@ async def probe(report):
             with patch.object(core, 'safe_url', original_safe):
                 return original_filter(translated, 'https://anyrouter.top/console')
         with patch.object(core, 'ORIGIN', origin), patch.object(core, 'safe_url', local_safe), patch.object(core, 'filtered_cookies', local_cookies), patch.object(core, 'browser_launcher', return_value=launch):
-            for kind in ('early', 'slow', 'spa'):
+            for kind in ('early', 'slow', 'spa', 'managed', 'external', 'semi', 'notice'):
                 report['phase'] = 'helper_' + kind
                 mode.update(kind=kind, slow_finished=False, premature_console=False, spa_ready=False)
                 console_before = requests.count(('GET', '/console'))
+                blocked_before = requests.count(('POST', '/auto-blocked'))
+                login_before = sum(method == 'POST' and urlsplit(path).path == '/api/user/login' for method, path in requests)
                 start = time.monotonic()
                 result = await core.run_login(core.LoginInput('fixture-user', 'fictional-sentinel', 20000))
                 assert result['ok'], result.get('error', 'fixture_failed')
@@ -202,7 +272,14 @@ async def probe(report):
                     assert mode['slow_finished'] and time.monotonic() - start >= 6
                 if kind == 'spa':
                     assert requests.count(('GET', '/console')) == console_before
+                assert sum(method == 'POST' and urlsplit(path).path == '/api/user/login' for method, path in requests) == login_before+1
+                if kind in ('managed', 'external', 'semi', 'notice'):
+                    assert requests.count(('POST', '/auto-blocked')) == blocked_before+2
+                    assert ('POST', '/api/user/login?generated=%2Fconsole&challenge=local') in requests
+                    assert not any(urlsplit(path).path in ('/api/user/sign_in', '/wrong-submit') for _, path in requests)
                 report['real_helper_' + kind + '_self'] = True
+            report['managed_auto_signin_sink_count'] = 0
+            report['managed_login_query_preserved_single_submit'] = True
             mode.update(kind='rejected', slow_finished=False)
             with patch.dict(os.environ, {'BROWSER_HELPER_DIAGNOSTICS': '1'}):
                 result = await core.run_login(core.LoginInput('private-user-sentinel', 'private-password-sentinel', 20000))
