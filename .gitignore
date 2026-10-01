@@ -16,3 +16,4 @@ __pycache__/
 /results/
 /results.json
 /tools/browser-helper/results/
+.slim/deepwork/

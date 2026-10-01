@@ -1,9 +1,10 @@
 # AnyRouter Manager
 
-面向本机使用的单账号管理器：Rust 后端，React / TypeScript 前端。上游固定为
-`https://anyrouter.top`，不可通过配置切换为任意站点。通过本地 Web UI 提交账号密码，
-优先通过直接 HTTP 或在遇到防护页时回退单次浏览器完成登录，并提取现有 API Key 供本地 `/v1` 网关代理使用；
-不提供多账号池；定时与手动签到已接入前后端管理 API（默认关闭）。
+面向本机使用的 AnyRouter 多账号管理器与 API 网关代理：Rust 后端，React / TypeScript 前端。上游固定为 `https://anyrouter.top`，不可通过配置切换为任意站点。
+
+通过本地 Web UI 提交账号密码，优先通过直接 HTTP 或在遇到防护页时回退单次浏览器完成登录，支持管理最多 64 个账号（Portfolio V2）；由管理员显式手选“使用此账号”指定单一全局生效路由，新发起的所有 `/v1` 客户端请求透明代理至该账号，运行中的流式请求（SSE）与长连接保持原有快照不变；系统不提供负载均衡、自动故障切换或保活探测。
+
+多账号固定时槽每日签到已接入前后端接口（默认关闭）；本地环形缓冲错误日志支持保留非 2xx 原始正文供调试；`/v1/models` 接口自动执行 13 个特定模型白名单过滤。
 
 ## NixOS / WSL2 环境
 
@@ -13,11 +14,9 @@
 nix develop
 ```
 
-默认 shell 提供 Rust、Cargo、rustfmt、Clippy、Node.js 24（含 npm）、Python、uv、util-linux（含 unshare）、
-pkg-config 和 OpenSSL，**不包含、不下载浏览器**。锁定的 nixpkgs 为 `7a0f122f5090cf4c2ade2a13a0e229d4e19ba71f`。
+默认 shell 提供 Rust、Cargo、rustfmt、Clippy、Node.js 24（含 npm）、Python、uv、util-linux（含 unshare）、pkg-config 和 OpenSSL，**不包含、不下载浏览器**。锁定的 nixpkgs 为 `7a0f122f5090cf4c2ade2a13a0e229d4e19ba71f`。
 
-两个 shell 均包含 Python native wheels 所需最小 C++ runtime 的 `LD_LIBRARY_PATH`，
-并设置 `PLAYWRIGHT_NODEJS_PATH = "${pkgs.nodejs_24}/bin/node"`。
+两个 shell 均包含 Python native wheels 所需最小 C++ runtime 的 `LD_LIBRARY_PATH`，并设置 `PLAYWRIGHT_NODEJS_PATH = "${pkgs.nodejs_24}/bin/node"`。
 
 真实账号登录与自动化浏览器依赖必须使用 browser shell：
 
@@ -25,17 +24,7 @@ pkg-config 和 OpenSSL，**不包含、不下载浏览器**。锁定的 nixpkgs 
 nix develop .#browser
 ```
 
-此环境提供官方修补版 CloakBrowser（x86_64 固定 **146.0.7680.177.5**，官方 binary 标记为 unfree/nonredistributable，
-仅在独立 package 开启允许），设置 `CLOAKBROWSER_BINARY_PATH` 环境变量，无需全局 nix-ld。
-
-**实测与验证状态：**
-- **本次实测流程**：在受限隔离临时环境中实测 AnyRouter 线上登录成功、读取余额成功、读取已有 Key（1 个）成功、激活并通过 `/v1/models` 网关代理请求（HTTP 200，返回 16 个模型列表 JSON）、刷新余额成功。现场观察证实登录后页面自然发起单次签到 POST（HTTP 200 `success: true`，提示 25 美元奖励，仅匹配“签到成功”短语）。测试结束临时配置和会话文件已清除，未调用任何付费接口，未创建新 Key，无重复签到。
-- **进程隔离与生命周期**：本地非 container 模式通过 Linux PID/User namespace (`unshare --user --map-current-user --pid --fork --kill-child=KILL --mount-proc`) 与 `PDEATHSIG` 控制 helper 及其子进程，已验证 namespace 结束会回收其内子进程；`container_mode` 下采用 Rust subreaper 监督进程（supervisor）而不是 namespace 沙箱，配合容器默认 PID namespace 与 `tini` 回收子进程，无需 `SYS_ADMIN` 或 `unconfined`，禁止 `host PID`；单一浏览器信号量从唤起到完全确认回收全程受控（含取消场景）。
-- **模块测试与接入状态**：
-  - Rust 后端：落地混合登录机制（优先独立空 CookieStore 直连 POST；仅已知 WAF HTML 挑战单次回退浏览器；JSON 失败/超时/5xx/未知 HTML 绝不唤起浏览器；直接复用已验证的 self/id/余额/上游用户名，无重复 GET；网关客户端不带 cookie jar）。后端完成 56 项 unit + 9 项 integration 测试全部通过（默认 1 项真实 browser ignored 已先单独跑通关于 about:blank normal/timeout 验证），`cargo fmt`、`clippy` 与 `build` 全部通过；已修复路径别名冲突（P1：相对/绝对/`..`/祖先软链接同文件拒绝），panic 记录 unknown 终止任务，跨 08:00 CST 状态落盘失败安全恢复，无上游网络请求。
-  - Python helper：托管登录安全守卫主动拦截页面自动 `sign_in`，`session_verify` 只读；通过 77 项 unit + 真实 localhost smoke / module 入口 / 13 项 session 测试。
-  - 前端：33 项 test、typecheck、build 及 390px/1280px 响应式截图通过；签到管理功能已接入前后端（`GET /api/checkin`、`PUT /api/checkin/settings`、`POST /api/checkin/run`，09:00 默认关闭、北京时间 08:00 重置、180 条 JSON 周期摘要、unknown 人工确认、成功去重）。
-  - 本地 HTTP 集成验证全部通过：父代理执行本地集成验证脚本（`anyrouter-final-integration.py`），7 组本地 HTTP 真实检查（健康检查、静态托管、签到默认配置与重置、严格配置与 Origin 校验、空账号 404/401 隔离、重启配置持久化及管理员会话注销）全部通过（使用临时随机 root key，未请求上游）。
+此环境提供官方修补版 CloakBrowser（x86_64 固定 **146.0.7680.177.5**，官方 binary 标记为 unfree/nonredistributable，仅在独立 package 开启允许），设置 `CLOAKBROWSER_BINARY_PATH` 环境变量，无需全局 nix-ld。
 
 ## 配置与秘密边界
 
@@ -46,17 +35,26 @@ cp config.example.toml config.toml
 chmod 600 config.toml
 ```
 
-自行设置 `root_key` 为**至少 32 字节的高熵随机 ASCII 密钥**（不提供默认可猜密钥）。默认仅监听 `127.0.0.1:8080`。
+自行设置 `root_key` 为**至少 32 字节的高熵随机 ASCII 密钥**（系统不提供默认密钥，运行前需自行生成并在本地妥善保存，切勿将密钥提交至代码仓库）。默认仅监听 `127.0.0.1:8080`。
 
-- `root_key` 用于本机管理授权及受保护的 Key 明文读取，不是 AnyRouter 密码。
+- `root_key` 用于本机管理鉴权、`/v1` 网关代理请求以及通过 `Authorization: Bearer <root_key>` 查看选定 Key 明文，不是 AnyRouter 账号密码。
 - 账号密码仅用于登录瞬时传递，**严禁落盘，但未做底层安全内存擦除（not secure-wipe）**。
-- 激活后账号状态保存于 `data/account.json`（会话 Cookie、账号信息与选定的明文 Key），签到状态保存于 `data/checkin.json`（周期记录与调度设置），文件权限严格采用 `0600`（目录 `0700`）。
-  **这是敏感明文状态，不是加密保险箱（0600 plaintext, not encrypted vault）**，不保存密码。项目中未留存账号数据，运行前需自行在 UI 中登录。
-- 可选配置 `login_diagnostics = false`（默认关闭）：开启时仅在错误中返回固定白名单安全元数据（见 `backend/src/diagnostics.rs`），不记录密码、原始响应体或敏感 Cookie，不额外落盘日志。
-- 可选配置 `container_mode = false`（默认 false）：仅当显式设为 `true` 时，采用 Rust subreaper 监督进程（supervisor）模式管理 helper 进程树，支持绑定非回环地址（如 `0.0.0.0`）；在容器内使用标准 PID namespace 与 `tini`，无需 `SYS_ADMIN` 或 `unconfined`，禁止 `host PID`；本地非容器环境（`false`）仍使用 Linux `unshare` 沙箱。
-- 可选配置 `cookie_secure = false`（默认 false）：在远程反向代理与 HTTPS 部署时应设为 `true`，强制管理会话 Cookie 包含 `Secure` 标记。
-- 可选配置 `browser_helper_executable`：支持指定用于运行 helper 的 Python 解释器绝对路径（适配独立打包的虚拟环境），缺省时默认使用 `uv` 驱动。
-- 优雅停机与健康检查：原生捕获 `SIGTERM` 与 `SIGINT` 信号，在 10 秒内清理后台跟踪任务，15 秒内排空 HTTP 请求；提供活跃度探针与带缓存的降级就绪探针（检查命名空间与浏览器可用性）。
+- **状态持久化与文件安全**：
+  - 账号列表保存于 `data/account.json`（Portfolio V2 格式，上限 8 MiB，最多 64 账号，支持从单账号旧版 Active 格式完整原子迁移并保留旧路由；新增账号不自动切换路由；基于 `upstream_user_id` 去重；重新登录保留原 ID、顺序与路由状态；未绑定 Key 的账号可签到但不可选为路由）。
+  - 签到状态保存于 `data/checkin.json`（上限 8 MiB，每账号最多 180 条历史，系统总上限 11,520 条；旧历史身份可保留并加载；清理时保护当前、上一周期、未来及 running 记录）。
+  - 请求日志保存于 `data/request-logs.json`（上限 1 MiB，最多 1000 条记录；内存容量 256 环形缓冲，异步落盘不阻塞流式传输）。
+  - 文件权限严格限定为 `0600`（所有父目录必须为 `0700`）。启动时对状态路径、日志路径与 `config.toml` 进行别名与祖先路径冲突校验。
+  - **重要声明：这是敏感明文存储，不是加密保险箱（0600 plaintext, not encrypted vault）**，不存储用户登录密码。
+- **请求日志与错误保真**：
+  - 2xx 成功请求仅记录时间戳、账号标识与 HTTP 状态码（不记录正文，不代表 SSE 流完成）。
+  - 非 2xx 错误响应保真记录前 64 KiB 原始正文（不脱敏，断流标记 `truncated: true`；用户明确个人使用保留原文供排错，若上游自身回显秘密则按原文留存；前端在 `<pre>` 中严格以纯文本渲染）。
+- **模型白名单清洗**：
+  - `GET /v1/models` 在上游返回 200 OK 且体积 $\le 2\text{ MiB}$ 时，精确过滤 13 个指定模型 ID，保留其余模型顺序与属性并重算 `Content-Length`，不拦截客户端推理请求参数。
+- **可选运行时配置**：
+  - `container_mode = false`（默认 false）：仅当显式设为 `true` 时，采用 Rust subreaper 监督进程（supervisor）模式管理 helper 进程树，支持绑定非回环地址；本地非容器环境（`false`）仍使用 Linux `unshare` 沙箱。
+  - `cookie_secure = false`（默认 false）：在远程反向代理与 HTTPS 部署时应设为 `true`。
+  - `browser_helper_executable`：支持指定用于运行 helper 的 Python 解释器绝对路径。
+- **优雅停机**：原生捕获 `SIGTERM` 与 `SIGINT` 信号，在 10 秒内清理后台跟踪任务，15 秒内排空 HTTP 请求后退出。
 
 ## 一次性安装 helper 依赖与构建
 
@@ -68,7 +66,9 @@ npm --prefix frontend ci
 npm --prefix frontend run build
 ```
 
-## 启动服务
+## 本地启动说明
+
+本地服务已在 18880 端口保持运行，测试环境使用临时随机 `root_key`；正式生产密钥生成与远端部署将在 Oracle Gate 1 评审通过后推进。
 
 生产式本机运行（Rust 后端直接托管 `frontend/dist` 静态资源）：
 
@@ -76,17 +76,17 @@ npm --prefix frontend run build
 cargo run --locked --manifest-path backend/Cargo.toml -- --config config.toml
 ```
 
-访问 `http://localhost:8080`，使用配置的 `root_key` 登录后，在界面中输入 AnyRouter 账号密码完成激活。
+访问 `http://localhost:8080`，使用配置的 `root_key` 登录后，在界面中添加管理账号与配置签到。
 
-前端单独开发模式可运行：
+前端单独开发模式：
 
 ```sh
 npm --prefix frontend run dev -- --host 127.0.0.1
 ```
 
-访问 `http://localhost:5173`。Vite 已配置开发代理将 `/api` 与 `/v1` 转发至 `http://127.0.0.1:8080`。
+访问 `http://localhost:5173`。Vite 开发代理将 `/api` 与 `/v1` 转发至 `http://127.0.0.1:8080`。
 
-## 验证与已知限制
+## 验证与已知边界
 
 ```sh
 nix flake check --no-build
@@ -94,12 +94,13 @@ cargo test --locked --manifest-path backend/Cargo.toml
 npm --prefix frontend test
 ```
 
-- 本次实测验证了当前环境下通过浏览器完成防护页加载、登录与既存 Key 读取可用；但不保证上游未来 DOM 变动或防护规则升级后永久有效。
-- 额度数值保留上游原始字符串（raw unit），不进行货币汇率猜测。
-- **容器与 Docker 支持边界**：项目编写了 Dockerfile 及 GitHub Actions 私有 GHCR 镜像工作流并通过了 18 组静态 mock 与 lint 检查，测试在同一 image ID 下验证后再 push 私有 GHCR。环境未安装本机 Docker Engine，亦未运行远端仓库与 GitHub Actions workflow，不声称镜像构建或容器集群部署已实测验证。旧版“namespace 默认 Docker 必阻断”文案现已过时，当前采用 Rust subreaper 监督进程（supervisor）替代 namespace 沙箱，该机制需待后续真实 CI 环境实测，仍保持容器内无特权限制。
-- **签到功能状态与日常登录守卫**：北京时间每日 08:00 重置周期来自用户规则（单点现场观察未独立验证跨日切规律）。日常管理器登录时，helper 安全守卫会主动拦截控制台页面的自动签到 POST，将签到行为作为计划任务交由管理器控制，避免在管理登录时意外触发签到导致漏记状态或与调度计划冲突（这与线上页面真实自动发起签到并不矛盾）；生产环境签到 HTTP 接口实现仅包含本地 mock 验证，不再使用真实账号重复签到探测。
-- **Git 提交状态**：项目遵循按组件分步提交规范，功能模块已分步完成提交，最终文档由父代理完成最后集成提交。
-- **最终集成验证结论**：本地端到端集成验证已由父代理执行完毕（7 组本地 HTTP 真实链路检查全部通过），无未尽待执行事项。
+- **后端测试状态**：Rust 后端 133 项 unit + 9 项 supervisor integration 测试全部通过（2 项授权 probe 与 1 项原生 browser 测试默认 ignored 此前已单独跑通）。
+- **本地集成验证**：父代理运行本地集成脚本（`anyrouter-multi-final-integration.py`）四阶段全部通过；本地 HTTP 6 组系统日志管理检查全部通过。
+- **历史与线上实测记录**：受控环境下完成多账号真实登录、读取 Key、揭示验证、生效路由手选/切换以及 `/v1/models` 精确过滤；真实账号刷新（6724/5930 ms）与单次生产签到（2xx `success: true`）实测通过，未在上游重复执行签到探测，未调用付费模型推理。
+- **多账号签到固定时槽**：每日按账号添加顺序分配固定时槽，默认起始 09:00（默认关闭），间隔 30 分钟。若排程累计超过 24 小时周期（1440 分钟）严格返回 `422 schedule_overflow`。单账号单周期唯一，失败或未知状态不自动重试，晚到仅 catch-up 当前周期。
+- **前端接入现状**：前端 117 项单元/组件测试、类型检查与构建全部通过（包含修复 RevealDialog 身份时序新增的 15 项测试及 17 项 hook race 回归测试）；整装页面通过原生 UI 验收（涵盖 4 主页面与系统日志导航、6 列数据表、原生仅设置页时间配置、弹窗重开清理、单次刷新与真实登录保存）。
+- **容器与 CI 状态**：项目完成 Dockerfile 及私有 GHCR 工作流，完成 13 条 pure tests exact 各 1 项通过 + 18 组容器静态 + 6 组 workflow groups (18 event cases) + hadolint/actionlint/shellcheck 检查；本地主机无 Docker，远端 GitHub 仓库与 Actions 实际尚未运行，未在 homelab 或远端执行上传与发布。用户全自动交付授权已覆盖手工确认门控，Oracle Gate 1 评审已通过，按阶段推进后续工作。
+- **Git 提交基线**：当前仓库处于基线 12 次提交状态（`main 353282a`），多账号、真实校验记录与日志模块由父代理完成后续集成提交，不预写未知 commit hash 或提交计数。
 
 ## 许可证 (License)
 
