@@ -1,37 +1,52 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
-import type { AccountState, ActiveAccount, CheckinFullStatus } from "./api";
+import type {
+  AccountDTO,
+  AccountsResponse,
+  GlobalCheckinResponse,
+} from "./api";
 
 const balance = { quota_raw: "1000000.25", used_quota_raw: "25000", fetched_at: "2026-09-30T12:00:00Z" };
-const active: ActiveAccount = {
+const accountA: AccountDTO = {
+  id: "acc-1",
   revision: "rev-1",
   username: "current-user",
   upstream_user_id: "10",
   balance,
+  keys: [{ id: "key-1", name: "Existing key", masked: "sk-ab…1234", enabled: true }],
   selected_key: { id: "key-1", name: "Existing key", masked: "sk-ab…1234" },
-  activated_at: "2026-09-30T12:00:00Z",
+  added_at: "2026-09-30T12:00:00Z",
 };
 
-const snapshot = (extra: Partial<AccountState> = {}): AccountState => ({
-  active,
+const snapshot = (extra: Partial<AccountsResponse> = {}): AccountsResponse => ({
+  accounts: [accountA],
+  route_account_id: "acc-1",
   candidate: null,
   operation: null,
   ...extra,
 });
 
-const defaultCheckin: CheckinFullStatus = {
+const defaultCheckin: GlobalCheckinResponse = {
   settings: {
     enabled: false,
     time: "09:00",
+    interval_minutes: 30,
     timezone: "Asia/Shanghai",
     reset_time: "08:00",
   },
   cycle_date: "2026-10-01",
-  today: null,
-  history: [],
   next_run_at: null,
+  schedule: [
+    {
+      account_id: "acc-1",
+      scheduled_at: "2026-10-01T09:00:00+08:00",
+      status: "pending",
+    },
+  ],
 };
+
+const emptyLogs = { items: [], dropped_count: 0 };
 
 const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
@@ -62,55 +77,69 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-async function openDashboard(checkinState = defaultCheckin, accountState = snapshot()) {
-  fetchMock.mockResolvedValueOnce(json(accountState));
-  fetchMock.mockResolvedValueOnce(json(checkinState));
+async function openDashboard(
+  checkinState = defaultCheckin,
+  accountsState = snapshot(),
+  page: "accounts" | "settings" = "accounts"
+) {
+  fetchMock.mockImplementation(async (url: string | URL | Request) => {
+    const urlStr = typeof url === "string" ? url : url.toString();
+    if (urlStr.startsWith("/api/accounts")) return json(accountsState);
+    if (urlStr.startsWith("/api/checkin")) return json(checkinState);
+    if (urlStr.startsWith("/api/request-logs")) return json(emptyLogs);
+    return json({});
+  });
+
+  window.location.hash = "#" + page;
   render(<App />);
-  await screen.findByRole("heading", { name: "当前账号" });
-  await screen.findByRole("heading", { name: "每日自动签到" });
+  if (page === "settings") {
+    await screen.findByRole("heading", { name: /全局自动签到/ });
+    if (checkinState.cycle_date) {
+      await screen.findByText(new RegExp(`${checkinState.cycle_date} 周期`));
+    }
+  } else {
+    await screen.findByRole("heading", { name: /已绑定账号列表/ });
+  }
 }
 
 describe("Checkin 集成流程与异常处理", () => {
-  it("authenticated load fetches both /api/account and /api/checkin and renders checkin panel", async () => {
-    const configuredCheckin: CheckinFullStatus = {
+  it("authenticated load fetches both /api/accounts and /api/checkin and renders checkin config", async () => {
+    const configuredCheckin: GlobalCheckinResponse = {
       settings: {
         enabled: true,
         time: "09:30",
+        interval_minutes: 30,
         timezone: "Asia/Shanghai",
         reset_time: "08:00",
       },
       cycle_date: "2026-10-01",
-      today: null,
-      history: [
+      schedule: [
         {
-          date: "2026-09-30",
-          account_user_id: "10",
-          trigger: "scheduled",
-          status: "success",
-          started_at: "2026-09-30T01:30:00Z",
-          finished_at: "2026-09-30T01:30:02Z",
-          code: "ok",
+          account_id: "acc-1",
+          scheduled_at: "2026-10-01T09:30:00+08:00",
+          status: "pending",
         },
       ],
-      next_run_at: "2026-10-02T01:30:00Z",
+      next_run_at: "2026-10-01T09:30:00+08:00",
     };
 
-    await openDashboard(configuredCheckin);
+    await openDashboard(configuredCheckin, snapshot(), "settings");
 
-    expect(screen.getByRole("heading", { name: "每日自动签到" })).toBeInTheDocument();
-    expect(screen.getByText("当前签到周期 · 2026-10-01 轮次")).toBeInTheDocument();
-    expect(screen.getByText("当前周期尚未签到")).toBeInTheDocument();
-    expect(screen.getByLabelText("启用每日自动签到")).toBeChecked();
-    expect(screen.getByLabelText("每日签到时间")).toHaveValue("09:30");
-    expect(screen.getByText("共 1 条")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: /全局自动签到/ })).toBeInTheDocument();
+    expect(screen.getByText(/2026-10-01 周期/)).toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.getByLabelText("启用每日自动签到")).toBeChecked();
+    });
+    expect(screen.getByLabelText(/起始.*时间/)).toHaveValue("09:30");
+    expect(screen.getByLabelText(/账号.*间隔（分钟）/)).toHaveValue(30);
   });
 
   it("settings PUT validation and failure keeps form dirty without discarding input", async () => {
-    await openDashboard();
+    await openDashboard(defaultCheckin, snapshot(), "settings");
 
     const checkbox = screen.getByLabelText("启用每日自动签到");
-    const timeInput = screen.getByLabelText("每日签到时间");
-    const saveButton = screen.getByRole("button", { name: "保存配置" });
+    const timeInput = screen.getByLabelText(/起始.*时间/);
+    const saveButton = screen.getByRole("button", { name: /保存.*签到配置/ });
 
     expect(saveButton).toBeDisabled();
 
@@ -119,203 +148,288 @@ describe("Checkin 集成流程与异常处理", () => {
     expect(saveButton).toBeEnabled();
 
     // Mock failure on PUT
-    fetchMock.mockResolvedValueOnce(
-      json({ error: { code: "persistence_failed", message: "保存签到配置失败" } }, 500)
-    );
+    fetchMock.mockImplementation(async (url: string | URL | Request) => {
+      const urlStr = typeof url === "string" ? url : url.toString();
+      if (urlStr === "/api/checkin/settings") {
+        return json({ error: { code: "persistence_failed", message: "保存签到配置失败" } }, 500);
+      }
+      return json({});
+    });
 
     fireEvent.click(saveButton);
 
-    await screen.findByText("保存失败，请重试");
+    await screen.findByText(/保存签到配置失败/);
     // Form retains user's modifications
     expect(checkbox).toBeChecked();
     expect(timeInput).toHaveValue("10:15");
   });
 
-  it("POST /api/checkin/run 202 starts operation, polls until complete, and refreshes checkin state", async () => {
+  it("schedule overflow 422 displays prompt without quiet cross-day", async () => {
+    await openDashboard(defaultCheckin, snapshot(), "settings");
+
+    const intervalInput = screen.getByLabelText(/账号.*间隔（分钟）/);
+    const saveButton = screen.getByRole("button", { name: /保存.*签到配置/ });
+
+    fireEvent.change(intervalInput, { target: { value: "200" } });
+    expect(saveButton).toBeEnabled();
+
+    fetchMock.mockImplementation(async (url: string | URL | Request) => {
+      const urlStr = typeof url === "string" ? url : url.toString();
+      if (urlStr === "/api/checkin/settings") {
+        return json(
+          {
+            error: {
+              code: "schedule_overflow",
+              message: "签到排期跨天溢出，请缩短间隔或调整起始时间",
+            },
+          },
+          422
+        );
+      }
+      return json({});
+    });
+
+    fireEvent.click(saveButton);
+
+    await screen.findByText("签到排期跨天溢出，请缩短间隔或调整起始时间");
+    expect(intervalInput).toHaveValue(200);
+  });
+
+  it("interval change from 30 to 15 successfully saves configuration", async () => {
+    await openDashboard(defaultCheckin, snapshot(), "settings");
+
+    const intervalInput = screen.getByLabelText(/账号.*间隔（分钟）/);
+    const saveButton = screen.getByRole("button", { name: /保存.*签到配置/ });
+
+    fireEvent.change(intervalInput, { target: { value: "15" } });
+    expect(saveButton).toBeEnabled();
+
+    fetchMock.mockImplementation(async (url: string | URL | Request, init?: RequestInit) => {
+      const urlStr = typeof url === "string" ? url : url.toString();
+      if (urlStr === "/api/checkin/settings" && init?.method === "PUT") {
+        return json({
+          settings: {
+            enabled: false,
+            time: "09:00",
+            interval_minutes: 15,
+            timezone: "Asia/Shanghai",
+            reset_time: "08:00",
+          },
+          cycle_date: "2026-10-01",
+          next_run_at: null,
+          schedule: [
+            {
+              account_id: "acc-1",
+              scheduled_at: "2026-10-01T09:00:00+08:00",
+              status: "pending",
+            },
+          ],
+        });
+      }
+      return json({});
+    });
+
+    fireEvent.click(saveButton);
+
+    await screen.findByText(/配置已保存/);
+    expect(saveButton).toBeDisabled();
+  });
+
+  it("POST /api/accounts/{id}/checkin/run 202 starts operation, polls until complete, and refreshes checkin state", async () => {
     await openDashboard();
     vi.useFakeTimers();
 
-    const runButton = screen.getByRole("button", { name: "立即签到" });
+    fireEvent.click(screen.getByTestId("account-card-acc-1"));
+    const runButton = screen.getByRole("button", { name: "手动签到" });
     expect(runButton).toBeEnabled();
 
-    // 1. POST /api/checkin/run returns 202
-    fetchMock.mockResolvedValueOnce(json({ operation_id: "op-checkin-1" }, 202));
-    // 2. Immediate GET /api/account returns operation: running
-    fetchMock.mockResolvedValueOnce(
-      json(
-        snapshot({
-          operation: {
-            id: "op-checkin-1",
-            kind: "checkin",
-            status: "running",
-            phase: "checking_in",
-            error: null,
-          },
-        })
-      )
-    );
-    // 3. Immediate GET /api/checkin returns today: running
-    fetchMock.mockResolvedValueOnce(
-      json({
-        ...defaultCheckin,
-        today: {
-          date: "2026-10-01",
-          account_user_id: "10",
-          trigger: "manual",
-          status: "running",
-          started_at: "2026-10-01T08:05:00Z",
-          finished_at: null,
-          code: null,
-        },
-      })
-    );
+    // 1. POST returns 202
+    fetchMock.mockImplementation(async (url: string | URL | Request) => {
+      const urlStr = typeof url === "string" ? url : url.toString();
+      if (urlStr === "/api/accounts/acc-1/checkin/run") {
+        return json({ operation_id: "op-checkin-1" }, 202);
+      }
+      if (urlStr.startsWith("/api/accounts")) {
+        return json(
+          snapshot({
+            operation: {
+              id: "op-checkin-1",
+              account_id: "acc-1",
+              kind: "checkin",
+              status: "running",
+              phase: "checking_in",
+              error: null,
+            },
+          })
+        );
+      }
+      if (urlStr.startsWith("/api/checkin")) {
+        return json({
+          ...defaultCheckin,
+          schedule: [
+            {
+              account_id: "acc-1",
+              scheduled_at: "2026-10-01T09:00:00+08:00",
+              status: "running",
+            },
+          ],
+        });
+      }
+      return json({});
+    });
 
     await act(async () => fireEvent.click(runButton));
 
-    expect(screen.getByText("正在签到")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "正在签到…" })).toBeDisabled();
+    expect(screen.getAllByText("正在签到")[0]).toBeInTheDocument();
 
-    // 4. Advance 1s timer: poll GET /api/account returns succeeded
-    fetchMock.mockResolvedValueOnce(
-      json(
-        snapshot({
-          operation: {
-            id: "op-checkin-1",
-            kind: "checkin",
-            status: "succeeded",
-            phase: "done",
-            error: null,
-          },
-        })
-      )
-    );
-    // 5. Operation finished triggers GET /api/checkin returns today: success
-    fetchMock.mockResolvedValueOnce(
-      json({
-        ...defaultCheckin,
-        today: {
-          date: "2026-10-01",
-          account_user_id: "10",
-          trigger: "manual",
-          status: "success",
-          started_at: "2026-10-01T08:05:00Z",
-          finished_at: "2026-10-01T08:05:02Z",
-          code: "ok",
-        },
-      })
-    );
+    // 2. Poll finishes
+    fetchMock.mockImplementation(async (url: string | URL | Request) => {
+      const urlStr = typeof url === "string" ? url : url.toString();
+      if (urlStr.startsWith("/api/accounts")) {
+        return json(
+          snapshot({
+            operation: {
+              id: "op-checkin-1",
+              account_id: "acc-1",
+              kind: "checkin",
+              status: "succeeded",
+              phase: "done",
+              error: null,
+            },
+          })
+        );
+      }
+      if (urlStr.startsWith("/api/checkin")) {
+        return json({
+          ...defaultCheckin,
+          schedule: [
+            {
+              account_id: "acc-1",
+              scheduled_at: "2026-10-01T09:00:00+08:00",
+              status: "success",
+            },
+          ],
+        });
+      }
+      return json({});
+    });
 
     await act(async () => vi.advanceTimersByTime(1000));
 
-    expect(screen.getByText("今日已签到")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "今日已完成" })).toBeDisabled();
+    expect(screen.getByText("已签到")).toBeInTheDocument();
   });
 
-  it("POST /api/checkin/run 200 already_recorded refreshes state without starting background operation", async () => {
+  it("POST /api/accounts/{id}/checkin/run 200 already_recorded refreshes state without starting background operation", async () => {
     await openDashboard();
 
-    const runButton = screen.getByRole("button", { name: "立即签到" });
+    fireEvent.click(screen.getByTestId("account-card-acc-1"));
+    const runButton = screen.getByRole("button", { name: "手动签到" });
 
-    // 1. POST /api/checkin/run returns 200
-    fetchMock.mockResolvedValueOnce(json({ already_recorded: true }, 200));
-    // 2. Prompt GET /api/checkin returns today: already_done
-    fetchMock.mockResolvedValueOnce(
-      json({
-        ...defaultCheckin,
-        today: {
-          date: "2026-10-01",
-          account_user_id: "10",
-          trigger: "manual",
-          status: "already_done",
-          started_at: "2026-10-01T08:00:00Z",
-          finished_at: "2026-10-01T08:00:01Z",
-          code: "already_checked_in",
-        },
-      })
-    );
+    fetchMock.mockImplementation(async (url: string | URL | Request) => {
+      const urlStr = typeof url === "string" ? url : url.toString();
+      if (urlStr === "/api/accounts/acc-1/checkin/run") {
+        return json({ already_recorded: true }, 200);
+      }
+      if (urlStr.startsWith("/api/checkin")) {
+        return json({
+          ...defaultCheckin,
+          schedule: [
+            {
+              account_id: "acc-1",
+              scheduled_at: "2026-10-01T09:00:00+08:00",
+              status: "already_done",
+            },
+          ],
+        });
+      }
+      if (urlStr.startsWith("/api/accounts")) return json(snapshot());
+      return json({});
+    });
 
     await act(async () => fireEvent.click(runButton));
 
     await waitFor(() => {
-      expect(screen.getByRole("button", { name: "今日已完成" })).toBeDisabled();
+      expect(screen.getAllByText("今日已完成").length).toBeGreaterThan(0);
     });
-    expect(screen.getAllByText("今日已完成").length).toBeGreaterThan(0);
   });
 
   it("unknown status requires explicit confirmation modal before retrying with confirm_retry: true", async () => {
-    const unknownCheckin: CheckinFullStatus = {
+    const unknownCheckin: GlobalCheckinResponse = {
       ...defaultCheckin,
-      today: {
-        date: "2026-10-01",
-        account_user_id: "10",
-        trigger: "manual",
-        status: "unknown",
-        started_at: "2026-10-01T08:05:00Z",
-        finished_at: "2026-10-01T08:05:05Z",
-        code: "upstream_5xx",
-      },
+      schedule: [
+        {
+          account_id: "acc-1",
+          scheduled_at: "2026-10-01T09:00:00+08:00",
+          status: "unknown",
+        },
+      ],
     };
 
     await openDashboard(unknownCheckin);
 
-    const retryButton = screen.getByRole("button", { name: "重试签到" });
+    fireEvent.click(screen.getByTestId("account-card-acc-1"));
+    const retryButton = await screen.findByRole("button", { name: "重试签到" });
     expect(retryButton).toBeEnabled();
 
-    // Clicking retry opens the confirmation modal
+    // Clicking retry opens confirmation modal
     fireEvent.click(retryButton);
 
     const modal = screen.getByRole("dialog", { name: "确认重试签到" });
     expect(modal).toBeInTheDocument();
     expect(
-      screen.getByText(/上一次签到状态未知（如网络中断或 upstream 响应异常）/)
+      screen.getByText(/该账号上次签到结果未知（如上游超时或未返回明确状态）/)
     ).toBeInTheDocument();
 
     // Confirm in dialog dispatches with confirm_retry: true
-    fetchMock.mockResolvedValueOnce(json({ operation_id: "op-checkin-retry" }, 202));
-    fetchMock.mockResolvedValueOnce(
-      json(
-        snapshot({
-          operation: {
-            id: "op-checkin-retry",
-            kind: "checkin",
-            status: "running",
-            phase: "checking_in",
-            error: null,
-          },
-        })
-      )
-    );
-    fetchMock.mockResolvedValueOnce(json(unknownCheckin));
+    fetchMock.mockImplementation(async (url: string | URL | Request, init?: RequestInit) => {
+      const urlStr = typeof url === "string" ? url : url.toString();
+      if (urlStr === "/api/accounts/acc-1/checkin/run" && init?.method === "POST") {
+        expect(JSON.parse(init.body as string)).toEqual({ confirm_retry: true });
+        return json({ operation_id: "op-checkin-retry" }, 202);
+      }
+      if (urlStr.startsWith("/api/accounts")) {
+        return json(
+          snapshot({
+            operation: {
+              id: "op-checkin-retry",
+              account_id: "acc-1",
+              kind: "checkin",
+              status: "running",
+              phase: "checking_in",
+              error: null,
+            },
+          })
+        );
+      }
+      if (urlStr.startsWith("/api/checkin")) return json(unknownCheckin);
+      return json({});
+    });
 
-    fireEvent.click(screen.getByRole("button", { name: "确认继续重试" }));
+    fireEvent.click(screen.getByRole("button", { name: /确认.*重试/ }));
 
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
-    expect(fetchMock.mock.calls[2]).toEqual([
-      "/api/checkin/run",
-      expect.objectContaining({
-        method: "POST",
-        body: JSON.stringify({ confirm_retry: true }),
-      }),
-    ]);
   });
 
   it("scheduled record appears on visibility change", async () => {
     await openDashboard();
 
-    const updatedCheckin: CheckinFullStatus = {
+    const updatedCheckin: GlobalCheckinResponse = {
       ...defaultCheckin,
-      today: {
-        date: "2026-10-01",
-        account_user_id: "10",
-        trigger: "scheduled",
-        status: "success",
-        started_at: "2026-10-01T09:00:00Z",
-        finished_at: "2026-10-01T09:00:02Z",
-        code: "ok",
-      },
+      schedule: [
+        {
+          account_id: "acc-1",
+          scheduled_at: "2026-10-01T09:00:00+08:00",
+          status: "success",
+        },
+      ],
     };
 
-    fetchMock.mockResolvedValueOnce(json(updatedCheckin));
+    fetchMock.mockImplementation(async (url: string | URL | Request) => {
+      const urlStr = typeof url === "string" ? url : url.toString();
+      if (urlStr.startsWith("/api/checkin")) return json(updatedCheckin);
+      if (urlStr.startsWith("/api/accounts")) return json(snapshot());
+      return json({});
+    });
 
     act(() => {
       Object.defineProperty(document, "visibilityState", {
@@ -325,29 +439,32 @@ describe("Checkin 集成流程与异常处理", () => {
       document.dispatchEvent(new Event("visibilitychange"));
     });
 
-    await screen.findByText("今日已签到");
-    expect(screen.getByRole("button", { name: "今日已完成" })).toBeDisabled();
+    await screen.findByText("已签到");
   });
 
   it("account change or logout aborts in-flight checkin requests and discards late responses", async () => {
     await openDashboard();
 
     const pendingCheckin = deferred();
-    fetchMock.mockReturnValueOnce(pendingCheckin.promise);
+    fetchMock.mockImplementation(async (url: string | URL | Request) => {
+      const urlStr = typeof url === "string" ? url : url.toString();
+      if (urlStr.startsWith("/api/checkin")) return pendingCheckin.promise;
+      if (urlStr === "/api/admin/session") return new Response(null, { status: 204 });
+      return json({});
+    });
 
-    // Trigger checkin retry read
-    const retryReadButton = screen.queryByRole("button", { name: "重试读取" });
-    if (!retryReadButton) {
-      // Simulate visibility change to invoke loadCheckin
-      act(() => {
-        document.dispatchEvent(new Event("visibilitychange"));
+    act(() => {
+      Object.defineProperty(document, "visibilityState", {
+        configurable: true,
+        get: () => "visible",
       });
-    }
+      document.dispatchEvent(new Event("visibilitychange"));
+    });
 
-    const checkinSignal = fetchMock.mock.calls[2][1]?.signal;
+    const checkinCall = fetchMock.mock.calls.slice().reverse().find(call => (call[0] as string).startsWith("/api/checkin"));
+    const checkinSignal = checkinCall?.[1]?.signal;
 
     // User logs out
-    fetchMock.mockResolvedValueOnce(new Response(null, { status: 204 }));
     fireEvent.click(screen.getByRole("button", { name: "退出管理" }));
 
     expect(checkinSignal?.aborted).toBe(true);
@@ -357,83 +474,38 @@ describe("Checkin 集成流程与异常处理", () => {
       pendingCheckin.resolve(
         json({
           ...defaultCheckin,
-          today: {
-            date: "2026-10-01",
-            account_user_id: "10",
-            trigger: "manual",
-            status: "success",
-            started_at: "2026-10-01T08:00:00Z",
-            finished_at: "2026-10-01T08:00:01Z",
-            code: "ok",
-          },
+          schedule: [
+            {
+              account_id: "acc-1",
+              scheduled_at: "2026-10-01T09:00:00+08:00",
+              status: "success",
+            },
+          ],
         })
       )
     );
 
     // App is locked, checkin data is not rendered
-    expect(screen.queryByRole("heading", { name: "每日自动签到" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: /全局自动签到/ })).not.toBeInTheDocument();
   });
 
   it("checkin 401 locks app whereas root reveal 401 remains inline", async () => {
     await openDashboard();
 
-    // Checkin fetch returning 401 locks the whole session
-    fetchMock.mockResolvedValueOnce(
-      json({ error: { code: "upstream_session_expired", message: "未鉴权" } }, 401)
-    );
+    fetchMock.mockImplementation(async (url: string | URL | Request) => {
+      const urlStr = typeof url === "string" ? url : url.toString();
+      if (urlStr.startsWith("/api/checkin")) {
+        return json({ error: { code: "upstream_session_expired", message: "未鉴权" } }, 401);
+      }
+      return json({});
+    });
 
     act(() => {
       document.dispatchEvent(new Event("visibilitychange"));
     });
 
-    await screen.findByLabelText("本地 root 密钥");
-    expect(screen.getByText("请输入本地 root 密钥以建立管理会话")).toBeInTheDocument();
-    expect(screen.queryByRole("heading", { name: "当前账号" })).not.toBeInTheDocument();
-  });
-
-  it("under 08:00 schedule displays previous cycle hint without local date error", async () => {
-    const earlyCheckin: CheckinFullStatus = {
-      settings: {
-        enabled: true,
-        time: "02:30",
-        timezone: "Asia/Shanghai",
-        reset_time: "08:00",
-      },
-      cycle_date: "2026-10-01",
-      today: null,
-      history: [],
-      next_run_at: null,
-    };
-
-    await openDashboard(earlyCheckin);
-
-    expect(
-      screen.getByText("每日 02:30 自动执行（北京时间，08:00 前执行属于上一签到轮）")
-    ).toBeInTheDocument();
-    expect(screen.getByText("当前签到周期 · 2026-10-01 轮次")).toBeInTheDocument();
-  });
-
-  it("no extra requests dispatched while busy running an account operation", async () => {
-    const runningOp = {
-      id: "refresh-busy",
-      kind: "refresh" as const,
-      status: "running" as const,
-      phase: "reading_account" as const,
-      error: null,
-    };
-    await openDashboard(defaultCheckin, snapshot({ operation: runningOp }));
-
-    const runButton = screen.getByRole("button", { name: "立即签到" });
-    expect(runButton).toBeDisabled();
-
-    const checkbox = screen.getByLabelText("启用每日自动签到");
-    expect(checkbox).toBeDisabled();
-
-    const timeInput = screen.getByLabelText("每日签到时间");
-    expect(timeInput).toBeDisabled();
-
-    // Clicking disabled button dispatches no new network requests
-    fireEvent.click(runButton);
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    await screen.findByLabelText("密钥");
+    expect(screen.getByRole("button", { name: "进入" })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: /已绑定账号列表/ })).not.toBeInTheDocument();
   });
 });

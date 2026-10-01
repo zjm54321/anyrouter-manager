@@ -1,202 +1,776 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent } from "react";
-import { errorText, phases } from "./api";
-import type { AccountBalance, CandidateAccount } from "./api";
-import { CheckinPanel } from "./CheckinPanel";
-import { RevealDialog } from "./RevealDialog";
+import {
+  AlertCircle,
+  Calendar,
+  Check,
+  CheckCircle2,
+  ChevronRight,
+  Eye,
+  FileText,
+  Key,
+  KeyRound,
+  LayoutDashboard,
+  Loader2,
+  LogOut,
+  Menu,
+  Network,
+  RefreshCw,
+  Settings,
+  Shield,
+  ShieldAlert,
+  ShieldCheck,
+  User,
+  Users,
+  X,
+} from "lucide-react";
+import { AccountsPanel } from "./AccountsPanel";
+import { RequestLogPanel } from "./RequestLogPanel";
 import { useManager } from "./useManager";
+import type { GlobalCheckinConfig } from "./accountsTypes";
+import {
+  formatQuotaUsd,
+  formatRemainingUsd,
+  mapAccountDtoToManaged,
+  mapLogItemToEntry,
+} from "./accountsTypes";
+import { OverviewPanel } from "./OverviewPanel";
+import { SettingsPanel } from "./SettingsPanel";
+import { RevealDialog } from "./RevealDialog";
 
-function date(value: string) {
-  const parsed = new Date(value);
-  return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleString("zh-CN", { hour12: false });
-}
+export type AppPage = "overview" | "accounts" | "logs" | "settings";
 
-function Balance({ balance }: { balance: AccountBalance }) {
-  return <div>
-    <dl className="balance-grid">
-      <div className="subcard"><dt>剩余额度（原始单位）</dt><dd className="amount">{balance.quota_raw}</dd></div>
-      <div className="subcard"><dt>已用额度</dt><dd className="amount">{balance.used_quota_raw}</dd></div>
-    </dl>
-    <p className="secondary small numeric">余额读取时间：{date(balance.fetched_at)}</p>
-  </div>;
-}
-
-function GatewayBanner() {
-  const url = import.meta.env.DEV ? "http://127.0.0.1:8080/v1" : `${window.location.origin}/v1`;
-  const [feedback, setFeedback] = useState("");
-  const mounted = useRef(false);
-  useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
-  useEffect(() => {
-    if (!feedback) return;
-    const timer = window.setTimeout(() => setFeedback(""), 2000);
-    return () => window.clearTimeout(timer);
-  }, [feedback]);
-  return <section className="card gateway" aria-labelledby="gateway-title">
-    <div className="section-heading"><h2 id="gateway-title">本地网关</h2><button type="button" onClick={async () => {
-      try { await navigator.clipboard.writeText(url); if (mounted.current) setFeedback("已复制网关地址"); }
-      catch { if (mounted.current) setFeedback("复制失败，请手动复制"); }
-    }}>复制地址</button></div>
-    <code className="gateway-url">{url}</code>
-    <p className="secondary">客户端使用本地 root 密钥；后端替换为当前账号的上游密钥</p>
-    {import.meta.env.DEV && <p className="secondary small">开发环境网关位于后端 8080 端口，不是当前 Vite 页面端口。</p>}
-    <span className="feedback" role="status">{feedback}</span>
-  </section>;
-}
-
-function Candidate({ candidate, busy, replacing, onActivate }: {
-  candidate: CandidateAccount; busy: boolean; replacing: boolean;
-  onActivate: (candidateId: string, keyId: string) => void;
-}) {
-  const [keyId, setKeyId] = useState("");
-  return <div className="stack">
-    <div><h3>{candidate.username}</h3><p className="secondary small">上游用户 ID：{candidate.upstream_user_id}</p></div>
-    <Balance balance={candidate.balance} />
-    <fieldset disabled={busy} className="key-options">
-      <legend>选择已有密钥</legend>
-      {candidate.keys.map(key => <label className={`key-option ${keyId === key.id ? "selected" : ""}`} key={key.id}>
-        <input type="radio" name="candidate-key" value={key.id} checked={keyId === key.id} onChange={() => setKeyId(key.id)} />
-        <span><span className="key-name">{key.name || "未命名密钥"}</span><code>{key.masked}</code><span className="secondary small">ID：{key.id}</span></span>
-      </label>)}
-    </fieldset>
-    {!candidate.keys.length && <p className="inline-warning">未找到已有密钥，请先在 AnyRouter 创建后重试</p>}
-    <p className="secondary small numeric">候选账号暂存 15 分钟，到期时间：{date(candidate.expires_at)}</p>
-    {replacing && <p className="inline-warning">启用后将替换当前账号</p>}
-    <button className="primary" type="button" disabled={busy || !keyId || !candidate.keys.some(key => key.id === keyId)}
-      onClick={() => onActivate(candidate.id, keyId)}>确认启用所选密钥</button>
-  </div>;
+function formatShanghaiDateTime(iso: string | null | undefined): string {
+  if (!iso) return "-";
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return iso;
+  return new Intl.DateTimeFormat("zh-CN", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).format(date);
 }
 
 export function App() {
   const manager = useManager();
-  const { state, session, busy } = manager;
-  const [root, setRoot] = useState("");
-  const [username, setUsername] = useState("");
-  const [password, setPassword] = useState("");
-  const [revealRevision, setRevealRevision] = useState<string | null>(null);
-  const [reloginCandidate, setReloginCandidate] = useState<string | null>(null);
-  const [now, setNow] = useState(Date.now());
+  const { session, state, busy, loadError } = manager;
 
-  useEffect(() => {
-    if (session !== "open") { setUsername(""); setPassword(""); setRoot(""); setRevealRevision(null); setReloginCandidate(null); }
-  }, [session]);
-  useEffect(() => {
-    setRevealRevision(null);
-  }, [state.active?.revision]);
-  useEffect(() => {
-    if (!state.candidate) return;
-    setNow(Date.now());
-    const timer = window.setInterval(() => setNow(Date.now()), 1000);
-    return () => window.clearInterval(timer);
-  }, [state.candidate]);
+  // Root login password state
+  const [rootPassword, setRootPassword] = useState("");
+  const [submittingRoot, setSubmittingRoot] = useState(false);
+  const [rootError, setRootError] = useState<string | null>(null);
 
-  const expired = manager.candidateExpired || !!(state.candidate && new Date(state.candidate.expires_at).getTime() <= now);
-  function unlock(event: FormEvent) {
-    event.preventDefault();
-    const pending = manager.unlock(root);
-    setRoot("");
-    void pending;
+  // Responsive mobile menu drawer state
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+
+  // Detail reveal modal state
+  const [detailRevealOpen, setDetailRevealOpen] = useState(false);
+
+  // 4-page hash navigation
+  const [currentPage, setCurrentPage] = useState<AppPage>(() => {
+    if (typeof window !== "undefined") {
+      const hash = window.location.hash.replace("#", "");
+      if (
+        hash === "overview" ||
+        hash === "accounts" ||
+        hash === "logs" ||
+        hash === "settings"
+      ) {
+        return hash as AppPage;
+      }
+    }
+    return "overview";
+  });
+
+  // Synchronize hash changes (browser back/forward & initial load)
+  useEffect(() => {
+    function handleHashChange() {
+      const hash = window.location.hash.replace("#", "");
+      if (
+        hash === "overview" ||
+        hash === "accounts" ||
+        hash === "logs" ||
+        hash === "settings"
+      ) {
+        setCurrentPage(hash as AppPage);
+        setMobileMenuOpen(false);
+      } else {
+        setCurrentPage("overview");
+      }
+    }
+
+    window.addEventListener("hashchange", handleHashChange);
+    return () => window.removeEventListener("hashchange", handleHashChange);
+  }, []);
+
+  const navigateTo = (page: AppPage) => {
+    window.location.hash = `#${page}`;
+    setCurrentPage(page);
+    setMobileMenuOpen(false);
+    manager.selectDetailAccount(null);
+  };
+
+  // Handle Root Unlock Login
+  async function handleUnlockSubmit(e: FormEvent) {
+    e.preventDefault();
+    const root = rootPassword.trim();
+    if (!root) return;
+
+    setRootPassword("");
+    setSubmittingRoot(true);
+    setRootError(null);
+    try {
+      await manager.unlock(root);
+    } catch (err: any) {
+      setRootError(err?.message || "密钥不正确，请重试");
+    } finally {
+      setSubmittingRoot(false);
+    }
   }
-  function login(event: FormEvent) {
-    event.preventDefault();
-    const pending = manager.perform("login", { username, password });
-    setPassword("");
-    void pending;
+
+  // Handle Logout
+  async function handleLogout() {
+    await manager.logout();
+    setRootPassword("");
+    setRootError(null);
+    setDetailRevealOpen(false);
   }
 
-  if (session !== "open") return <main className="locked-layout">
-    <section className="card locked-card" aria-labelledby="app-title">
-      <h1 id="app-title">AnyRouter Manager</h1>
-      <p className="secondary">使用本地 root 密钥建立管理会话</p>
-      <p className="notice" role="status" aria-live="polite">{manager.notice || (session === "loading" ? "正在读取管理会话…" : "管理页面已锁定")}</p>
-      {session === "locked" && <form className="stack" onSubmit={unlock}>
-        <label htmlFor="admin-root">本地 root 密钥</label>
-        <input id="admin-root" type="password" autoComplete="off" required value={root} disabled={manager.sending} onChange={event => setRoot(event.target.value)} />
-        <button className="primary" disabled={manager.sending || !root.trim()}>{manager.sending ? "正在建立会话…" : "进入管理页面"}</button>
-      </form>}
-      {manager.loadError && <button type="button" onClick={() => void manager.load()}>重试读取状态</button>}
-      {session === "locked" && manager.notice.includes("注销失败") && <button type="button" disabled={manager.sending} onClick={() => void manager.logout()}>重试注销</button>}
-      <p className="secondary small">密钥仅用于本次验证，不保存在浏览器存储；管理会话由后端维护。</p>
-      <a href="https://anyrouter.top" target="_blank" rel="noreferrer">AnyRouter 上游：anyrouter.top</a>
-    </section>
-  </main>;
+  // Selected account for detail view
+  const selectedAccount = useMemo(() => {
+    if (!manager.selectedAccountId) return null;
+    return state.accounts.find(a => a.id === manager.selectedAccountId) || null;
+  }, [state.accounts, manager.selectedAccountId]);
 
-  const operation = state.operation;
-  const operationNotice = operation?.status === "running" ? phases[operation.phase]
-    : operation?.status === "failed" ? (operation.error ? errorText(operation.error) : "操作未完成，请重试")
-    : operation?.status === "succeeded" ? "操作已完成" : "";
-  const revealOpen = !!state.active && revealRevision === state.active.revision;
-  return <><main className="dashboard" inert={revealOpen} aria-hidden={revealOpen || undefined}>
-    <header className="page-header">
-      <div><h1>AnyRouter Manager</h1><a href="https://anyrouter.top" target="_blank" rel="noreferrer">固定上游：https://anyrouter.top</a></div>
-      <button type="button" onClick={() => { setRevealRevision(null); setPassword(""); setUsername(""); void manager.logout(); }}>退出管理</button>
-    </header>
-    <div className={`operation-notice ${manager.loadError || operation?.status === "failed" ? "error-notice" : ""}`} role="status" aria-live="polite" aria-atomic="true">
-      {manager.notice || operationNotice || "管理会话已建立"}
-      {manager.loadError && <button type="button" onClick={() => void manager.load()}>重试读取状态</button>}
-    </div>
-    <GatewayBanner />
-    <section className="card" aria-labelledby="active-title">
-      <div className="section-heading"><h2 id="active-title">当前账号</h2>{state.active && <span className="badge success">已配置</span>}</div>
-      {state.active ? <div className="stack">
-        <div><h3>{state.active.username}</h3><p className="secondary small">上游用户 ID：{state.active.upstream_user_id}</p></div>
-        <Balance balance={state.active.balance} />
-        <div className="subcard stack compact">
-          <span className="secondary small">当前密钥 · {state.active.selected_key.name || "未命名密钥"}</span>
-          <code className="masked-key">{state.active.selected_key.masked}</code>
-          <span className="secondary small numeric">版本：{state.active.revision} · 启用时间：{date(state.active.activated_at)}</span>
+  // Clean managed accounts list
+  const managedAccounts = useMemo(() => {
+    const schedule = manager.globalCheckin?.schedule || [];
+    return state.accounts.map(a => {
+      const scheduleItem = schedule.find(s => s.account_id === a.id);
+      return mapAccountDtoToManaged(
+        a,
+        state.route_account_id,
+        scheduleItem,
+        a.id === manager.selectedAccountId ? manager.accountCheckin : undefined
+      );
+    });
+  }, [
+    state.accounts,
+    state.route_account_id,
+    manager.globalCheckin?.schedule,
+    manager.selectedAccountId,
+    manager.accountCheckin,
+  ]);
+
+  // Candidate TTL expiration calculation
+  const expired = useMemo(() => {
+    if (manager.candidateExpired) return true;
+    if (!state.candidate?.expires_at) return false;
+    const exp = new Date(state.candidate.expires_at).getTime();
+    return !Number.isNaN(exp) && exp < Date.now();
+  }, [manager.candidateExpired, state.candidate?.expires_at]);
+
+  // Global Checkin Config Memo
+  const globalCheckinConfig: GlobalCheckinConfig = useMemo(() => {
+    if (!manager.globalCheckin?.settings) {
+      return {
+        enabled: false,
+        startTime: "09:00",
+        intervalMinutes: 30,
+        timezone: "Asia/Shanghai",
+        resetTime: "08:00",
+        cycleDate: manager.globalCheckin?.cycle_date,
+      };
+    }
+    return {
+      enabled: manager.globalCheckin.settings.enabled,
+      startTime: manager.globalCheckin.settings.time,
+      intervalMinutes: manager.globalCheckin.settings.interval_minutes,
+      timezone: manager.globalCheckin.settings.timezone || "Asia/Shanghai",
+      resetTime: manager.globalCheckin.settings.reset_time || "08:00",
+      cycleDate: manager.globalCheckin.cycle_date,
+    };
+  }, [manager.globalCheckin]);
+
+  // Loading Session
+  if (session === "loading") {
+    return (
+      <div className="login-screen">
+        <div className="card login-card text-center">
+          <div className="login-loading-content">
+            <Loader2 size={32} className="spin text-teal" />
+            <p className="secondary mt-4">正在连接本地服务…</p>
+          </div>
         </div>
-        <div className="actions"><button type="button" disabled={busy} onClick={() => void manager.perform("refresh")}>刷新余额</button>
-          <button type="button" disabled={busy} onClick={() => setRevealRevision(state.active!.revision)}>查看密钥</button></div>
-      </div> : <div className="empty-state"><h3>尚未配置账号</h3><p className="secondary">登录 AnyRouter 并选择一个已有密钥后，才能配置本地网关。</p></div>}
-    </section>
-    <CheckinPanel
-      settings={manager.checkin?.settings}
-      today={manager.checkin?.today ? {
-        ...manager.checkin.today,
-        accountUserId: manager.checkin.today.account_user_id,
-        startedAt: manager.checkin.today.started_at,
-        finishedAt: manager.checkin.today.finished_at,
-        code: manager.checkin.today.code,
-        errorCode: manager.checkin.today.code,
-      } : null}
-      history={manager.checkin?.history ? manager.checkin.history.map(item => ({
-        ...item,
-        accountUserId: item.account_user_id,
-        startedAt: item.started_at,
-        finishedAt: item.finished_at,
-        code: item.code,
-        errorCode: item.code,
-      })) : []}
-      cycleDate={manager.checkin?.cycle_date || null}
-      nextRunAt={manager.checkin?.next_run_at || null}
-      accountConfigured={!!state.active}
-      busy={busy}
-      saving={manager.checkinSaving}
-      fetchError={manager.checkinError}
-      runError={manager.checkinRunError}
-      onRetryRead={() => void manager.loadCheckin()}
-      onSave={settings => manager.saveCheckinSettings(settings)}
-      onRun={options => manager.runCheckinAction(options)}
-    />
-    <section className="card" aria-labelledby="candidate-title">
-      <div className="section-heading"><h2 id="candidate-title">{state.active ? "更换账号" : "添加账号"}</h2>{state.candidate && !expired && <span className="badge">待确认</span>}</div>
-      <p className="secondary">登录后读取余额与已有密钥；确认启用前不会替换当前账号。系统不会创建新密钥。</p>
-      {state.candidate && !expired && reloginCandidate !== state.candidate.id ? <>
-        <Candidate key={state.candidate.id} candidate={state.candidate} busy={busy} replacing={!!state.active}
-          onActivate={(candidate_id, key_id) => void manager.perform("activate", { candidate_id, key_id })} />
-        <button type="button" disabled={busy} onClick={() => setReloginCandidate(state.candidate!.id)}>重新登录并读取</button>
-      </>
-        : <>
-          {expired && <p className="inline-warning">候选账号已过期，请重新登录</p>}
-          <form className="stack" onSubmit={login}>
-            <div className="field"><label htmlFor="username">AnyRouter 用户名</label><input id="username" autoComplete="username" value={username} onChange={event => setUsername(event.target.value)} disabled={busy} required /></div>
-            <div className="field"><label htmlFor="password">AnyRouter 密码</label><input id="password" type="password" autoComplete="off" value={password} onChange={event => setPassword(event.target.value)} disabled={busy} required /></div>
-            <p className="secondary small">密码仅本次使用，不会保存；上游会话仅由后端维护。</p>
-            <button className="primary" disabled={busy || !username.trim() || !password}>{busy ? "正在处理…" : "登录并读取已有密钥"}</button>
+      </div>
+    );
+  }
+
+  // Locked Screen
+  if (session === "locked") {
+    return (
+      <div className="login-screen">
+        <div className="card login-card">
+          <div className="login-header">
+            <div className="login-brand">
+              <ShieldCheck size={28} className="text-teal" />
+              <h1 className="login-brand-title">AnyRouter 管理面板</h1>
+            </div>
+          </div>
+
+          {rootError && (
+            <div className="alert alert-error" role="alert">
+              <span>{rootError}</span>
+            </div>
+          )}
+
+          {manager.notice && (
+            <div className="alert alert-warn" role="status" style={{ marginBottom: "1rem" }}>
+              <div>{manager.notice}</div>
+              {manager.notice.includes("服务端会话注销失败") && (
+                <button
+                  type="button"
+                  className="btn btn-secondary btn-sm"
+                  style={{ marginTop: "0.5rem" }}
+                  onClick={() => manager.logout()}
+                >
+                  重试注销
+                </button>
+              )}
+            </div>
+          )}
+
+          <form onSubmit={handleUnlockSubmit} className="stack">
+            <div className="field">
+              <label htmlFor="admin-root">密钥</label>
+              <input
+                id="admin-root"
+                type="password"
+                required
+                autoFocus
+                autoComplete="off"
+                placeholder="输入本地 root 密钥"
+                value={rootPassword}
+                onChange={e => setRootPassword(e.target.value)}
+                disabled={submittingRoot}
+              />
+            </div>
+
+            <div className="actions">
+              <button
+                type="submit"
+                className="btn btn-primary btn-block"
+                disabled={submittingRoot || !rootPassword.trim()}
+              >
+                {submittingRoot ? "正在建立会话…" : "进入"}
+              </button>
+            </div>
           </form>
-        </>}
-    </section>
-  </main>
-    {state.active && revealOpen && <RevealDialog key={state.active.revision} active={state.active} onClose={() => setRevealRevision(null)} />}
-  </>;
+        </div>
+      </div>
+    );
+  }
+
+  // Page titles
+  const pageTitles: Record<AppPage, string> = {
+    overview: "首页概览",
+    accounts: "账号列表",
+    logs: "网关请求日志",
+    settings: "系统设置",
+  };
+  const pageTitle = pageTitles[currentPage];
+
+  // Retained request logs
+  const mappedRequestLogs = (manager.logs || []).map(mapLogItemToEntry);
+
+  return (
+    <div className="app-shell">
+      {/* Mobile Top Header */}
+      <header className="mobile-header">
+        <div className="mobile-header-brand">
+          <ShieldCheck size={20} className="text-teal" />
+          <span className="font-semibold text-sm">AnyRouter</span>
+        </div>
+        <button
+          type="button"
+          className="btn btn-ghost btn-icon mobile-menu-btn"
+          onClick={() => setMobileMenuOpen(!mobileMenuOpen)}
+          aria-label={mobileMenuOpen ? "关闭菜单" : "打开菜单"}
+          aria-expanded={mobileMenuOpen}
+        >
+          {mobileMenuOpen ? <X size={20} /> : <Menu size={20} />}
+        </button>
+      </header>
+
+      {/* Desktop Fixed Left Sidebar */}
+      <aside className={`app-sidebar ${mobileMenuOpen ? "mobile-open" : ""}`}>
+        <div className="sidebar-brand">
+          <div className="brand-logo-wrap">
+            <ShieldCheck size={24} className="text-teal" />
+          </div>
+          <div className="brand-text">
+            <span className="brand-name font-semibold">AnyRouter</span>
+            <span className="brand-sub secondary text-xs">本地管理</span>
+          </div>
+        </div>
+
+        <nav className="sidebar-nav" aria-label="主要导航">
+          <a
+            href="#overview"
+            className={`nav-link ${currentPage === "overview" ? "active" : ""}`}
+            aria-current={currentPage === "overview" ? "page" : undefined}
+            onClick={e => {
+              e.preventDefault();
+              navigateTo("overview");
+            }}
+          >
+            <LayoutDashboard size={18} />
+            <span>首页概览</span>
+          </a>
+
+          <a
+            href="#accounts"
+            className={`nav-link ${currentPage === "accounts" ? "active" : ""}`}
+            aria-current={currentPage === "accounts" ? "page" : undefined}
+            onClick={e => {
+              e.preventDefault();
+              navigateTo("accounts");
+            }}
+          >
+            <Users size={18} />
+            <span>账号列表</span>
+            {managedAccounts.length > 0 && (
+              <span className="nav-badge numeric">{managedAccounts.length}</span>
+            )}
+          </a>
+
+          <a
+            href="#logs"
+            className={`nav-link ${currentPage === "logs" ? "active" : ""}`}
+            aria-current={currentPage === "logs" ? "page" : undefined}
+            onClick={e => {
+              e.preventDefault();
+              navigateTo("logs");
+            }}
+          >
+            <FileText size={18} />
+            <span>网关请求日志</span>
+          </a>
+
+          <a
+            href="#settings"
+            className={`nav-link ${currentPage === "settings" ? "active" : ""}`}
+            aria-current={currentPage === "settings" ? "page" : undefined}
+            onClick={e => {
+              e.preventDefault();
+              navigateTo("settings");
+            }}
+          >
+            <Settings size={18} />
+            <span>设置</span>
+          </a>
+        </nav>
+
+        {/* Sidebar Footer with Logout Button */}
+        <div className="sidebar-footer">
+          <button
+            type="button"
+            className="btn btn-ghost btn-sm btn-block logout-btn"
+            onClick={handleLogout}
+            title="退出管理会话"
+          >
+            <LogOut size={16} />
+            <span>退出管理</span>
+          </button>
+        </div>
+      </aside>
+
+      {/* Main Content Area */}
+      <div className="app-main-content">
+        <div className="content-header">
+          <div>
+            <h1 className="content-title">{pageTitle}</h1>
+          </div>
+
+          <div className="content-header-actions">
+            {manager.loadError && (
+              <button
+                type="button"
+                className="btn btn-secondary btn-sm"
+                onClick={() => void manager.load()}
+              >
+                <RefreshCw size={14} />
+                <span>重试读取状态</span>
+              </button>
+            )}
+          </div>
+        </div>
+
+        {/* Page Content Rendered by Hash Route */}
+        <main className="page-body">
+          {currentPage === "overview" && (
+            <OverviewPanel
+              accounts={managedAccounts}
+              routedAccountId={state.route_account_id}
+              pendingRouteAccountId={manager.pendingRouteAccountId}
+              globalCheckinConfig={globalCheckinConfig}
+              globalCheckinSchedule={manager.globalCheckin?.schedule || []}
+              logs={mappedRequestLogs}
+              logsLoading={manager.logsLoading}
+              onNavigate={page => navigateTo(page)}
+              onSelectRoute={id => manager.routeAccount(id)}
+              onViewDetails={id => {
+                manager.selectDetailAccount(id);
+                navigateTo("accounts");
+              }}
+            />
+          )}
+
+          {currentPage === "accounts" && (
+            <div className="stack">
+              <AccountsPanel
+                accounts={managedAccounts}
+                routedAccountId={state.route_account_id}
+                pendingRouteAccountId={manager.pendingRouteAccountId}
+                globalCheckinConfig={globalCheckinConfig}
+                busy={busy}
+                hideGlobalCheckin={true}
+                candidate={state.candidate}
+                candidateExpired={expired}
+                onSaveCandidate={async (candidateId, keyId) => {
+                  await manager.saveCandidate(candidateId, keyId);
+                }}
+                operation={state.operation}
+                onSelectRoute={id => manager.routeAccount(id)}
+                onManualCheckin={(id, opts) => manager.runAccountCheckin(id, opts)}
+                onAddAccount={creds => manager.addAccount(creds)}
+                onSelectKey={(id, keyId) => manager.selectAccountKey(id, keyId)}
+                onRefreshBalance={id => manager.refreshAccount(id)}
+                onRevealKey={(id, rootKey, signal) => manager.revealKey(id, rootKey, signal)}
+                onViewDetails={id =>
+                  manager.selectDetailAccount(manager.selectedAccountId === id ? null : id)
+                }
+                selectedDetailAccountId={manager.selectedAccountId}
+                onNavigateToSettings={() => navigateTo("settings")}
+                routeError={manager.notice && manager.notice.includes("路由") ? manager.notice : null}
+                error={manager.notice || null}
+                requestLogs={mappedRequestLogs}
+                refreshingAccountId={manager.refreshingAccountId}
+                accountRefreshError={manager.accountRefreshError}
+                accountCheckin={manager.accountCheckin}
+              />
+
+              {/* Comprehensive Account Detail View */}
+              {selectedAccount && (
+                <section
+                  className="card account-detail-panel stack"
+                  aria-labelledby="account-detail-title"
+                >
+                  <div className="section-heading">
+                    <div>
+                      <h2 id="account-detail-title" className="text-lg font-semibold flex items-center gap-2">
+                        <span>账号签到详情 · {selectedAccount.username}</span>
+                        {selectedAccount.id === state.route_account_id && (
+                          <span className="badge badge-success text-xs font-medium">当前路由</span>
+                        )}
+                      </h2>
+                      <span className="text-secondary text-xs font-mono">
+                        上游用户 ID：{selectedAccount.upstream_user_id} · 当前周期：
+                        {manager.accountCheckin?.cycle_date || "08:00 日切"}
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      className="btn btn-secondary btn-sm"
+                      onClick={() => manager.selectDetailAccount(null)}
+                    >
+                      关闭详情
+                    </button>
+                  </div>
+
+                  {/* Account Action Bar: Key Selection, Reveal & Route */}
+                  <div className="account-subcard stack compact">
+                    <div className="subcard-header">
+                      <span className="subcard-label flex items-center gap-1.5">
+                        <Key size={14} className="text-teal" />
+                        <span>密钥与路由配置</span>
+                      </span>
+                    </div>
+
+                    <div className="flex gap-4 flex-wrap items-end" style={{ marginTop: "0.5rem" }}>
+                      <div className="field" style={{ minWidth: "220px", flex: 1 }}>
+                        <label className="field-label text-xs">关联密钥选择</label>
+                        <select
+                          className="select-input"
+                          value={selectedAccount.selected_key?.id || ""}
+                          onChange={e => manager.selectAccountKey(selectedAccount.id, e.target.value)}
+                          disabled={busy}
+                          aria-label="关联密钥手选"
+                        >
+                          <option value="">不使用密钥（仅用于管理/签到）</option>
+                          {selectedAccount.keys.map(k => (
+                            <option key={k.id} value={k.id}>
+                              {k.name || "未命名"} ({k.masked})
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+
+                      <div className="flex gap-2">
+                        <button
+                          type="button"
+                          className="btn btn-secondary btn-sm"
+                          onClick={() => setDetailRevealOpen(true)}
+                          disabled={busy || !selectedAccount.selected_key}
+                        >
+                          <Eye size={14} />
+                          <span>查看完整密钥</span>
+                        </button>
+
+                        <button
+                          type="button"
+                          className={`btn btn-sm ${
+                            selectedAccount.id === state.route_account_id
+                              ? "btn-route-active badge-success"
+                              : "btn-primary"
+                          }`}
+                          disabled={
+                            busy ||
+                            selectedAccount.id === state.route_account_id ||
+                            !selectedAccount.selected_key ||
+                            selectedAccount.id === manager.pendingRouteAccountId
+                          }
+                          onClick={() => manager.routeAccount(selectedAccount.id)}
+                        >
+                          {selectedAccount.id === state.route_account_id ? (
+                            <>
+                              <Check size={14} />
+                              <span>当前正在使用此账号路由</span>
+                            </>
+                          ) : selectedAccount.id === manager.pendingRouteAccountId ? (
+                            <>
+                              <Loader2 size={14} className="spin" />
+                              <span>正在切换…</span>
+                            </>
+                          ) : !selectedAccount.selected_key ? (
+                            <span>未选择密钥（无法路由）</span>
+                          ) : (
+                            <span>使用此账号作为网关路由</span>
+                          )}
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Account Recent Request Logs (Filtered from retained logs) */}
+                  <div className="account-subcard stack compact">
+                    <div className="subcard-header">
+                      <span className="subcard-label flex items-center gap-1.5">
+                        <FileText size={14} className="text-secondary" />
+                        <span>该账号本地网关调用记录</span>
+                      </span>
+                    </div>
+
+                    {(() => {
+                      const accountLogs = mappedRequestLogs.filter(
+                        l => l.accountId === selectedAccount.id || l.accountName === selectedAccount.username
+                      );
+                      if (accountLogs.length === 0) {
+                        return (
+                          <p className="secondary small text-center p-3">
+                            暂无此账号的网关调用记录
+                          </p>
+                        );
+                      }
+                      return (
+                        <div className="log-table-wrapper table-responsive" style={{ maxHeight: "180px", overflowY: "auto" }}>
+                          <table className="log-table data-table" aria-label="账号专属请求记录">
+                            <thead>
+                              <tr>
+                                <th scope="col">时间</th>
+                                <th scope="col">状态码</th>
+                                <th scope="col">错误信息</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {accountLogs.slice(0, 10).map(l => (
+                                <tr key={l.id}>
+                                  <td className="text-xs font-mono">{formatShanghaiDateTime(l.timestamp)}</td>
+                                  <td>
+                                    {l.httpStatus !== null ? (
+                                      <span className={`badge ${l.httpStatus < 300 ? "badge-success" : "badge-error"} text-xs font-mono`}>
+                                        {l.httpStatus}
+                                      </span>
+                                    ) : (
+                                      <span className="badge badge-warn text-xs">未收到响应</span>
+                                    )}
+                                  </td>
+                                  <td className="text-xs secondary truncate" style={{ maxWidth: "240px" }}>
+                                    {l.errorBody || "—"}
+                                  </td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      );
+                    })()}
+                  </div>
+
+                  {/* Checkin Today & History */}
+                  {manager.accountCheckin?.today && (
+                    <div className="account-subcard stack compact">
+                      <div className="subcard-header">
+                        <span className="subcard-label flex items-center gap-1.5">
+                          <Calendar size={14} className="text-secondary" />
+                          <span>今日签到状态</span>
+                        </span>
+                        <span
+                          className={`badge ${
+                            manager.accountCheckin.today.status === "success" ||
+                            manager.accountCheckin.today.status === "already_done"
+                              ? "badge-success"
+                              : manager.accountCheckin.today.status === "failed"
+                              ? "badge-error"
+                              : "badge-warn"
+                          }`}
+                        >
+                          {manager.accountCheckin.today.status === "success"
+                            ? "已签到"
+                            : manager.accountCheckin.today.status === "already_done"
+                            ? "今日已完成"
+                            : manager.accountCheckin.today.status === "failed"
+                            ? "签到失败"
+                            : "状态未知"}
+                        </span>
+                      </div>
+                      <div className="subcard-meta flex gap-4 text-xs secondary font-mono">
+                        <span>
+                          执行时间：{formatShanghaiDateTime(manager.accountCheckin.today.started_at)}
+                        </span>
+                        <span>
+                          返回代码：{manager.accountCheckin.today.code || "无"}
+                        </span>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* History Table */}
+                  <div className="account-subcard stack compact">
+                    <div className="subcard-header">
+                      <span className="subcard-label">历史签到记录</span>
+                    </div>
+
+                    <div className="checkin-table-wrapper table-responsive">
+                      <table className="checkin-table data-table" aria-label="账号签到历史">
+                        <thead>
+                          <tr>
+                            <th scope="col">日期</th>
+                            <th scope="col">触发方式</th>
+                            <th scope="col">状态</th>
+                            <th scope="col">开始时间</th>
+                            <th scope="col">结束时间</th>
+                            <th scope="col">状态码</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {(manager.accountCheckin?.history || []).length === 0 ? (
+                            <tr>
+                              <td colSpan={6} className="text-center secondary small">
+                                暂无历史签到记录
+                              </td>
+                            </tr>
+                          ) : (
+                            (manager.accountCheckin?.history || []).map((item, idx) => (
+                              <tr key={`${item.date}-${idx}`}>
+                                <td className="text-xs font-mono tabular-nums">{item.date}</td>
+                                <td>{item.trigger === "manual" ? "手动" : "定时"}</td>
+                                <td>
+                                  <span
+                                    className={`badge ${
+                                      item.status === "success" || item.status === "already_done"
+                                        ? "badge-success"
+                                        : item.status === "failed"
+                                        ? "badge-error"
+                                        : "badge-warn"
+                                    }`}
+                                  >
+                                    {item.status === "success" || item.status === "already_done"
+                                      ? "成功"
+                                      : item.status === "failed"
+                                      ? "失败"
+                                      : "未知"}
+                                  </span>
+                                </td>
+                                <td className="text-xs font-mono tabular-nums">
+                                  {formatShanghaiDateTime(item.started_at)}
+                                </td>
+                                <td className="text-xs font-mono tabular-nums">
+                                  {formatShanghaiDateTime(item.finished_at)}
+                                </td>
+                                <td className="text-xs font-mono tabular-nums">
+                                  {item.code || "—"}
+                                </td>
+                              </tr>
+                            ))
+                          )}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+
+                  {/* Detail Reveal Dialog */}
+                  {detailRevealOpen && selectedAccount && (
+                    <RevealDialog
+                      account={selectedAccount}
+                      onClose={() => setDetailRevealOpen(false)}
+                      onReveal={async (id, rootKey, signal) => {
+                        return await manager.revealKey(id, rootKey, signal);
+                      }}
+                    />
+                  )}
+                </section>
+              )}
+            </div>
+          )}
+
+          {currentPage === "logs" && (
+            <RequestLogPanel
+              logs={mappedRequestLogs}
+              loading={manager.logsLoading}
+              error={manager.logsError}
+              onRefresh={() => manager.loadLogs()}
+              systemLogs={manager.systemLogs}
+              systemLogsLoading={manager.systemLogsLoading}
+              systemLogsError={manager.systemLogsError}
+              onRefreshSystemLogs={params => manager.loadSystemLogs(params)}
+              onClearSystemLogs={() => manager.clearSystemLogs()}
+              onClearRequestLogs={() => manager.clearRequestLogs()}
+            />
+          )}
+
+          {currentPage === "settings" && (
+            <SettingsPanel
+              globalConfig={globalCheckinConfig}
+              busy={busy}
+              onSaveGlobalCheckin={async cfg => {
+                await manager.updateGlobalCheckin(cfg);
+              }}
+              logSettings={manager.logSettings}
+              onSaveLogSettings={async settings => {
+                await manager.saveLogSettings(settings);
+              }}
+              onClearSystemLogs={() => manager.clearSystemLogs()}
+              onClearRequestLogs={() => manager.clearRequestLogs()}
+            />
+          )}
+        </main>
+      </div>
+    </div>
+  );
 }
