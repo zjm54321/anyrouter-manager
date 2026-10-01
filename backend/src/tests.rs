@@ -27,9 +27,14 @@ use std::{
 };
 use tower::ServiceExt;
 
+#[path = "gateway_tests.rs"]
+mod gateway_tests;
+
 const ROOT: &str = "Test-Only-Root-91c7e8aa-2345-SufficientEntropy";
 const KEY: &str = "exact-token-no-invented-prefix";
 const SECRET_COOKIE: &str = "private-upstream-cookie";
+const KEY_B: &str = "other-exact-opaque-token";
+const COOKIE_B: &str = "isolated-second-session";
 
 #[tokio::test]
 async fn checkin_management_contract_auth_and_strict_settings() {
@@ -71,7 +76,7 @@ async fn checkin_management_contract_auth_and_strict_settings() {
             "/api/checkin/settings",
             Some(&cookie),
             false,
-            Some(json!({"enabled":true,"time":"07:17"})),
+            Some(json!({"enabled":true,"time":"07:17","interval_minutes":30})),
         )
         .await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -85,10 +90,10 @@ async fn checkin_management_contract_auth_and_strict_settings() {
             Some(json!({})),
         )
         .await;
-    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(response.status(), StatusCode::GONE);
     assert_eq!(
         json_body(response).await["error"]["code"],
-        "account_not_configured"
+        "deprecated_endpoint"
     );
     let request = axum::http::Request::builder()
         .method("PUT")
@@ -111,11 +116,16 @@ struct FakeLogin {
 }
 #[async_trait]
 impl LoginProvider for FakeLogin {
-    async fn login(&self, _: String, _: String) -> Result<Credentials, SafeError> {
+    async fn login(&self, username: String, _: String) -> Result<Credentials, SafeError> {
         if self.fail.load(Ordering::Relaxed) {
             Err(SafeError::new("invalid_credentials"))
         } else {
-            Ok(credentials())
+            let mut c = credentials();
+            if username == "account-b" {
+                c.api_user = "8".into();
+                c.cookies[0].value = COOKIE_B.into();
+            }
+            Ok(c)
         }
     }
 }
@@ -157,18 +167,59 @@ pub(crate) fn active() -> Active {
 struct MockState {
     refresh_fail: AtomicBool,
     tokens_fail: AtomicBool,
+    stream_started: tokio::sync::Notify,
+    stream_continue: Arc<tokio::sync::Notify>,
+    signins: std::sync::Mutex<Vec<String>>,
 }
 
 async fn mock(State(state): State<Arc<MockState>>, request: Request) -> Response {
     let path = request.uri().path();
-    if path == "/api/user/self" {
-        assert_eq!(request.headers()["new-api-user"], "7");
-        assert!(
-            request.headers()[header::COOKIE]
-                .to_str()
-                .unwrap()
-                .contains(SECRET_COOKIE)
+    let b = request
+        .headers()
+        .get("new-api-user")
+        .is_some_and(|v| v == "8");
+    let user = if b { "8" } else { "7" };
+    let key = if b { KEY_B } else { KEY };
+    if path.starts_with("/api/") {
+        assert_eq!(request.headers()["new-api-user"], user);
+        assert_eq!(
+            request.headers()[header::COOKIE],
+            format!("session={}", if b { COOKIE_B } else { SECRET_COOKIE })
         );
+    }
+    if path == "/api/user/sign_in" {
+        state.signins.lock().unwrap().push(user.into());
+        return axum::Json(json!({"success":true})).into_response();
+    }
+    if path == "/v1/identity" {
+        return request.headers()[header::AUTHORIZATION]
+            .to_str()
+            .unwrap()
+            .to_owned()
+            .into_response();
+    }
+    if path == "/v1/held-events" {
+        let captured = request.headers()[header::AUTHORIZATION]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let wait = state.stream_continue.clone();
+        state.stream_started.notify_one();
+        let first = futures_util::stream::once(async {
+            Ok::<_, std::io::Error>(Bytes::from_static(b"data: started\n\n"))
+        });
+        let last = futures_util::stream::once(async move {
+            wait.notified().await;
+            Ok::<_, std::io::Error>(Bytes::from(format!("data: {captured}\n\n")))
+        });
+        use futures_util::StreamExt;
+        return (
+            [("content-type", "text/event-stream")],
+            Body::from_stream(first.chain(last)),
+        )
+            .into_response();
+    }
+    if path == "/api/user/self" {
         if state.refresh_fail.load(Ordering::Relaxed) {
             return (
                 StatusCode::UNAUTHORIZED,
@@ -177,7 +228,7 @@ async fn mock(State(state): State<Arc<MockState>>, request: Request) -> Response
                 .into_response();
         }
         return axum::Json(
-            json!({"success":true,"data":{"id":7,"quota":"99999999999999999999","used_quota":3}}),
+            json!({"success":true,"data":{"id":user,"username":if b {"verified-b"}else{"validated-account"},"quota":"99999999999999999999","used_quota":3}}),
         )
         .into_response();
     }
@@ -194,14 +245,14 @@ async fn mock(State(state): State<Arc<MockState>>, request: Request) -> Response
                 .map(|id| json!({"id":id,"name":format!("key-{id}"),"status":1,"key":"********"}))
                 .collect::<Vec<_>>()
         } else {
-            vec![json!({"id":101,"name":"last-key","status":1,"key":KEY})]
+            vec![json!({"id":101,"name":"last-key","status":1,"key":key})]
         };
         return axum::Json(json!({"success":true,"data":{"items":items,"total":101}}))
             .into_response();
     }
     if path == "/api/token/1/key" {
         assert_eq!(request.method(), "POST");
-        return axum::Json(json!({"success":true,"data":{"key":KEY}})).into_response();
+        return axum::Json(json!({"success":true,"data":{"key":key}})).into_response();
     }
     if path == "/v1/redirect" {
         return (
@@ -265,6 +316,11 @@ impl Drop for Fixture {
 }
 
 impl Fixture {
+    async fn account_id(&self) -> String {
+        self.app.accounts.lock().await.portfolio.accounts[0]
+            .id
+            .clone()
+    }
     async fn new(with_active: bool) -> Self {
         Self::with_login(with_active, false, None).await
     }
@@ -296,7 +352,11 @@ impl Fixture {
         });
         let app = App::new(
             config,
-            with_active.then(active),
+            if with_active {
+                model::Portfolio::from_active(active())
+            } else {
+                model::Portfolio::default()
+            },
             Upstream::mock(base),
             login.unwrap_or_else(|| fake.clone()),
         );
@@ -378,6 +438,567 @@ impl Fixture {
 
 async fn json_body(response: Response) -> Value {
     serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await.unwrap()).unwrap()
+}
+
+impl Fixture {
+    async fn login_save(&self, cookie: &str, username: &str, key: Option<&str>) -> Value {
+        assert_eq!(
+            self.request(
+                "POST",
+                "/api/accounts/login",
+                Some(cookie),
+                false,
+                Some(json!({"username":username,"password":"fixture-password"}))
+            )
+            .await
+            .status(),
+            StatusCode::ACCEPTED
+        );
+        self.done().await;
+        let candidate = self
+            .app
+            .accounts
+            .lock()
+            .await
+            .candidate
+            .as_ref()
+            .unwrap()
+            .id
+            .clone();
+        let response = self
+            .request(
+                "POST",
+                "/api/accounts/save",
+                Some(cookie),
+                false,
+                Some(json!({"candidate_id":candidate,"key_id":key})),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        self.done().await;
+        assert_eq!(
+            self.app
+                .accounts
+                .lock()
+                .await
+                .operation
+                .as_ref()
+                .unwrap()
+                .status,
+            "succeeded"
+        );
+        json_body(
+            self.request("GET", "/api/accounts", Some(cookie), false, None)
+                .await,
+        )
+        .await
+    }
+}
+
+#[tokio::test]
+async fn multi_account_upsert_keyless_and_explicit_route_isolation() {
+    let f = Fixture::new(false).await;
+    let cookie = f.session().await;
+    let first = f.login_save(&cookie, "alias-a", Some("1")).await;
+    assert!(first["route_account_id"].is_null());
+    assert_eq!(first["accounts"][0]["username"], "validated-account");
+    let id_a = first["accounts"][0]["id"].as_str().unwrap().to_owned();
+    let second = f.login_save(&cookie, "account-b", None).await;
+    let id_b = second["accounts"][1]["id"].as_str().unwrap().to_owned();
+    assert!(second["accounts"][1]["selected_key"].is_null());
+    assert_eq!(
+        f.request(
+            "POST",
+            &format!("/api/accounts/{id_b}/route"),
+            Some(&cookie),
+            false,
+            Some(json!({"revision":"1"}))
+        )
+        .await
+        .status(),
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        f.request(
+            "POST",
+            &format!("/api/accounts/{id_b}/checkin/run"),
+            Some(&cookie),
+            false,
+            Some(json!({}))
+        )
+        .await
+        .status(),
+        StatusCode::ACCEPTED
+    );
+    f.done().await;
+    assert_eq!(*f.mock.signins.lock().unwrap(), vec!["8"]);
+    let history = json_body(
+        f.request(
+            "GET",
+            &format!("/api/accounts/{id_b}/checkin"),
+            Some(&cookie),
+            false,
+            None,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(history["history"].as_array().unwrap().len(), 1);
+    assert_eq!(history["account_id"], id_b);
+    assert_eq!(
+        f.request(
+            "POST",
+            &format!("/api/accounts/{id_a}/route"),
+            Some(&cookie),
+            false,
+            Some(json!({"revision":"1"}))
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    let relogin = f.login_save(&cookie, "another-alias-a", None).await;
+    assert_eq!(relogin["accounts"].as_array().unwrap().len(), 2);
+    assert_eq!(relogin["accounts"][0]["id"], id_a);
+    assert_eq!(relogin["accounts"][1]["id"], id_b);
+    assert_eq!(relogin["route_account_id"], id_a);
+    assert_eq!(relogin["accounts"][0]["selected_key"]["id"], "1");
+    assert_eq!(
+        f.request(
+            "POST",
+            &format!("/api/accounts/{id_b}/refresh"),
+            Some(&cookie),
+            false,
+            None
+        )
+        .await
+        .status(),
+        StatusCode::ACCEPTED
+    );
+    f.done().await;
+    let refreshed = json_body(
+        f.request("GET", "/api/accounts", Some(&cookie), false, None)
+            .await,
+    )
+    .await;
+    assert_eq!(refreshed["accounts"][1]["username"], "verified-b");
+    assert!(refreshed["accounts"][1]["selected_key"].is_null());
+    assert_eq!(
+        f.request(
+            "POST",
+            &format!("/api/accounts/{id_b}/key/select"),
+            Some(&cookie),
+            false,
+            Some(json!({"revision":"1","key_id":"1"}))
+        )
+        .await
+        .status(),
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        f.request(
+            "POST",
+            &format!("/api/accounts/{id_b}/key/select"),
+            Some(&cookie),
+            false,
+            Some(json!({"revision":"2","key_id":"2001"}))
+        )
+        .await
+        .status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        f.request(
+            "POST",
+            &format!("/api/accounts/{id_b}/key/select"),
+            Some(&cookie),
+            false,
+            Some(json!({"revision":"2","key_id":"1"}))
+        )
+        .await
+        .status(),
+        StatusCode::ACCEPTED
+    );
+    f.done().await;
+    let reveal = f
+        .request(
+            "POST",
+            &format!("/api/accounts/{id_b}/key/reveal"),
+            Some(&cookie),
+            true,
+            Some(json!({"revision":"3"})),
+        )
+        .await;
+    let reveal = json_body(reveal).await;
+    assert_eq!(reveal["account_id"], id_b);
+    assert_eq!(reveal["key"], KEY_B);
+    let safe = serde_json::to_string(&refreshed).unwrap();
+    for secret in [KEY, KEY_B, SECRET_COOKIE, COOKIE_B, "fixture-password"] {
+        assert!(!safe.contains(secret));
+    }
+    let loaded = store::load(&f.app.config.state_path).unwrap();
+    assert_eq!(loaded.route_account_id, Some(id_a));
+    assert_eq!(loaded.accounts[1].selected_key.as_ref().unwrap().key, KEY_B);
+    f.app.shutdown().await;
+}
+
+#[tokio::test]
+async fn route_atomic_failure_new_requests_b_old_sse_a() {
+    let f = Fixture::new(true).await;
+    let cookie = f.session().await;
+    store::save(
+        &f.app.config.state_path,
+        &f.app.accounts.lock().await.portfolio,
+    )
+    .unwrap();
+    let dto = f.login_save(&cookie, "account-b", Some("1")).await;
+    let id_b = dto["accounts"][1]["id"].as_str().unwrap();
+    let bytes = std::fs::read(&f.app.config.state_path).unwrap();
+    let held = f.request("GET", "/v1/held-events", None, true, None).await;
+    assert_eq!(held.status(), StatusCode::OK);
+    f.app.fail_account_save.store(true, Ordering::SeqCst);
+    assert_eq!(
+        f.request(
+            "POST",
+            &format!("/api/accounts/{id_b}/route"),
+            Some(&cookie),
+            false,
+            Some(json!({"revision":"1"}))
+        )
+        .await
+        .status(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    assert_eq!(std::fs::read(&f.app.config.state_path).unwrap(), bytes);
+    assert_eq!(
+        to_bytes(
+            f.request("GET", "/v1/identity", None, true, None)
+                .await
+                .into_body(),
+            1024
+        )
+        .await
+        .unwrap(),
+        format!("Bearer {KEY}")
+    );
+    f.app.fail_account_save.store(false, Ordering::SeqCst);
+    assert_eq!(
+        f.request(
+            "POST",
+            &format!("/api/accounts/{id_b}/route"),
+            Some(&cookie),
+            false,
+            Some(json!({"revision":"1"}))
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        to_bytes(
+            f.request("GET", "/v1/identity", None, true, None)
+                .await
+                .into_body(),
+            1024
+        )
+        .await
+        .unwrap(),
+        format!("Bearer {KEY_B}")
+    );
+    f.mock.stream_continue.notify_one();
+    let old = to_bytes(held.into_body(), 1024).await.unwrap();
+    assert_eq!(old, format!("data: started\n\ndata: Bearer {KEY}\n\n"));
+    let compat = json_body(
+        f.request("GET", "/api/account", Some(&cookie), false, None)
+            .await,
+    )
+    .await;
+    assert_eq!(compat["active"]["upstream_user_id"], "8");
+    f.app.shutdown().await;
+}
+
+#[tokio::test]
+async fn multi_account_failed_selection_keeps_route_key_and_bytes() {
+    let f = Fixture::new(true).await;
+    let cookie = f.session().await;
+    let dto = f.login_save(&cookie, "account-b", Some("1")).await;
+    let id_b = dto["accounts"][1]["id"].as_str().unwrap();
+    let bytes = std::fs::read(&f.app.config.state_path).unwrap();
+    f.app.fail_account_save.store(true, Ordering::SeqCst);
+    assert_eq!(
+        f.request(
+            "POST",
+            &format!("/api/accounts/{id_b}/key/select"),
+            Some(&cookie),
+            false,
+            Some(json!({"revision":"1","key_id":"101"}))
+        )
+        .await
+        .status(),
+        StatusCode::ACCEPTED
+    );
+    f.done().await;
+    let state = f.app.accounts.lock().await;
+    assert_eq!(
+        state
+            .operation
+            .as_ref()
+            .unwrap()
+            .error
+            .as_ref()
+            .unwrap()
+            .code,
+        "persistence_failed"
+    );
+    assert_eq!(
+        state.portfolio.accounts[1]
+            .selected_key
+            .as_ref()
+            .unwrap()
+            .id,
+        "1"
+    );
+    assert_eq!(state.active.as_ref().unwrap().key, KEY);
+    assert_eq!(std::fs::read(&f.app.config.state_path).unwrap(), bytes);
+    drop(state);
+    assert_eq!(
+        f.request(
+            "POST",
+            "/api/accounts/nonexistent/route",
+            Some(&cookie),
+            false,
+            Some(json!({"revision":"1"}))
+        )
+        .await
+        .status(),
+        StatusCode::NOT_FOUND
+    );
+    f.app.shutdown().await;
+}
+
+#[tokio::test]
+async fn schedule_overflow_rejects_account_add_and_settings_even_disabled() {
+    let f = Fixture::new(true).await;
+    let cookie = f.session().await;
+    assert_eq!(
+        f.request(
+            "PUT",
+            "/api/checkin/settings",
+            Some(&cookie),
+            false,
+            Some(json!({"enabled":false,"time":"07:59","interval_minutes":30}))
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        f.request(
+            "POST",
+            "/api/accounts/login",
+            Some(&cookie),
+            false,
+            Some(json!({"username":"account-b","password":"fixture-password"}))
+        )
+        .await
+        .status(),
+        StatusCode::ACCEPTED
+    );
+    f.done().await;
+    let candidate = f
+        .app
+        .accounts
+        .lock()
+        .await
+        .candidate
+        .as_ref()
+        .unwrap()
+        .id
+        .clone();
+    assert_eq!(
+        f.request(
+            "POST",
+            "/api/accounts/save",
+            Some(&cookie),
+            false,
+            Some(json!({"candidate_id":candidate}))
+        )
+        .await
+        .status(),
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    assert_eq!(f.app.accounts.lock().await.portfolio.accounts.len(), 1);
+    assert_eq!(
+        f.request(
+            "PUT",
+            "/api/checkin/settings",
+            Some(&cookie),
+            false,
+            Some(json!({"enabled":false,"time":"09:00","interval_minutes":30}))
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        f.request(
+            "POST",
+            "/api/accounts/save",
+            Some(&cookie),
+            false,
+            Some(json!({"candidate_id":candidate}))
+        )
+        .await
+        .status(),
+        StatusCode::ACCEPTED
+    );
+    f.done().await;
+    let old = std::fs::read(f.app.config.checkin_path()).unwrap();
+    assert_eq!(
+        f.request(
+            "PUT",
+            "/api/checkin/settings",
+            Some(&cookie),
+            false,
+            Some(json!({"enabled":false,"time":"09:00","interval_minutes":1440}))
+        )
+        .await
+        .status(),
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    assert_eq!(std::fs::read(f.app.config.checkin_path()).unwrap(), old);
+    f.app.shutdown().await;
+}
+
+#[tokio::test]
+async fn multi_account_auth_deprecation_busy_reveal_and_limit_contract() {
+    let f = Fixture::new(true).await;
+    assert_eq!(
+        f.request("GET", "/api/accounts", None, false, None)
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let cookie = f.session().await;
+    let id = f.account_id().await;
+    for path in [
+        "/api/account/login",
+        "/api/account/activate",
+        "/api/account/refresh",
+        "/api/account/key/reveal",
+        "/api/checkin/run",
+    ] {
+        let response = f
+            .request("POST", path, Some(&cookie), false, Some(json!({})))
+            .await;
+        assert_eq!(response.status(), StatusCode::GONE);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        assert_eq!(
+            json_body(response).await["error"]["code"],
+            "deprecated_endpoint"
+        );
+    }
+    assert_eq!(
+        f.request(
+            "POST",
+            &format!("/api/accounts/{id}/key/reveal"),
+            Some(&cookie),
+            false,
+            Some(json!({"revision":"1"}))
+        )
+        .await
+        .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        f.request(
+            "POST",
+            &format!("/api/accounts/{id}/key/reveal"),
+            Some(&cookie),
+            true,
+            Some(json!({"revision":"stale-opaque"}))
+        )
+        .await
+        .status(),
+        StatusCode::CONFLICT
+    );
+    {
+        let mut state = f.app.accounts.lock().await;
+        app::start_for(&mut state, "refresh", "reading_account", Some(id.clone()));
+    }
+    assert_eq!(
+        f.request(
+            "POST",
+            &format!("/api/accounts/{id}/route"),
+            Some(&cookie),
+            false,
+            Some(json!({"revision":"1"}))
+        )
+        .await
+        .status(),
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        f.request(
+            "PUT",
+            "/api/checkin/settings",
+            Some(&cookie),
+            false,
+            Some(json!({"enabled":false,"time":"09:00","interval_minutes":30}))
+        )
+        .await
+        .status(),
+        StatusCode::CONFLICT
+    );
+    f.app.accounts.lock().await.operation = None;
+    // 64 valid independent identities; user 8 is intentionally not present.
+    {
+        let mut state = f.app.accounts.lock().await;
+        let prototype = state.portfolio.accounts[0].clone();
+        for user in 100..163 {
+            let mut a = prototype.clone();
+            a.id = model::id();
+            a.upstream_user_id = user.to_string();
+            a.credentials.api_user = user.to_string();
+            state.portfolio.accounts.push(a);
+        }
+        assert!(state.portfolio.validate());
+    }
+    assert_eq!(
+        f.request(
+            "POST",
+            "/api/accounts/login",
+            Some(&cookie),
+            false,
+            Some(json!({"username":"account-b","password":"fixture-password"}))
+        )
+        .await
+        .status(),
+        StatusCode::ACCEPTED
+    );
+    f.done().await;
+    let candidate = f
+        .app
+        .accounts
+        .lock()
+        .await
+        .candidate
+        .as_ref()
+        .unwrap()
+        .id
+        .clone();
+    let response = f
+        .request(
+            "POST",
+            "/api/accounts/save",
+            Some(&cookie),
+            false,
+            Some(json!({"candidate_id":candidate})),
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(json_body(response).await["error"]["code"], "account_limit");
+    f.app.shutdown().await;
 }
 
 #[tokio::test]
@@ -465,7 +1086,7 @@ async fn management_diagnostics_opt_in_only_and_auth_shape_unchanged() {
         let response = f
             .request(
                 "POST",
-                "/api/account/login",
+                "/api/accounts/login",
                 Some(&cookie),
                 false,
                 Some(json!({"username": "fake", "password": "sentinel-password"})),
@@ -522,7 +1143,7 @@ async fn login_stage_sources_self_and_tokens_do_not_reflect_upstream() {
         let response = f
             .request(
                 "POST",
-                "/api/account/login",
+                "/api/accounts/login",
                 Some(&cookie),
                 false,
                 Some(json!({"username": "fake", "password": "sentinel-password"})),
@@ -627,7 +1248,7 @@ async fn login_candidate_activation_reveal_refresh_and_failure_retention() {
     assert_eq!(
         f.request(
             "POST",
-            "/api/account/login",
+            "/api/accounts/login",
             Some(&cookie),
             false,
             Some(json!({"username":"new-account","password":"never-persist-this-password"}))
@@ -652,7 +1273,7 @@ async fn login_candidate_activation_reveal_refresh_and_failure_retention() {
     f.fake.fail.store(true, Ordering::Relaxed);
     f.request(
         "POST",
-        "/api/account/login",
+        "/api/accounts/login",
         Some(&cookie),
         false,
         Some(json!({"username":"bad","password":"bad"})),
@@ -670,7 +1291,7 @@ async fn login_candidate_activation_reveal_refresh_and_failure_retention() {
     assert_eq!(
         f.request(
             "POST",
-            "/api/account/activate",
+            "/api/accounts/save",
             Some(&cookie),
             false,
             Some(json!({"candidate_id":candidate_id,"key_id":"1"}))
@@ -690,10 +1311,10 @@ async fn login_candidate_activation_reveal_refresh_and_failure_retention() {
     assert_eq!(
         f.request(
             "POST",
-            "/api/account/key/reveal",
+            &format!("/api/accounts/{}/key/reveal", f.account_id().await),
             Some(&cookie),
             false,
-            Some(json!({"active_revision":"2"}))
+            Some(json!({"revision":"2"}))
         )
         .await
         .status(),
@@ -702,10 +1323,10 @@ async fn login_candidate_activation_reveal_refresh_and_failure_retention() {
     let stale = f
         .request(
             "POST",
-            "/api/account/key/reveal",
+            &format!("/api/accounts/{}/key/reveal", f.account_id().await),
             Some(&cookie),
             true,
-            Some(json!({"active_revision":"1"})),
+            Some(json!({"revision":"1"})),
         )
         .await;
     assert_eq!(stale.status(), StatusCode::CONFLICT);
@@ -714,10 +1335,10 @@ async fn login_candidate_activation_reveal_refresh_and_failure_retention() {
         json_body(
             f.request(
                 "POST",
-                "/api/account/key/reveal",
+                &format!("/api/accounts/{}/key/reveal", f.account_id().await),
                 Some(&cookie),
                 true,
-                Some(json!({"active_revision":"2"}))
+                Some(json!({"revision":"2"}))
             )
             .await
         )
@@ -742,9 +1363,20 @@ async fn login_candidate_activation_reveal_refresh_and_failure_retention() {
             & 0o777,
         0o700
     );
-    assert!(store::load(&f.app.config.state_path).unwrap().is_some());
-    f.request("POST", "/api/account/refresh", Some(&cookie), false, None)
-        .await;
+    assert!(
+        !store::load(&f.app.config.state_path)
+            .unwrap()
+            .accounts
+            .is_empty()
+    );
+    f.request(
+        "POST",
+        &format!("/api/accounts/{}/refresh", f.account_id().await),
+        Some(&cookie),
+        false,
+        None,
+    )
+    .await;
     f.done().await;
     assert_eq!(
         f.app
@@ -758,8 +1390,14 @@ async fn login_candidate_activation_reveal_refresh_and_failure_retention() {
         "3"
     );
     f.mock.refresh_fail.store(true, Ordering::Relaxed);
-    f.request("POST", "/api/account/refresh", Some(&cookie), false, None)
-        .await;
+    f.request(
+        "POST",
+        &format!("/api/accounts/{}/refresh", f.account_id().await),
+        Some(&cookie),
+        false,
+        None,
+    )
+    .await;
     f.done().await;
     let state = f.app.accounts.lock().await;
     assert_eq!(state.active.as_ref().unwrap().revision, "3");
@@ -783,7 +1421,7 @@ async fn expired_candidate_single_operation_and_persistence_failure() {
     let cookie = f.session().await;
     f.request(
         "POST",
-        "/api/account/login",
+        "/api/accounts/login",
         Some(&cookie),
         false,
         Some(json!({"username":"new","password":"test"})),
@@ -812,7 +1450,7 @@ async fn expired_candidate_single_operation_and_persistence_failure() {
     assert_eq!(
         f.request(
             "POST",
-            "/api/account/activate",
+            "/api/accounts/save",
             Some(&cookie),
             false,
             Some(json!({"candidate_id":candidate_id,"key_id":"1"}))
@@ -826,7 +1464,7 @@ async fn expired_candidate_single_operation_and_persistence_failure() {
     std::fs::create_dir(&f.app.config.state_path).unwrap();
     f.request(
         "POST",
-        "/api/account/activate",
+        "/api/accounts/save",
         Some(&cookie),
         false,
         Some(json!({"candidate_id":candidate_id,"key_id":"1"})),
@@ -850,9 +1488,15 @@ async fn expired_candidate_single_operation_and_persistence_failure() {
     state.operation.as_mut().unwrap().status = "running";
     drop(state);
     assert_eq!(
-        f.request("POST", "/api/account/refresh", Some(&cookie), false, None)
-            .await
-            .status(),
+        f.request(
+            "POST",
+            &format!("/api/accounts/{}/refresh", f.account_id().await),
+            Some(&cookie),
+            false,
+            None
+        )
+        .await
+        .status(),
         StatusCode::CONFLICT
     );
 }
@@ -1010,7 +1654,7 @@ async fn gateway_delivers_sse_before_upstream_finishes() {
     };
     let app = App::new(
         config,
-        Some(active()),
+        model::Portfolio::from_active(active()),
         transport,
         Arc::new(FakeLogin {
             fail: AtomicBool::new(false),
@@ -1042,16 +1686,33 @@ async fn expired_persisted_session_keeps_gateway_and_refresh_retains_snapshot() 
     old.credentials.cookies[0].expires = Some(1.0);
     assert!(!old.credentials.validate());
     assert!(old.validate());
-    store::save(&f.app.config.state_path, &old).unwrap();
-    let loaded = store::load(&f.app.config.state_path).unwrap().unwrap();
-    f.app.accounts.lock().await.active = Some(Arc::new(loaded));
+    store::save(
+        &f.app.config.state_path,
+        &model::Portfolio::from_active(old),
+    )
+    .unwrap();
+    let loaded = store::load(&f.app.config.state_path).unwrap();
+    {
+        let mut state = f.app.accounts.lock().await;
+        state.active = loaded
+            .route()
+            .and_then(model::Entry::snapshot)
+            .map(Arc::new);
+        state.portfolio = loaded;
+    }
     let cookie = f.session().await;
     let response = f.request("GET", "/v1/events", None, true, None).await;
     assert_eq!(response.status(), StatusCode::OK);
     let _ = to_bytes(response.into_body(), 1024).await.unwrap();
     let before = std::fs::read(&f.app.config.state_path).unwrap();
-    f.request("POST", "/api/account/refresh", Some(&cookie), false, None)
-        .await;
+    f.request(
+        "POST",
+        &format!("/api/accounts/{}/refresh", f.account_id().await),
+        Some(&cookie),
+        false,
+        None,
+    )
+    .await;
     f.done().await;
     let state = f.app.accounts.lock().await;
     assert_eq!(
@@ -1073,7 +1734,7 @@ async fn expired_persisted_session_keeps_gateway_and_refresh_retains_snapshot() 
     assert_eq!(
         f.request(
             "POST",
-            "/api/account/login",
+            "/api/accounts/login",
             Some(&cookie),
             false,
             Some(json!({"username":"new","password":"fake-test-password"}))
@@ -1102,13 +1763,13 @@ fn failed_actual_rename_preserves_existing_state_bytes_and_checksum() {
     use sha2::{Digest, Sha256};
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("data/account.json");
-    let old = active();
+    let old = model::Portfolio::from_active(active());
     store::save(&path, &old).unwrap();
     let before = std::fs::read(&path).unwrap();
     let checksum = Sha256::digest(&before);
     let mut updated = old.clone();
-    updated.key = "new-fake-test-key".into();
-    updated.revision = "2".into();
+    updated.accounts[0].selected_key.as_mut().unwrap().key = "new-fake-test-key".into();
+    updated.accounts[0].revision = "2".into();
     assert_eq!(
         store::save_with_rename_failure(&path, &updated)
             .unwrap_err()
@@ -1118,7 +1779,12 @@ fn failed_actual_rename_preserves_existing_state_bytes_and_checksum() {
     let after = std::fs::read(&path).unwrap();
     assert_eq!(after, before);
     assert_eq!(Sha256::digest(&after), checksum);
-    let reloaded = store::load(&path).unwrap().unwrap();
+    let reloaded = store::load(&path)
+        .unwrap()
+        .route()
+        .unwrap()
+        .snapshot()
+        .unwrap();
     assert_eq!(reloaded.key, KEY);
     assert_eq!(reloaded.revision, "1");
 }
@@ -1209,7 +1875,7 @@ async fn network_disconnect_test(upload: bool) {
     };
     let app = App::new(
         config,
-        Some(active()),
+        model::Portfolio::from_active(active()),
         transport,
         Arc::new(FakeLogin {
             fail: AtomicBool::new(false),
@@ -1312,7 +1978,7 @@ async fn native_gateway_large_stream_is_incremental_and_cookie_free() {
             state_path: directory.path().join("account.json"),
             ..Default::default()
         },
-        Some(active()),
+        model::Portfolio::from_active(active()),
         transport,
         Arc::new(FakeLogin {
             fail: AtomicBool::new(false),
@@ -1395,7 +2061,7 @@ fn config_material_and_target_validation() {
     );
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("data/state.json");
-    store::save(&path, &active()).unwrap();
+    store::save(&path, &model::Portfolio::from_active(active())).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
     assert!(store::load(&path).is_err());
 }

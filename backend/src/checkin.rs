@@ -2,12 +2,12 @@
 use crate::{
     app::{self, App},
     error::{ApiError, SafeError},
-    model::{Active, Credentials},
+    model::{Credentials, Entry},
     upstream::{UPSTREAM, identifier},
 };
 use axum::{
     Json,
-    extract::State,
+    extract::{Path as AccountPath, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
@@ -22,12 +22,18 @@ use std::{path::Path, sync::Arc, time::Duration};
 pub struct Settings {
     pub enabled: bool,
     pub time: String,
+    #[serde(default = "default_interval")]
+    pub interval_minutes: u16,
+}
+fn default_interval() -> u16 {
+    30
 }
 impl Default for Settings {
     fn default() -> Self {
         Self {
             enabled: false,
             time: "09:00".into(),
+            interval_minutes: 30,
         }
     }
 }
@@ -46,7 +52,7 @@ pub enum Trigger {
     Manual,
     Scheduled,
 }
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Code {
     #[serde(rename = "checkin_outcome_unknown")]
     OutcomeUnknown,
@@ -156,6 +162,146 @@ mod tests {
         s.history[0].started_at = "invalid".into();
         assert!(!s.valid());
     }
+
+    #[tokio::test]
+    async fn legacy_history_with_65_identities_loads_with_one_current_account() {
+        let (app, posts, _, _dir, server) = fixture(0).await;
+        assert_eq!(app.accounts.lock().await.portfolio.accounts.len(), 1);
+        let mut saved = Saved::default();
+        for n in 0..180 {
+            let mut r = record();
+            r.account_user_id = (n % 65 + 1).to_string();
+            r.date = cycle(fixed() - chrono::Duration::days(n + 2));
+            r.status = Status::Success;
+            r.finished_at = Some(fixed().to_rfc3339());
+            saved.history.push(r);
+        }
+        let path = app.config.checkin_path();
+        save(&path, &saved).unwrap();
+        let mut legacy = serde_json::to_value(&saved).unwrap();
+        legacy["settings"]
+            .as_object_mut()
+            .unwrap()
+            .remove("interval_minutes");
+        let bytes = serde_json::to_vec(&legacy).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        let recovered = load_at(&path, fixed()).unwrap();
+        assert_eq!(recovered.settings.interval_minutes, 30);
+        assert_eq!(recovered.history.len(), 180);
+        assert_eq!(
+            recovered
+                .history
+                .iter()
+                .map(|r| &r.account_user_id)
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            65
+        );
+        assert_eq!(
+            serde_json::to_value(&recovered.history).unwrap(),
+            serde_json::to_value(&saved.history).unwrap()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        *app.checkin.lock().await = recovered;
+        assert_eq!(posts.load(Ordering::SeqCst), 0);
+        app.shutdown().await;
+        server.abort();
+    }
+
+    fn expired_ambiguous_history(count: i64) -> Saved {
+        let mut saved = Saved::default();
+        for n in 0..count {
+            let mut r = record();
+            r.date = cycle(fixed() - chrono::Duration::days(n + 2));
+            r.status = Status::Unknown;
+            r.code = Some(Code::CycleAmbiguous);
+            r.finished_at = Some(fixed().to_rfc3339());
+            saved.history.push(r);
+        }
+        saved
+    }
+
+    #[test]
+    fn expired_ambiguous_history_allows_new_persisted_intent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("private/checkin.json");
+        let mut saved = expired_ambiguous_history(180);
+        save(&path, &saved).unwrap();
+        saved = load_at(&path, fixed()).unwrap();
+        let oldest = cycle(fixed() - chrono::Duration::days(181));
+        saved.put_protected(record(), fixed()).unwrap();
+        assert_eq!(saved.history.len(), 180);
+        assert!(saved.find("7", &oldest).is_none());
+        assert!(saved.find("7", &cycle(fixed())).unwrap().status == Status::Running);
+        save(&path, &saved).unwrap();
+        let recovered = load_at(&path, fixed()).unwrap();
+        assert_eq!(recovered.history.len(), 180);
+        assert!(recovered.find("7", &cycle(fixed())).unwrap().status == Status::Unknown);
+    }
+
+    #[test]
+    fn recovery_prunes_expired_ambiguity_but_preserves_both_reset_cycles() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("private/checkin.json");
+        let mut saved = expired_ambiguous_history(179);
+        let previous = cycle(fixed() - chrono::Duration::days(1));
+        let mut interrupted = record();
+        interrupted.date = previous.clone();
+        saved.history.push(interrupted);
+        save(&path, &saved).unwrap();
+        let recovered = load_at(&path, fixed()).unwrap();
+        assert_eq!(recovered.history.len(), 180);
+        assert!(
+            recovered
+                .find("7", &cycle(fixed() - chrono::Duration::days(180)))
+                .is_none()
+        );
+        for date in [&previous, &cycle(fixed())] {
+            let r = recovered.find("7", date).unwrap();
+            assert!(r.status == Status::Unknown);
+            assert!(r.code == Some(Code::CycleAmbiguous));
+        }
+        let reloaded = load_at(&path, fixed()).unwrap();
+        assert_eq!(
+            serde_json::to_value(&reloaded.history).unwrap(),
+            serde_json::to_value(&recovered.history).unwrap()
+        );
+    }
+
+    #[test]
+    fn current_previous_future_and_running_history_remain_protected() {
+        for anchor in [-1, 0, 1] {
+            let mut saved = expired_ambiguous_history(179);
+            for r in &mut saved.history {
+                r.status = Status::Running;
+                r.finished_at = None;
+                r.code = None;
+            }
+            let mut protected = record();
+            protected.date = cycle(fixed() + chrono::Duration::days(anchor));
+            protected.status = Status::Unknown;
+            protected.code = Some(Code::CycleAmbiguous);
+            protected.finished_at = Some(fixed().to_rfc3339());
+            saved.history.push(protected);
+            let before = serde_json::to_vec(&saved).unwrap();
+            let mut intent = record();
+            if anchor == 0 {
+                intent.date = cycle(fixed() - chrono::Duration::days(1));
+            }
+            assert_eq!(
+                saved.put_protected(intent, fixed()).unwrap_err().code,
+                "checkin_history_full"
+            );
+            assert_eq!(serde_json::to_vec(&saved).unwrap(), before);
+            // On a backward clock jump even old unknown dates become future,
+            // and must remain protected instead of reopening duplicate attempts.
+            let mut rollback = expired_ambiguous_history(180);
+            let rollback_time = fixed() - chrono::Duration::days(500);
+            let mut intent = record();
+            intent.date = cycle(rollback_time);
+            assert!(rollback.put_protected(intent, rollback_time).is_err());
+        }
+    }
     async fn fixture(
         mode: usize,
     ) -> (
@@ -221,7 +367,7 @@ mod tests {
         };
         let mut app = App::new(
             config,
-            Some(crate::tests::active()),
+            crate::model::Portfolio::from_active(crate::tests::active()),
             Upstream::mock(format!("http://{addr}")),
             Arc::new(Provider(verifies.clone())),
         );
@@ -330,14 +476,14 @@ mod tests {
                 .code,
             "persistence_failed"
         );
-        app.accounts.lock().await.active = None;
+        app.accounts.lock().await.portfolio.accounts.clear();
         assert_eq!(
             start(&app, Trigger::Manual, false, fixed())
                 .await
                 .unwrap_err()
                 .1
                 .code,
-            "account_not_configured"
+            "not_found"
         );
         assert_eq!(posts.load(Ordering::SeqCst), 0);
         app.shutdown().await;
@@ -377,7 +523,7 @@ mod tests {
         *app.checkin.lock().await = saved;
         std::fs::remove_file(&path).unwrap();
         std::fs::create_dir(&path).unwrap();
-        let active = app.accounts.lock().await.active.clone().unwrap();
+        let active = Arc::new(app.accounts.lock().await.portfolio.accounts[0].clone());
         execute(&app, active, record()).await;
         assert_eq!(posts.load(Ordering::SeqCst), 1);
         assert!(app.checkin.lock().await.history[0].status == Status::Unknown);
@@ -519,14 +665,218 @@ mod tests {
         assert!(b.is_err());
         settled(&app).await;
         assert_eq!(posts.load(Ordering::SeqCst), 1);
-        assert_eq!(status(&app).await["history"].as_array().unwrap().len(), 1);
+        assert_eq!(app.checkin.lock().await.history.len(), 1);
         let mut changed = crate::tests::active();
         changed.upstream_user_id = "8".into();
         changed.credentials.api_user = "8".into();
-        app.accounts.lock().await.active = Some(Arc::new(changed));
+        app.accounts.lock().await.portfolio = crate::model::Portfolio::from_active(changed);
         let dto = status(&app).await;
-        assert!(dto["history"].as_array().unwrap().is_empty());
-        assert!(dto["today"].is_null());
+        assert_eq!(dto["schedule"][0]["status"], "pending");
+        app.shutdown().await;
+        server.abort();
+    }
+
+    #[test]
+    fn ordered_slots_interval_overflow_and_per_account_history() {
+        let mut settings = Settings {
+            enabled: false,
+            time: "09:00".into(),
+            interval_minutes: 30,
+        };
+        let now = at("2026-10-01T08:00:00+08:00");
+        assert_eq!(slot(now, &settings, 0), at("2026-10-01T09:00:00+08:00"));
+        assert_eq!(slot(now, &settings, 1), at("2026-10-01T09:30:00+08:00"));
+        assert_eq!(
+            slot(at("2026-10-01T07:59:59+08:00"), &settings, 1),
+            at("2026-09-30T09:30:00+08:00")
+        );
+        settings.interval_minutes = 11;
+        assert_eq!(slot(now, &settings, 1), at("2026-10-01T09:11:00+08:00"));
+        settings.time = "07:59".into();
+        assert_eq!(slot(now, &settings, 0), at("2026-10-02T07:59:00+08:00"));
+        assert_eq!(
+            validate_plan(&settings, 2).unwrap_err().1.code,
+            "schedule_overflow"
+        );
+        settings.interval_minutes = 1440;
+        settings.time = "08:00".into();
+        assert!(validate_plan(&settings, 1).is_ok());
+        assert!(validate_plan(&settings, 2).is_err());
+        let mut saved = Saved::default();
+        for user in ["7", "8"] {
+            for n in 0..200 {
+                let mut r = record();
+                r.account_user_id = user.into();
+                r.date = cycle(fixed() - chrono::Duration::days(200 - n));
+                r.status = Status::Success;
+                r.finished_at = Some(fixed().to_rfc3339());
+                saved.put_protected(r, fixed()).unwrap();
+            }
+        }
+        assert_eq!(saved.history.len(), 360);
+        assert!(saved.valid());
+        let mut rollback = record();
+        rollback.date = cycle(fixed() - chrono::Duration::days(500));
+        assert!(
+            saved
+                .put_protected(rollback, fixed() - chrono::Duration::days(500))
+                .is_err()
+        );
+        // Legacy settings acquire the default interval without losing records.
+        let mut legacy = serde_json::to_value(&saved).unwrap();
+        legacy["settings"]
+            .as_object_mut()
+            .unwrap()
+            .remove("interval_minutes");
+        let migrated: Saved = serde_json::from_value(legacy).unwrap();
+        assert_eq!(migrated.settings.interval_minutes, 30);
+        assert_eq!(migrated.history.len(), 360);
+    }
+
+    #[tokio::test]
+    async fn two_account_slots_failure_busy_catchup_and_no_auto_retry() {
+        let (app, _, _, _dir, old_server) = fixture(0).await;
+        old_server.abort();
+        // Both distinct credentials are checked by this loopback-only server.
+        let attempts = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let captured = attempts.clone();
+        let router = Router::new().fallback(any(move |request: axum::extract::Request| {
+            let captured = captured.clone();
+            async move {
+                let user = request.headers()["new-api-user"]
+                    .to_str()
+                    .unwrap()
+                    .to_owned();
+                let cookie = request.headers()["cookie"].to_str().unwrap();
+                assert_eq!(
+                    cookie,
+                    if user == "7" {
+                        "session=private-upstream-cookie"
+                    } else {
+                        "session=second-checkin-cookie"
+                    }
+                );
+                if request.method() == reqwest::Method::POST {
+                    captured.lock().unwrap().push(user);
+                    Json(json!({"success":true})).into_response()
+                } else if user == "7" {
+                    (StatusCode::UNAUTHORIZED, Json(json!({"success":false}))).into_response()
+                } else {
+                    Json(json!({"success":true,"data":{"id":8}})).into_response()
+                }
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        // Move into a new App to inject the local transport, never mutate production origin.
+        let mut portfolio = app.accounts.lock().await.portfolio.clone();
+        let mut b = portfolio.accounts[0].clone();
+        b.id = crate::model::id();
+        b.upstream_user_id = "8".into();
+        b.credentials.api_user = "8".into();
+        b.credentials.cookies[0].value = "second-checkin-cookie".into();
+        b.selected_key = None;
+        let id_a = portfolio.accounts[0].id.clone();
+        let id_b = b.id.clone();
+        portfolio.accounts.push(b);
+        let upstream = Upstream::mock(format!("http://{}", listener.local_addr().unwrap()));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let config = Config {
+            state_path: app.config.state_path.clone(),
+            ..Config::default()
+        };
+        let mut app = App::new(config, portfolio, upstream, app.login.clone());
+        Arc::get_mut(&mut app).unwrap().checkin_clock = fixed;
+        app.checkin.lock().await.settings.enabled = true;
+        let nine = at("2026-10-01T09:00:00+08:00");
+        scheduler_tick(&app, nine - chrono::Duration::seconds(1)).await;
+        assert!(app.accounts.lock().await.operation.is_none());
+        scheduler_tick(&app, nine).await;
+        settled(&app).await;
+        assert!(
+            app.checkin
+                .lock()
+                .await
+                .find("7", &cycle(nine))
+                .unwrap()
+                .status
+                == Status::Failed
+        );
+        assert_eq!(
+            app.accounts
+                .lock()
+                .await
+                .operation
+                .as_ref()
+                .unwrap()
+                .account_id
+                .as_deref(),
+            Some(id_a.as_str())
+        );
+        scheduler_tick(&app, nine + chrono::Duration::minutes(29)).await;
+        assert!(attempts.lock().unwrap().is_empty());
+        {
+            let mut a = app.accounts.lock().await;
+            app::start(&mut a, "refresh", "reading_account");
+        }
+        scheduler_tick(&app, nine + chrono::Duration::minutes(30)).await;
+        assert!(app.checkin.lock().await.find("8", &cycle(nine)).is_none());
+        app.accounts.lock().await.operation = None;
+        scheduler_tick(&app, nine + chrono::Duration::minutes(31)).await;
+        settled(&app).await;
+        assert_eq!(*attempts.lock().unwrap(), vec!["8"]);
+        assert_eq!(
+            app.accounts
+                .lock()
+                .await
+                .operation
+                .as_ref()
+                .unwrap()
+                .account_id
+                .as_deref(),
+            Some(id_b.as_str())
+        );
+        scheduler_tick(&app, nine + chrono::Duration::hours(1)).await;
+        assert_eq!(*attempts.lock().unwrap(), vec!["8"]);
+        // Restart turns durable running B into unknown; A failure remains independent.
+        let mut saved = app.checkin.lock().await.clone();
+        let mut r = record();
+        r.account_user_id = "8".into();
+        saved.put_protected(r, fixed()).unwrap();
+        save(&app.config.checkin_path(), &saved).unwrap();
+        *app.checkin.lock().await = load_at(&app.config.checkin_path(), fixed()).unwrap();
+        scheduler_tick(&app, fixed()).await;
+        assert_eq!(*attempts.lock().unwrap(), vec!["8"]);
+        assert_eq!(
+            start_account(&app, &id_b, Trigger::Manual, false, fixed())
+                .await
+                .unwrap_err()
+                .1
+                .code,
+            "checkin_retry_confirmation_required"
+        );
+        // Adding an account into an already elapsed slot gets exactly one catch-up.
+        let mut c = app.accounts.lock().await.portfolio.accounts[1].clone();
+        c.id = crate::model::id();
+        c.upstream_user_id = "9".into();
+        c.credentials.api_user = "9".into();
+        // The fixture deliberately rejects ID 9 as an identity mismatch: one failed
+        // attempt still blocks automatic retry without changing any other slot.
+        app.accounts.lock().await.portfolio.accounts.push(c);
+        scheduler_tick(&app, fixed()).await;
+        settled(&app).await;
+        assert!(
+            app.checkin
+                .lock()
+                .await
+                .find("9", &cycle(fixed()))
+                .unwrap()
+                .status
+                == Status::Failed
+        );
+        scheduler_tick(&app, fixed()).await;
+        assert_eq!(*attempts.lock().unwrap(), vec!["8"]);
         app.shutdown().await;
         server.abort();
     }
@@ -548,24 +898,83 @@ fn due(now: DateTime<Utc>, time: &str) -> DateTime<Utc> {
     now.date_naive().and_hms_opt(0, 0, 0).unwrap().and_utc()
         + chrono::Duration::minutes(minutes(time).expect("validated settings"))
 }
+pub(crate) fn validate_plan(settings: &Settings, count: usize) -> Result<(), ApiError> {
+    let offset = minutes(&settings.time)
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "bad_request"))?;
+    if !(1..=1440).contains(&settings.interval_minutes) {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "bad_request"));
+    }
+    if count > 0 && offset + (count - 1) as i64 * i64::from(settings.interval_minutes) >= 1440 {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "schedule_overflow",
+        ));
+    }
+    Ok(())
+}
+fn slot(now: DateTime<Utc>, settings: &Settings, index: usize) -> DateTime<Utc> {
+    due(now, &settings.time)
+        + chrono::Duration::minutes(index as i64 * i64::from(settings.interval_minutes))
+}
 impl Saved {
     fn find(&self, user: &str, date: &str) -> Option<&Record> {
         self.history
             .iter()
             .find(|r| r.account_user_id == user && r.date == date)
     }
+    #[cfg(test)]
     fn put(&mut self, record: Record) {
+        // Keep a separate bounded history for each identity, not one shared 180-row ring.
+        let user = record.account_user_id.clone();
         self.history
             .retain(|r| r.account_user_id != record.account_user_id || r.date != record.date);
         self.history.push(record);
         self.history.sort_by(|a, b| b.date.cmp(&a.date));
-        self.history.truncate(180);
+        let mut n = 0;
+        self.history.retain(|r| {
+            if r.account_user_id != user {
+                true
+            } else {
+                n += 1;
+                n <= 180
+            }
+        });
+    }
+    fn put_protected(&mut self, record: Record, now: DateTime<Utc>) -> Result<(), SafeError> {
+        let user = record.account_user_id.clone();
+        let date = record.date.clone();
+        let previous = cycle(now - chrono::Duration::days(1));
+        let mut history = self.history.clone();
+        history.retain(|r| r.account_user_id != user || r.date != date);
+        history.push(record);
+        history.sort_by(|a, b| b.date.cmp(&a.date));
+        while history.iter().filter(|r| r.account_user_id == user).count() > 180 {
+            let index = history
+                .iter()
+                .rposition(|r| {
+                    r.account_user_id == user
+                        && r.date < previous
+                        && r.date != date
+                        && r.status != Status::Running
+                })
+                .ok_or_else(|| SafeError::new("checkin_history_full"))?;
+            history.remove(index);
+        }
+        if history.len() > 64 * 180 {
+            return Err(SafeError::new("checkin_history_full"));
+        }
+        self.history = history;
+        Ok(())
     }
     fn valid(&self) -> bool {
         let mut keys = std::collections::HashSet::new();
+        let mut counts = std::collections::HashMap::new();
         minutes(&self.settings.time).is_some()
-            && self.history.len() <= 180
+            && (1..=1440).contains(&self.settings.interval_minutes)
+            && self.history.len() <= 64 * 180
             && self.history.iter().all(|r| {
+                let count = counts.entry(&r.account_user_id).or_insert(0usize);
+                *count += 1;
                 NaiveDate::parse_from_str(&r.date, "%Y-%m-%d")
                     .is_ok_and(|d| d.to_string() == r.date)
                     && crate::model::positive_id(&r.account_user_id)
@@ -573,6 +982,7 @@ impl Saved {
                     && valid_timestamp(&r.started_at)
                     && r.finished_at.as_ref().is_none_or(|s| valid_timestamp(s))
                     && (r.status == Status::Running) == r.finished_at.is_none()
+                    && *count <= 180
             })
     }
 }
@@ -596,7 +1006,7 @@ fn load_at(path: &Path, now: DateTime<Utc>) -> Result<Saved, &'static str> {
         .and_then(|p| std::fs::symlink_metadata(p).ok())
         .ok_or("Invalid check-in directory.")?;
     if !meta.is_file()
-        || meta.len() > 256 * 1024
+        || meta.len() > 8 * 1024 * 1024
         || meta.permissions().mode() & 0o777 != 0o600
         || !parent.is_dir()
         || parent.permissions().mode() & 0o777 != 0o700
@@ -628,7 +1038,9 @@ fn load_at(path: &Path, now: DateTime<Utc>) -> Result<Saved, &'static str> {
     }
     for record in blocked {
         if saved.find(&record.account_user_id, &record.date).is_none() {
-            saved.put(record);
+            saved
+                .put_protected(record, now)
+                .map_err(|_| "Cannot safely recover check-in history.")?;
         }
     }
     if recovered {
@@ -668,10 +1080,16 @@ fn save(path: &Path, state: &Saved) -> Result<(), SafeError> {
             .mode(0o600)
             .open(&tmp)?;
         temp = Some(tmp.clone());
-        file.write_all(&serde_json::to_vec(state)?)?;
+        let bytes = serde_json::to_vec(state)?;
+        if bytes.len() > 8 * 1024 * 1024 {
+            return Err(std::io::Error::other("state too large"));
+        }
+        file.write_all(&bytes)?;
         file.sync_all()?;
+        let directory = fs::File::open(parent)?;
+        directory.sync_all()?;
         fs::rename(tmp, path)?;
-        fs::File::open(parent)?.sync_all()?;
+        let _ = directory.sync_all();
         Ok(())
     })();
     if let Some(tmp) = temp {
@@ -684,29 +1102,53 @@ async fn status(app: &App) -> Value {
     let saved = app.checkin.lock().await;
     let now = (app.checkin_clock)();
     let date = cycle(now);
-    let user = accounts
-        .active
-        .as_ref()
-        .map(|a| a.upstream_user_id.as_str());
-    let history: Vec<_> = saved
-        .history
-        .iter()
-        .filter(|r| Some(r.account_user_id.as_str()) == user)
-        .collect();
-    let today = user.and_then(|u| saved.find(u, &date));
-    let next = if saved.settings.enabled && user.is_some() {
-        Some(
-            if today.is_some() {
-                due(now + chrono::Duration::days(1), &saved.settings.time)
-            } else {
-                due(now, &saved.settings.time).max(now)
-            }
-            .to_rfc3339(),
-        )
+    let schedule: Vec<_> = accounts.portfolio.accounts.iter().enumerate().map(|(i,a)| json!({"account_id":a.id,"scheduled_at":slot(now,&saved.settings,i).to_rfc3339(),"status":saved.find(&a.upstream_user_id,&date).map(|r|serde_json::to_value(r.status).unwrap()).unwrap_or(json!("pending"))})).collect();
+    let next = if saved.settings.enabled {
+        accounts
+            .portfolio
+            .accounts
+            .iter()
+            .enumerate()
+            .map(|(i, a)| next_for(&saved, a, now, i))
+            .min()
+            .map(|n| n.to_rfc3339())
     } else {
         None
     };
-    json!({"settings":{"enabled":saved.settings.enabled,"time":saved.settings.time,"timezone":"Asia/Shanghai","reset_time":"08:00"},"cycle_date":date,"today":today,"history":history,"next_run_at":next})
+    json!({"settings":{"enabled":saved.settings.enabled,"time":saved.settings.time,"interval_minutes":saved.settings.interval_minutes,"timezone":"Asia/Shanghai","reset_time":"08:00"},"cycle_date":date,"schedule":schedule,"next_run_at":next})
+}
+fn next_for(saved: &Saved, account: &Entry, now: DateTime<Utc>, index: usize) -> DateTime<Utc> {
+    if saved.find(&account.upstream_user_id, &cycle(now)).is_some() {
+        slot(now + chrono::Duration::days(1), &saved.settings, index)
+    } else {
+        slot(now, &saved.settings, index).max(now)
+    }
+}
+pub async fn get_account_status(
+    State(app): State<Arc<App>>,
+    AccountPath(id): AccountPath<String>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    app::require_session(&app, &headers).await?;
+    let accounts = app.accounts.lock().await;
+    let account = app::entry(&accounts, &id)?;
+    let index = accounts
+        .portfolio
+        .accounts
+        .iter()
+        .position(|a| a.id == id)
+        .unwrap();
+    let saved = app.checkin.lock().await;
+    let now = (app.checkin_clock)();
+    let date = cycle(now);
+    let history: Vec<_> = saved
+        .history
+        .iter()
+        .filter(|r| r.account_user_id == account.upstream_user_id)
+        .collect();
+    Ok(Json(
+        json!({"account_id":id,"cycle_date":date,"today":saved.find(&account.upstream_user_id,&date),"history":history,"next_run_at":saved.settings.enabled.then(||next_for(&saved,account,now,index).to_rfc3339())}),
+    ))
 }
 pub async fn get_status(
     State(app): State<Arc<App>>,
@@ -718,14 +1160,19 @@ pub async fn get_status(
 pub async fn settings(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
-    input: Result<Json<Settings>, axum::extract::rejection::JsonRejection>,
+    input: Result<Json<SettingsInput>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<Value>, ApiError> {
     app::require_session(&app, &headers).await?;
     let Json(input) = input.map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "bad_request"))?;
-    if minutes(&input.time).is_none() {
-        return Err(ApiError::new(StatusCode::BAD_REQUEST, "bad_request"));
-    }
+    let input = Settings {
+        enabled: input.enabled,
+        time: input.time,
+        interval_minutes: input.interval_minutes,
+    };
     {
+        let accounts = app.accounts.lock().await;
+        app::idle(&accounts)?;
+        validate_plan(&input, accounts.portfolio.accounts.len())?;
         let mut state = app.checkin.lock().await;
         let mut updated = state.clone();
         updated.settings = input;
@@ -735,6 +1182,13 @@ pub async fn settings(
     }
     Ok(Json(status(&app).await))
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SettingsInput {
+    enabled: bool,
+    time: String,
+    interval_minutes: u16,
+}
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct RunInput {
@@ -743,43 +1197,61 @@ pub struct RunInput {
 }
 pub async fn run(
     State(app): State<Arc<App>>,
+    AccountPath(id): AccountPath<String>,
     headers: HeaderMap,
     input: Result<Json<RunInput>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Response, ApiError> {
     app::require_session(&app, &headers).await?;
     let Json(input) = input.map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "bad_request"))?;
-    start(
+    start_account(
         &app,
+        &id,
         Trigger::Manual,
         input.confirm_retry,
         (app.checkin_clock)(),
     )
     .await
 }
-async fn start(
+async fn start_account(
     app: &Arc<App>,
+    id: &str,
     trigger: Trigger,
     confirm: bool,
     now: DateTime<Utc>,
 ) -> Result<Response, ApiError> {
     let mut accounts = app.accounts.lock().await;
     app::idle(&accounts)?;
-    let active = accounts
-        .active
-        .clone()
-        .ok_or_else(|| ApiError::new(StatusCode::CONFLICT, "account_not_configured"))?;
+    let active = Arc::new(app::entry(&accounts, id)?.clone());
+    let index = accounts
+        .portfolio
+        .accounts
+        .iter()
+        .position(|a| a.id == id)
+        .unwrap();
     let mut saved = app.checkin.lock().await;
     let date = cycle(now);
     let existing = saved.find(&active.upstream_user_id, &date);
     // Never evict a newer/current tuple to make room after wall-clock rollback.
     if existing.is_none()
-        && saved.history.len() >= 180
-        && saved.history.last().is_some_and(|r| r.date >= date)
+        && saved
+            .history
+            .iter()
+            .filter(|r| r.account_user_id == active.upstream_user_id)
+            .count()
+            >= 180
+        && saved
+            .history
+            .iter()
+            .rev()
+            .find(|r| r.account_user_id == active.upstream_user_id)
+            .is_some_and(|r| r.date >= date || r.date >= cycle(now - chrono::Duration::days(1)))
     {
         return Err(ApiError::new(StatusCode::CONFLICT, "checkin_history_full"));
     }
     if matches!(trigger, Trigger::Scheduled)
-        && (!saved.settings.enabled || now < due(now, &saved.settings.time) || existing.is_some())
+        && (!saved.settings.enabled
+            || now < slot(now, &saved.settings, index)
+            || existing.is_some())
     {
         return Ok(StatusCode::NO_CONTENT.into_response());
     }
@@ -804,11 +1276,13 @@ async fn start(
         code: None,
     };
     let mut updated = saved.clone();
-    updated.put(record.clone());
+    updated
+        .put_protected(record.clone(), now)
+        .map_err(|e| ApiError(StatusCode::CONFLICT, e))?;
     save(&app.config.checkin_path(), &updated)
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     *saved = updated;
-    let response = app::start(&mut accounts, "checkin", "checking_in");
+    let response = app::start_for(&mut accounts, "checkin", "checking_in", Some(id.into()));
     let worker = app.clone();
     app.spawn_job(async move {
         execute(&worker, active, record).await;
@@ -821,9 +1295,45 @@ pub fn scheduler(app: &Arc<App>) {
         let mut interval = tokio::time::interval(Duration::from_secs(30));
         loop {
             interval.tick().await;
-            let _ = start(&worker, Trigger::Scheduled, false, (worker.checkin_clock)()).await;
+            scheduler_tick(&worker, (worker.checkin_clock)()).await;
         }
     });
+}
+async fn scheduler_tick(app: &Arc<App>, now: DateTime<Utc>) {
+    let ids: Vec<_> = app
+        .accounts
+        .lock()
+        .await
+        .portfolio
+        .accounts
+        .iter()
+        .map(|a| a.id.clone())
+        .collect();
+    for id in ids {
+        match start_account(app, &id, Trigger::Scheduled, false, now).await {
+            Ok(response) if response.status() == StatusCode::ACCEPTED => break,
+            Err(e) if e.1.code == "operation_in_progress" => break,
+            _ => {}
+        }
+    }
+}
+#[cfg(test)]
+async fn start(
+    app: &Arc<App>,
+    trigger: Trigger,
+    confirm: bool,
+    now: DateTime<Utc>,
+) -> Result<Response, ApiError> {
+    let id = app
+        .accounts
+        .lock()
+        .await
+        .portfolio
+        .accounts
+        .first()
+        .map(|a| a.id.clone())
+        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "not_found"))?;
+    start_account(app, &id, trigger, confirm, now).await
 }
 async fn request(app: &App, credentials: &Credentials, post: bool) -> Result<Value, SafeError> {
     let path = if post {
@@ -879,7 +1389,7 @@ async fn request(app: &App, credentials: &Credentials, post: bool) -> Result<Val
     }
     Ok(value)
 }
-async fn execute(app: &App, active: Arc<Active>, mut record: Record) {
+async fn execute(app: &App, active: Arc<Entry>, mut record: Record) {
     use futures_util::FutureExt;
     let mut post_started = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(app.config.helper_timeout);
@@ -899,15 +1409,21 @@ async fn execute(app: &App, active: Arc<Active>, mut record: Record) {
                 }
                 request(app, &credentials, false).await?;
                 let mut accounts = app.accounts.lock().await;
-                if accounts.active.as_ref().is_none_or(|a| {
-                    a.revision != active.revision || a.upstream_user_id != active.upstream_user_id
-                }) {
+                if accounts
+                    .portfolio
+                    .accounts
+                    .iter()
+                    .find(|a| a.id == active.id)
+                    .is_none_or(|a| {
+                        a.revision != active.revision
+                            || a.upstream_user_id != active.upstream_user_id
+                    })
+                {
                     return Err(SafeError::new("stale_revision"));
                 }
                 let mut updated = (*active).clone();
                 updated.credentials = credentials.clone();
-                crate::store::save(&app.config.state_path, &updated)?;
-                accounts.active = Some(Arc::new(updated));
+                app::replace_entry(app, &mut accounts, updated)?;
             }
             Err(e) => return Err(e),
             Ok(_) => {}
@@ -946,14 +1462,26 @@ async fn execute(app: &App, active: Arc<Active>, mut record: Record) {
         record.code = Some(Code::CycleAmbiguous);
         let mut blocked = record.clone();
         blocked.date = cycle(now);
-        saved.put(blocked);
+        // On an unsafe prune keep all dedupe tuples in memory and the durable running
+        // intent on disk; never forget a possibly completed side effect.
+        if saved.put_protected(blocked.clone(), now).is_err() {
+            saved.history.push(blocked);
+        }
     }
-    saved.put(record.clone());
+    if saved.put_protected(record.clone(), now).is_err() {
+        saved.history.push(record.clone());
+    }
     let persisted = save_result(app, &saved);
     if persisted.is_err() {
         record.status = Status::Unknown;
         record.code = Some(Code::PersistenceFailed);
-        saved.put(record.clone());
+        if let Some(r) = saved
+            .history
+            .iter_mut()
+            .find(|r| r.date == record.date && r.account_user_id == record.account_user_id)
+        {
+            *r = record.clone();
+        }
     }
     drop(saved);
     app.finish(if record.status == Status::Success {

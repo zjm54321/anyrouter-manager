@@ -623,7 +623,7 @@ mod tests {
         });
         let app = crate::app::App::new(
             config,
-            None,
+            crate::model::Portfolio::default(),
             crate::upstream::Upstream::mock("http://127.0.0.1:1".into()),
             browser,
         );
@@ -686,7 +686,7 @@ mod tests {
             .unwrap()
             .to_owned();
         let response = client
-            .post(format!("http://{address}/api/account/login"))
+            .post(format!("http://{address}/api/accounts/login"))
             .header("host", "127.0.0.1:8080")
             .header("origin", "http://localhost:5173")
             .header("cookie", cookie)

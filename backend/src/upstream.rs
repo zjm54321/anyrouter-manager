@@ -97,6 +97,7 @@ impl Upstream {
         value.get("data").cloned().ok_or_else(unexpected)
     }
 
+    #[cfg(test)]
     pub async fn balance(&self, credentials: &Credentials) -> Result<Balance, SafeError> {
         self.profile(credentials).await.map(|(balance, _)| balance)
     }

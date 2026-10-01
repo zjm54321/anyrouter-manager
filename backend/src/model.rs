@@ -130,11 +130,13 @@ pub fn full_key(value: &str) -> bool {
         && HeaderValue::from_str(&format!("Bearer {value}")).is_ok()
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct KeySummary {
     pub id: String,
     pub name: String,
     pub masked: String,
+    pub enabled: bool,
 }
 
 #[derive(Clone)]
@@ -150,6 +152,7 @@ impl ListedKey {
             id: self.id.clone(),
             name: self.name.clone(),
             masked: "••••••••".into(),
+            enabled: self.enabled,
         }
     }
 }
@@ -213,7 +216,7 @@ impl Candidate {
     pub fn dto(&self) -> serde_json::Value {
         serde_json::json!({"id": self.id, "username": self.username,
             "upstream_user_id": self.credentials.api_user, "balance": self.balance,
-            "keys": self.keys.iter().filter(|k| k.enabled).map(ListedKey::summary).collect::<Vec<_>>(),
+            "keys": self.keys.iter().map(ListedKey::summary).collect::<Vec<_>>(),
             "expires_at": self.expires_at})
     }
 }
@@ -225,4 +228,144 @@ pub struct Operation {
     pub status: &'static str,
     pub phase: &'static str,
     pub error: Option<SafeError>,
+    pub account_id: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SelectedKey {
+    pub id: String,
+    pub name: String,
+    pub key: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Entry {
+    pub id: String,
+    pub revision: String,
+    pub username: String,
+    pub upstream_user_id: String,
+    pub balance: Balance,
+    pub credentials: Credentials,
+    pub keys: Vec<KeySummary>,
+    pub selected_key: Option<SelectedKey>,
+    pub added_at: String,
+}
+
+impl Entry {
+    pub fn from_active(a: Active) -> Self {
+        Self {
+            id: id(),
+            revision: a.revision,
+            username: a.username,
+            upstream_user_id: a.upstream_user_id,
+            balance: a.balance,
+            credentials: a.credentials,
+            keys: vec![KeySummary {
+                id: a.key_id.clone(),
+                name: a.key_name.clone(),
+                masked: "••••••••".into(),
+                enabled: true,
+            }],
+            selected_key: Some(SelectedKey {
+                id: a.key_id,
+                name: a.key_name,
+                key: a.key,
+            }),
+            added_at: a.activated_at,
+        }
+    }
+    pub fn validate(&self) -> bool {
+        let mut ids = std::collections::HashSet::new();
+        uuid::Uuid::parse_str(&self.id).is_ok()
+            && !self.revision.is_empty()
+            && self.revision.len() <= 128
+            && !self.revision.chars().any(char::is_control)
+            && positive_id(&self.upstream_user_id)
+            && self.upstream_user_id == self.credentials.api_user
+            && self.credentials.validate_structure()
+            && !self.username.is_empty()
+            && self.username.len() <= 512
+            && !self.username.chars().any(char::is_control)
+            && DateTime::parse_from_rfc3339(&self.added_at).is_ok()
+            && DateTime::parse_from_rfc3339(&self.balance.fetched_at).is_ok()
+            && decimal(&self.balance.quota_raw)
+            && decimal(&self.balance.used_quota_raw)
+            && self.keys.len() <= 2000
+            && self.keys.iter().all(|k| {
+                positive_id(&k.id)
+                    && k.name.len() <= 512
+                    && k.masked == "••••••••"
+                    && ids.insert(&k.id)
+            })
+            && self
+                .selected_key
+                .as_ref()
+                .is_none_or(|k| positive_id(&k.id) && k.name.len() <= 512 && full_key(&k.key))
+    }
+    pub fn snapshot(&self) -> Option<Active> {
+        let key = self.selected_key.as_ref()?;
+        Some(Active {
+            revision: self.revision.clone(),
+            username: self.username.clone(),
+            upstream_user_id: self.upstream_user_id.clone(),
+            balance: self.balance.clone(),
+            key_id: key.id.clone(),
+            key_name: key.name.clone(),
+            key: key.key.clone(),
+            credentials: self.credentials.clone(),
+            activated_at: self.added_at.clone(),
+        })
+    }
+    pub fn dto(&self) -> serde_json::Value {
+        serde_json::json!({"id":self.id,"revision":self.revision,"username":self.username,"upstream_user_id":self.upstream_user_id,"balance":self.balance,"keys":self.keys,"selected_key":self.selected_key.as_ref().map(|k| serde_json::json!({"id":k.id,"name":k.name,"masked":"••••••••","enabled":self.keys.iter().find(|m| m.id==k.id).is_some_and(|m|m.enabled)})),"added_at":self.added_at})
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Portfolio {
+    pub version: u32,
+    pub accounts: Vec<Entry>,
+    pub route_account_id: Option<String>,
+}
+impl Default for Portfolio {
+    fn default() -> Self {
+        Self {
+            version: 2,
+            accounts: Vec::new(),
+            route_account_id: None,
+        }
+    }
+}
+impl Portfolio {
+    pub fn from_active(active: Active) -> Self {
+        let entry = Entry::from_active(active);
+        Self {
+            version: 2,
+            route_account_id: Some(entry.id.clone()),
+            accounts: vec![entry],
+        }
+    }
+    pub fn validate(&self) -> bool {
+        let mut ids = std::collections::HashSet::new();
+        let mut users = std::collections::HashSet::new();
+        self.version == 2
+            && self.accounts.len() <= 64
+            && self
+                .accounts
+                .iter()
+                .all(|a| a.validate() && ids.insert(&a.id) && users.insert(&a.upstream_user_id))
+            && self.route_account_id.as_ref().is_none_or(|id| {
+                self.accounts
+                    .iter()
+                    .any(|a| &a.id == id && a.selected_key.is_some())
+            })
+    }
+    pub fn route(&self) -> Option<&Entry> {
+        self.route_account_id
+            .as_ref()
+            .and_then(|id| self.accounts.iter().find(|a| &a.id == id))
+    }
 }

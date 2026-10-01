@@ -4,8 +4,10 @@ root_key = "REPLACE_WITH_A_RANDOM_ROOT_KEY_AT_LEAST_32_BYTES"
 bind = "127.0.0.1:8080"
 state_path = "data/account.json"
 # Optional: defaults to checkin.json alongside state_path (same private volume).
-# Independent 0600 JSON, at most 180 summaries across all accounts; schedule defaults off.
+# Independent 0600 JSON, at most 180 summaries per account; schedule defaults off.
 # checkin_state_path = "data/checkin.json"
+# Reserved independent state path; must differ from config/account/check-in paths.
+# request_log_path = "data/request_logs.json"
 frontend_dir = "frontend/dist"
 browser_helper_dir = "tools/browser-helper"
 # Opt-in container listener. Remote web origins require HTTPS and secure cookies.

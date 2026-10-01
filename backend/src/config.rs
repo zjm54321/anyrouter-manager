@@ -14,6 +14,7 @@ pub struct Config {
     pub bind: SocketAddr,
     pub state_path: PathBuf,
     pub checkin_state_path: Option<PathBuf>,
+    pub request_log_path: Option<PathBuf>,
     pub frontend_dir: PathBuf,
     pub browser_helper_dir: PathBuf,
     pub browser_helper_executable: Option<PathBuf>,
@@ -31,6 +32,7 @@ impl Default for Config {
             bind: "127.0.0.1:8080".parse().expect("literal socket address"),
             state_path: "data/account.json".into(),
             checkin_state_path: None,
+            request_log_path: None,
             frontend_dir: "frontend/dist".into(),
             browser_helper_dir: "tools/browser-helper".into(),
             browser_helper_executable: None,
@@ -51,6 +53,11 @@ impl Default for Config {
 }
 
 impl Config {
+    pub fn request_log_path(&self) -> PathBuf {
+        self.request_log_path
+            .clone()
+            .unwrap_or_else(|| self.state_path.with_file_name("request_logs.json"))
+    }
     pub fn checkin_path(&self) -> PathBuf {
         self.checkin_state_path
             .clone()
@@ -60,12 +67,28 @@ impl Config {
         let text = std::fs::read_to_string(path).map_err(|_| "Cannot read configuration file.")?;
         let config: Self = toml::from_str(&text).map_err(|_| "Invalid configuration file.")?;
         config.validate()?;
+        let configuration = resolved_destination(path)?;
+        for state in [
+            config.state_path.clone(),
+            config.checkin_path(),
+            config.request_log_path(),
+        ] {
+            if resolved_destination(&state)? == configuration {
+                return Err("State must not overwrite configuration.");
+            }
+        }
         Ok(config)
     }
 
     pub fn validate(&self) -> Result<(), &'static str> {
         if resolved_destination(&self.checkin_path())? == resolved_destination(&self.state_path)? {
             return Err("Check-in state must be separate from account state.");
+        }
+        let logs = resolved_destination(&self.request_log_path())?;
+        if logs == resolved_destination(&self.state_path)?
+            || logs == resolved_destination(&self.checkin_path())?
+        {
+            return Err("Request logs must be separate from account and check-in state.");
         }
         let lower = self.root_key.to_ascii_lowercase();
         if self.root_key.len() < 32
@@ -214,7 +237,31 @@ mod tests {
         assert!(config.validate().is_err());
         config.checkin_state_path = Some(dir.path().join("missing/checkin.json"));
         config.validate().unwrap();
+        for alias in [
+            destination.clone(),
+            dir.path().join("missing/child/../account.json"),
+            dir.path().join("alias/missing/account.json"),
+            dir.path().join("deep/../missing/checkin.json"),
+        ] {
+            config.request_log_path = Some(alias);
+            assert!(config.validate().is_err());
+        }
+        config.request_log_path = Some(dir.path().join("missing/request_logs.json"));
+        config.validate().unwrap();
         assert!(!destination.exists());
+    }
+    #[test]
+    fn configuration_cannot_alias_any_state_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        for field in ["state_path", "checkin_state_path", "request_log_path"] {
+            let text = format!(
+                "root_key='Test-Only-Root-91c7ce8aa-2345-SufficientEntropy'\n{field}={:?}\n",
+                path.to_str().unwrap()
+            );
+            std::fs::write(&path, text).unwrap();
+            assert!(Config::load(&path).is_err());
+        }
     }
     #[test]
     fn login_diagnostics_is_explicit_and_backward_compatible() {

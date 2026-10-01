@@ -7,6 +7,8 @@ mod gateway;
 mod helper;
 mod hybrid;
 mod model;
+mod model_filter;
+mod request_log;
 mod store;
 mod supervisor;
 mod upstream;
@@ -54,8 +56,20 @@ async fn run() -> Result<(), &'static str> {
     let upstream =
         upstream::Upstream::production().map_err(|_| "Cannot initialize upstream transport.")?;
     let bind = config.bind;
-    let app = app::App::new(config, active, upstream, login);
+    let logs = request_log::LogSink::open(config.request_log_path())
+        .await
+        .map_err(|_| "Cannot initialize private request log.")?;
+    logs.flush()
+        .await
+        .map_err(|_| "Cannot initialize private request log.")?;
+    let app = app::App::new_with_logs(config, active, upstream, login, Some(logs));
     *app.checkin.lock().await = checkin::load(&app.config.checkin_path())?;
+    {
+        let accounts = app.accounts.lock().await;
+        let checkin = app.checkin.lock().await;
+        checkin::validate_plan(&checkin.settings, accounts.portfolio.accounts.len())
+            .map_err(|_| "Saved schedule overflows the check-in cycle.")?;
+    }
     app.isolation_ready.store(
         if app.config.container_mode {
             supervisor::available().await
@@ -80,10 +94,13 @@ async fn serve_runtime(
     let server = axum::serve(listener, app::router(app.clone())).with_graceful_shutdown(async {
         let _ = rx.await;
     });
-    let server = std::future::IntoFuture::into_future(server);
-    tokio::pin!(server);
+    let mut server = Box::pin(std::future::IntoFuture::into_future(server));
     tokio::select! {
-        result = &mut server => return result.map_err(|_| "Local server failed."),
+        result = &mut server => {
+            app.shutdown().await;
+            app.shutdown_logs().await;
+            return result.map_err(|_| "Local server failed.");
+        },
         _ = termination() => {}
     }
     // Stop new jobs before signaling HTTP drain, then reap cancelled helpers.
@@ -96,6 +113,8 @@ async fn serve_runtime(
         result
     })
     .await;
+    drop(server);
+    app.shutdown_logs().await;
     Ok(())
 }
 
