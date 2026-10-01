@@ -8,17 +8,18 @@
 
 | 配置项 | 规范要求 |
 | :--- | :--- |
-| **系统架构** | 单账号模式；Rust 后端（提供管理 API 与 `/v1` 网关）+ React Vite 前端（TypeScript）。**不提供多账号池或自动签到功能**。 |
+| **系统架构** | 单账号模式；Rust 后端（提供管理 API 与 `/v1` 网关）+ React Vite 前端（TypeScript）。不提供多账号池；定时与手动签到管理功能已接入前后端（详见 `docs/checkin-contract.md`）。 |
 | **固定上游** | 固定为 `https://anyrouter.top`。禁止通过请求头、查询参数或路径覆盖上游地址（防 SSRF）。 |
 | **系统凭证** | 由本地 `config.toml` 配置 `root_key`（至少 32 字节高熵随机 ASCII），统一作为本地管理鉴权 (`/api/admin/*`) 与网关访问鉴权 (`/v1/*`) 的凭证。 |
-| **状态持久化与安全边界** | 本地 `data/account.json` 状态文件采用私有权限 `0600` 与原子写。保存会话 Cookie、账号信息及选中的 API Key。<br>• **注意：这是敏感明文存储，不是加密保险箱（0600 plaintext, not encrypted vault）**。<br>• 用户名与密码仅在登录时驻留短期内存供 helper 调用，**严禁落盘，但未做底层安全内存擦除（not secure-wipe）**。<br>• 系统无法承诺 100% 绕过未来上游变更后的 WAF、ESA 或人机挑战。 |
-| **服务端口与部署** | 后端默认监听 `127.0.0.1:8080`。<br>• **开发环境**：Vite 监听 `127.0.0.1:5173`，已配置 dev proxy 将 `/api` 与 `/v1` 同源代理至 `127.0.0.1:8080`。<br>• **生产环境**：Rust 后端直接托管 `frontend/dist` 静态资源；对于未匹配的静态资源请求，返回 `404` 状态码及 SPA HTML 页面体（实现行为，不承诺全静态路径 200）。 |
+| **状态持久化与安全边界** | 本地状态文件采用私有权限 `0600`（父目录 `0700`）与原子写，包含账号状态 `data/account.json`（会话 Cookie、账号信息与选中的 API Key）与签到状态 `data/checkin.json`（周期记录与调度设置）。<br>• **注意：这是敏感明文存储，不是加密保险箱（0600 plaintext, not encrypted vault）**，不存储用户密码。<br>• 用户名与密码仅在登录时驻留短期内存供调用，**严禁落盘，但未做底层安全内存擦除（not secure-wipe）**。<br>• 系统无法承诺必然绕过未来上游变更后的 WAF、ESA 或人机挑战。 |
+| **服务端口与部署** | 后端默认监听 `127.0.0.1:8080`。<br>• **运行时模式配置**：支持 `container_mode = false`（默认 false，显式设为 true 时方可监听非回环地址并启用 supervisor 监督模式）；`cookie_secure = false`（默认 false，要求远程 HTTPS 反向代理部署时启用以打上 Secure 标记）。<br>• **开发环境**：Vite 监听 `127.0.0.1:5173`，已配置 dev proxy 将 `/api` 与 `/v1` 同源代理至 `127.0.0.1:8080`。<br>• **生产环境**：Rust 后端直接托管 `frontend/dist` 静态资源；对于未匹配的静态资源请求，返回 `404` 状态码及 SPA HTML 页面体（实现行为，不承诺全静态路径 200）。 |
 | **管理会话机制** | 使用 `HttpOnly; SameSite=Strict; Path=/api/` Cookie，有效期 8 小时。前端**禁止**将会话凭据放入 `localStorage`、`sessionStorage` 等客户端持久存储。 |
 | **安全请求校验** | 后端严格校验所有管理请求的 `Origin` 与 `Host` 头，防止跨站或劫持请求。 |
 | **缓存策略** | 所有 `/api/*` 管理接口响应头均强制下发 `Cache-Control: no-store`，禁止任何中间代理与浏览器缓存。 |
 | **Cookie 隔离与过期行为** | 来自上游 AnyRouter 的所有 Cookie 仅保存在后端受控状态中，严禁下发给前端或客户端。<br>• **过期加载行为**：若上游 Session Cookie 过期，已激活的 API Key 仍可继续支撑 `/v1` 网关代理请求；仅在触发 `refresh` 时向管理端报错 `upstream_session_expired`。 |
 | **数据格式标准** | • 所有实体 ID 必须为字符串 (`string`)。<br>• 时间戳统一使用 ISO 8601 UTC 格式（如 `2026-09-30T12:00:00Z`）。<br>• 额度字段 `quota_raw` 与 `used_quota_raw` 为十进制字符串（如 `"1000000"`），禁止后端或协议层做美元换算。 |
-| **Browser Helper 执行** | 生产环境通过 Linux namespace 与 `PDEATHSIG` 调用 helper 隔离进程：<br>`unshare --user --map-current-user --pid --fork --kill-child=KILL --mount-proc -- uv run --offline --frozen --no-sync python -B -m browser_helper`<br>防止 Chromium Crashpad 逃逸 PGID；若在未包含修补浏览器的基础 shell 启动，登录接口返回 `browser_unavailable`。 |
+| **优雅停机与任务管理** | 后端原生捕获 `SIGTERM` 与 `SIGINT` 信号；收到信号后停止接收新任务，在 10 秒内清理后台跟踪任务，15 秒内排空存量 HTTP 请求后优雅退出。 |
+| **Browser Helper 与混合登录** | 采用混合登录架构（HTTP-First）：优先直接发起 HTTP POST 登录；仅在明确收到已知 WAF 挑战 HTML 时单次回退启动 Browser Helper（遇 5xx/超时/未知 HTML 不回退）。受全局单一浏览器信号量保护（从 spawn 直至进程完全确认回收，含中断与取消）。本地非容器环境通过 Linux namespace 与 `PDEATHSIG` 调用 helper 隔离进程；`container_mode = true` 下采用 Rust subreaper 监督进程（supervisor）模式管理 helper 进程树，配合容器 PID namespace 与 `tini`，无需 `SYS_ADMIN` 或 `unconfined`，禁止 `host PID`。可选配置 `browser_helper_executable` 指定 Python 解释器绝对路径。若在基础 shell 或缺少修补浏览器环境下启动，登录接口返回 `browser_unavailable`。 |
 
 ---
 
@@ -77,7 +78,7 @@ export interface SelectedKeySummary {
 
 export interface BackgroundOperation {
   id: string; // operation_id
-  kind: "login" | "activate" | "refresh";
+  kind: "login" | "activate" | "refresh" | "checkin";
   status: "running" | "succeeded" | "failed";
   phase:
     | "authenticating"
@@ -85,6 +86,7 @@ export interface BackgroundOperation {
     | "listing_keys"
     | "reading_key"
     | "committing"
+    | "checking_in"
     | "done";
   error: OperationError | null;
 }
@@ -155,7 +157,7 @@ export interface OperationError {
 
 ---
 
-## 4. 管理 API 接口契约 (7 Routes)
+## 4. 管理 API 接口契约 (10 Routes)
 
 基础路径统一为 `/api`。
 
@@ -192,10 +194,15 @@ export interface OperationError {
   ```
 - **处理逻辑**：
   1. 校验当前是否已有 operation，若有则同步返回 `409 Conflict` (`operation_in_progress`)。
-  2. 启动异步 CloakBrowser helper（在 namespace 隔离容器内）尝试登录 AnyRouter。
-  3. 成功后请求 `/api/user/self` 校验身份，并分页获取 token 列表生成 `KeySummary[]`。
-  4. 结果暂存为内存中的 `candidate` 对象（TTL 15 分钟），**绝对不直接替换 active**。
-  5. 密码仅在内存中供本次调用使用，随后立即丢弃，**严禁落盘**。
+  2. 采用混合登录流程（Hybrid Login）：
+     - a. 优先以独立的空标准 CookieStore 直接向固定地址 `POST /api/user/login` 发起 HTTP 请求。
+     - b. 若上游直接返回有效 JSON，完成认证并直接复用验证得到的 self/id、balance 和 username，无需重复向上游发起 GET 请求。
+     - c. 仅在明确收到已知 WAF 挑战 HTML 页面时，回退单次拉起 Browser Helper 尝试加载防护页并登录（持有单一浏览器全局信号量，直至子进程完全确认回收）。
+     - d. 若直接 HTTP 请求返回 JSON 业务错误、超时、5xx 服务端错误或未知 HTML/3xx 响应，坚决不启动浏览器，直接报告对应错误。
+     - e. 全局统一登录超时覆盖认证、self 校验与 token 列表获取全流程，流程取消或重试不重置截止时间。
+  3. 获取 token 列表生成 `KeySummary[]`（共享网关 HTTP 客户端无 cookie jar）。
+  4. 结果暂存为内存中的 `candidate` 对象（TTL 15 分钟），不直接替换 active。
+  5. 密码仅在内存中供本次调用使用，随后立即丢弃，**严禁落盘，但未做底层安全内存擦除（not secure-wipe）**。
 - **成功响应**：`202 Accepted`
   ```json
   {
@@ -265,6 +272,35 @@ export interface OperationError {
     "operation_id": "op-refresh-uuid"
   }
   ```
+
+### 4.8 获取签到状态与历史
+- **路径**：`GET /api/checkin`
+- **鉴权**：管理 Session Cookie 鉴权，强制校验 `Origin` / `Host`，响应头包含 `Cache-Control: no-store`
+- **请求体**：无
+- **成功响应**：`200 OK`，返回 `CheckinFullStatus` JSON 对象（包含调度配置、服务端计算的 `cycle_date`、`today` 记录、按当前账号过滤的历史摘要 `history` 及 `next_run_at`；详见 `docs/checkin-contract.md`）。
+
+### 4.9 更新定时签到配置
+- **路径**：`PUT /api/checkin/settings`
+- **鉴权**：管理 Session Cookie 鉴权，强制校验 `Origin` / `Host`，响应头包含 `Cache-Control: no-store`
+- **请求体**：
+  ```json
+  {
+    "enabled": true,
+    "time": "09:30"
+  }
+  ```
+- **处理规范**：`time` 必须严格满足 24 小时制 `HH:MM`；成功返回 `200 OK` 及更新后的完整 `CheckinFullStatus`。
+
+### 4.10 手动触发签到 (异步任务)
+- **路径**：`POST /api/checkin/run`
+- **鉴权**：管理 Session Cookie 鉴权，强制校验 `Origin` / `Host`，响应头包含 `Cache-Control: no-store`
+- **请求体**：
+  ```json
+  {
+    "confirm_retry": false
+  }
+  ```
+- **处理规范**：若当前账号在当前周期已存在 `success` 或 `already_done`，直接返回 `200 OK` (`{"already_recorded": true}`)；未确认且未传 `confirm_retry: true` 时返回 `409` (`checkin_retry_confirmation_required`)；校验通过返回 `202 Accepted` (`{"operation_id": "..."}`)，先原子落盘 `running` 意图再发起轻量 HTTP 请求。
 
 ---
 
