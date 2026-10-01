@@ -1,0 +1,13 @@
+# Documentation only: this placeholder is deliberately rejected by the backend.
+# Generate a real root_key privately; never commit, bake, or pass it via argv/env.
+root_key = "REPLACE_WITH_A_PRIVATE_RANDOM_ROOT_KEY"
+container_mode = true
+cookie_secure = false
+bind = "0.0.0.0:8080"
+state_path = "/data/private/account.json"
+frontend_dir = "/app/frontend/dist"
+browser_helper_dir = "/app/tools/browser-helper"
+browser_helper_executable = "/app/tools/browser-helper/.venv/bin/python"
+helper_timeout = 90
+login_diagnostics = false
+allowed_origin = ["http://localhost:8080", "http://127.0.0.1:8080"]
