@@ -1,6 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ApiError, failureText, request } from "./api";
-import type { AccountState } from "./api";
+import {
+  ApiError,
+  failureText,
+  fetchCheckin,
+  request,
+  runCheckin,
+  updateCheckinSettings,
+} from "./api";
+import type { AccountState, CheckinFullStatus } from "./api";
 
 const empty: AccountState = { active: null, candidate: null, operation: null };
 
@@ -11,9 +18,19 @@ export function useManager() {
   const [sending, setSending] = useState(false);
   const [loadError, setLoadError] = useState(false);
   const [candidateExpired, setCandidateExpired] = useState(false);
+
+  // Checkin state
+  const [checkin, setCheckin] = useState<CheckinFullStatus | null>(null);
+  const [checkinError, setCheckinError] = useState("");
+  const [checkinRunError, setCheckinRunError] = useState("");
+  const [checkinSaving, setCheckinSaving] = useState(false);
+
   const generation = useRef(0);
   const loadSequence = useRef(0);
+  const checkinSequence = useRef(0);
   const controllers = useRef(new Set<AbortController>());
+  const sessionRef = useRef<"loading" | "locked" | "open">("loading");
+  sessionRef.current = session;
 
   const abortAll = useCallback(() => {
     generation.current++;
@@ -30,7 +47,12 @@ export function useManager() {
   const lock = useCallback(() => {
     abortAll();
     setSession("locked");
+    sessionRef.current = "locked";
     setState(empty);
+    setCheckin(null);
+    setCheckinError("");
+    setCheckinRunError("");
+    setCheckinSaving(false);
     setSending(false);
     setLoadError(false);
     setCandidateExpired(false);
@@ -45,6 +67,7 @@ export function useManager() {
       if (epoch !== generation.current || sequence !== loadSequence.current) return;
       setState(data);
       setSession("open");
+      sessionRef.current = "open";
       setLoadError(false);
       setCandidateExpired(false);
       setNotice("");
@@ -62,16 +85,97 @@ export function useManager() {
     }
   }, [controller, lock]);
 
+  const loadCheckin = useCallback(async () => {
+    if (sessionRef.current !== "open") return;
+    const epoch = generation.current;
+    const sequence = ++checkinSequence.current;
+    const task = controller();
+    try {
+      const data = await fetchCheckin(task.signal);
+      if (epoch !== generation.current || sequence !== checkinSequence.current) return;
+      setCheckin(data);
+      setCheckinError("");
+    } catch (error) {
+      if (epoch !== generation.current || task.signal.aborted || sequence !== checkinSequence.current) return;
+      if (error instanceof ApiError && error.status === 401) {
+        lock();
+        setNotice("请输入本地 root 密钥以建立管理会话");
+      } else {
+        setCheckinError(failureText(error));
+      }
+    } finally {
+      controllers.current.delete(task);
+    }
+  }, [controller, lock]);
+
+  // Initial account load
   useEffect(() => {
     void load();
     return abortAll;
   }, [abortAll, load]);
 
+  // Poll account while any operation is running
   useEffect(() => {
     if (session !== "open" || state.operation?.status !== "running" || loadError) return;
     const timer = window.setTimeout(() => void load(), 1000);
     return () => window.clearTimeout(timer);
   }, [session, state, loadError, load]);
+
+  // Trigger checkin fetch on session open or active account change
+  useEffect(() => {
+    if (session !== "open") return;
+    void loadCheckin();
+  }, [session, state.active?.revision, loadCheckin]);
+
+  // Refresh checkin when an operation finishes running
+  const prevOpRunning = useRef(false);
+  useEffect(() => {
+    const isRunning = state.operation?.status === "running";
+    if (prevOpRunning.current && !isRunning && session === "open") {
+      void loadCheckin();
+    }
+    prevOpRunning.current = isRunning;
+  }, [state.operation?.status, session, loadCheckin]);
+
+  // Refresh checkin when tab becomes visible
+  useEffect(() => {
+    if (session !== "open") return;
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") {
+        void loadCheckin();
+      }
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => document.removeEventListener("visibilitychange", onVisibility);
+  }, [session, loadCheckin]);
+
+  // Bounded timer for next scheduled run or 08:00 CST boundary
+  useEffect(() => {
+    if (session !== "open") return;
+    const now = Date.now();
+    let delay: number | null = null;
+
+    if (checkin?.next_run_at) {
+      const nextRunTime = new Date(checkin.next_run_at).getTime();
+      const diff = nextRunTime - now;
+      if (diff > 0 && diff <= 86400000) {
+        delay = diff + 1000;
+      }
+    }
+
+    const nowDate = new Date(now);
+    const nextUtcMidnight = new Date(Date.UTC(nowDate.getUTCFullYear(), nowDate.getUTCMonth(), nowDate.getUTCDate() + 1, 0, 0, 1));
+    const diffTo08 = nextUtcMidnight.getTime() - now;
+    if (diffTo08 > 0 && diffTo08 <= 86400000) {
+      delay = delay === null ? diffTo08 : Math.min(delay, diffTo08);
+    }
+
+    if (delay === null) return;
+    const timer = window.setTimeout(() => {
+      void loadCheckin();
+    }, delay);
+    return () => window.clearTimeout(timer);
+  }, [session, checkin?.next_run_at, loadCheckin]);
 
   async function unlock(root: string) {
     const epoch = generation.current;
@@ -110,15 +214,76 @@ export function useManager() {
       body = undefined;
       await pending;
       if (epoch !== generation.current) return;
-      // Accepted jobs need an immediate snapshot even if the previous operation was null.
       await load();
     } catch (error) {
       if (epoch !== generation.current || task.signal.aborted) return;
       if (error instanceof ApiError && error.detail.code === "candidate_expired") setCandidateExpired(true);
-      // Only GET /account 401 locks the UI. POST auth failures are inline and retryable.
       setNotice(error instanceof ApiError && error.status === 401
         ? "管理请求未通过鉴权，请重试或退出后重新建立管理会话"
         : failureText(error));
+    } finally {
+      controllers.current.delete(task);
+      if (epoch === generation.current) setSending(false);
+    }
+  }
+
+  async function saveCheckinSettings(settings: { enabled: boolean; time: string }) {
+    const epoch = generation.current;
+    const task = controller();
+    setCheckinSaving(true);
+    setCheckinRunError("");
+    try {
+      const data = await updateCheckinSettings(settings, task.signal);
+      if (epoch !== generation.current) return;
+      setCheckin(data);
+      setCheckinError("");
+    } catch (error) {
+      if (epoch !== generation.current || task.signal.aborted) return;
+      if (error instanceof ApiError && error.status === 401) {
+        lock();
+        setNotice("请输入本地 root 密钥以建立管理会话");
+      } else {
+        setCheckinRunError(failureText(error));
+        throw error;
+      }
+    } finally {
+      controllers.current.delete(task);
+      if (epoch === generation.current) setCheckinSaving(false);
+    }
+  }
+
+  async function runCheckinAction(options: { confirmRetry: boolean }) {
+    const epoch = generation.current;
+    const task = controller();
+    setSending(true);
+    setCheckinRunError("");
+    try {
+      const res = await runCheckin(options.confirmRetry, task.signal);
+      if (epoch !== generation.current) return;
+      if (res.already_recorded) {
+        await loadCheckin();
+      } else {
+        await load();
+        await loadCheckin();
+      }
+    } catch (error) {
+      if (epoch !== generation.current || task.signal.aborted) return;
+      if (error instanceof ApiError) {
+        if (error.status === 401) {
+          lock();
+          setNotice("请输入本地 root 密钥以建立管理会话");
+          return;
+        }
+        if (error.detail.code === "operation_in_progress") {
+          await load();
+          return;
+        }
+        if (error.detail.code === "checkin_retry_confirmation_required") {
+          setCheckinRunError("当前周期签到结果处于未确认状态，重试可能导致重复提交，请确认后重试");
+          return;
+        }
+      }
+      setCheckinRunError(failureText(error));
     } finally {
       controllers.current.delete(task);
       if (epoch === generation.current) setSending(false);
@@ -147,5 +312,7 @@ export function useManager() {
   return {
     session, state, notice, sending, loadError, candidateExpired, load, unlock, perform, logout,
     busy: sending || state.operation?.status === "running",
+    checkin, checkinError, checkinRunError, checkinSaving,
+    loadCheckin, saveCheckinSettings, runCheckinAction,
   };
 }

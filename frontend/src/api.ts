@@ -34,7 +34,7 @@ export type ErrorCode =
   | "invalid_credentials" | "upstream_challenge" | "upstream_session_expired"
   | "upstream_unavailable" | "upstream_unexpected_response" | "key_material_unavailable"
   | "persistence_failed" | "operation_in_progress" | "account_not_configured"
-  | "stale_revision" | "candidate_expired";
+  | "stale_revision" | "candidate_expired" | "checkin_retry_confirmation_required";
 
 export interface OperationError {
   code: ErrorCode;
@@ -43,9 +43,9 @@ export interface OperationError {
 
 export interface BackgroundOperation {
   id: string;
-  kind: "login" | "activate" | "refresh";
+  kind: "login" | "activate" | "refresh" | "checkin";
   status: "running" | "succeeded" | "failed";
-  phase: "authenticating" | "reading_account" | "listing_keys" | "reading_key" | "committing" | "done";
+  phase: "authenticating" | "reading_account" | "listing_keys" | "reading_key" | "committing" | "checking_in" | "done";
   error: OperationError | null;
 }
 
@@ -61,18 +61,49 @@ export interface RevealedKey {
   key: string;
 }
 
+export interface CheckinSettings {
+  enabled: boolean;
+  time: string;
+  timezone: "Asia/Shanghai";
+  reset_time: "08:00";
+}
+
+export type CheckinTrigger = "manual" | "scheduled";
+export type CheckinStatus = "running" | "success" | "already_done" | "failed" | "unknown";
+export type CheckinCode = string | null;
+
+export interface CheckinRecord {
+  date: string;
+  account_user_id: string;
+  trigger: CheckinTrigger;
+  status: CheckinStatus;
+  started_at: string;
+  finished_at: string | null;
+  code: CheckinCode;
+}
+
+export interface CheckinFullStatus {
+  settings: CheckinSettings;
+  cycle_date: string;
+  today: CheckinRecord | null;
+  history: CheckinRecord[];
+  next_run_at: string | null;
+}
+
 export const phases: Record<BackgroundOperation["phase"], string> = {
   authenticating: "正在登录",
   reading_account: "正在读取余额",
   listing_keys: "正在读取已有密钥",
   reading_key: "正在获取所选密钥",
   committing: "正在保存账号",
+  checking_in: "正在签到",
   done: "已完成",
 };
 
 export function errorText(error: OperationError): string {
   if (error.code === "upstream_challenge") return "上游仍要求验证，暂时无法完成登录";
   if (error.code === "candidate_expired") return "候选账号已过期，请重新登录";
+  if (error.code === "checkin_retry_confirmation_required") return "当前周期签到结果处于未确认状态，重试可能导致重复提交，请确认后重试";
   return error.message || "操作未完成，请重试";
 }
 
@@ -94,6 +125,34 @@ export async function request<T>(path: string, init: RequestInit): Promise<T> {
   }
   if (response.status === 204) return undefined as T;
   return response.json() as Promise<T>;
+}
+
+export async function fetchCheckin(signal?: AbortSignal): Promise<CheckinFullStatus> {
+  return request<CheckinFullStatus>("/api/checkin", { signal });
+}
+
+export async function updateCheckinSettings(
+  settings: { enabled: boolean; time: string },
+  signal?: AbortSignal
+): Promise<CheckinFullStatus> {
+  return request<CheckinFullStatus>("/api/checkin/settings", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(settings),
+    signal,
+  });
+}
+
+export async function runCheckin(
+  confirm_retry = false,
+  signal?: AbortSignal
+): Promise<{ operation_id?: string; already_recorded?: boolean }> {
+  return request<{ operation_id?: string; already_recorded?: boolean }>("/api/checkin/run", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ confirm_retry }),
+    signal,
+  });
 }
 
 export function failureText(error: unknown): string {

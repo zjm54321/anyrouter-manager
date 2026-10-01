@@ -22,6 +22,14 @@ const deferred = () => {
   const promise = new Promise<Response>(done => { resolve = done; });
   return { promise, resolve };
 };
+const defaultCheckin = {
+  settings: { enabled: false, time: "09:00", timezone: "Asia/Shanghai" as const, reset_time: "08:00" as const },
+  cycle_date: "2026-10-01",
+  today: null,
+  history: [],
+  next_run_at: null,
+};
+
 let fetchMock: ReturnType<typeof vi.fn<typeof fetch>>;
 
 beforeEach(() => {
@@ -31,17 +39,19 @@ beforeEach(() => {
 });
 afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
 
-async function open(state = snapshot()) {
+async function open(state = snapshot(), checkin = defaultCheckin) {
   fetchMock.mockResolvedValueOnce(json(state));
+  fetchMock.mockResolvedValueOnce(json(checkin));
   render(<App />);
   await screen.findByRole("heading", { name: "当前账号" });
+  await screen.findByRole("heading", { name: "每日自动签到" });
 }
 async function openReveal() {
   await open();
   const button = screen.getByRole("button", { name: "查看密钥" });
   button.focus();
   fireEvent.click(button);
-  fireEvent.change(screen.getByLabelText("本地 root 密钥"), { target: { value: "local-root" } });
+  fireEvent.change(await screen.findByLabelText("本地 root 密钥"), { target: { value: "local-root" } });
 }
 function dispatchReveal() {
   fireEvent.click(screen.getByRole("button", { name: "验证并显示" }));
@@ -78,7 +88,7 @@ describe("管理员会话与操作", () => {
     fetchMock.mockResolvedValueOnce(json(snapshot({ candidate })));
     fireEvent.click(screen.getByRole("button", { name: "登录并读取已有密钥" }));
     expect(password).toHaveValue("");
-    expect(JSON.parse(fetchMock.mock.calls[1][1]?.body as string)).toEqual({ username: "next-user", password: "once-only" });
+    expect(JSON.parse(fetchMock.mock.calls[2][1]?.body as string)).toEqual({ username: "next-user", password: "once-only" });
     expect(screen.getByText("current-user")).toBeInTheDocument();
     await act(async () => loginTask.resolve(json({ operation_id: "login-op" }, 202)));
     const activateButton = await screen.findByRole("button", { name: "确认启用所选密钥" });
@@ -89,9 +99,10 @@ describe("管理员会话与操作", () => {
     expect(activateButton).toBeEnabled();
     fetchMock.mockResolvedValueOnce(json({ operation_id: "activate-op" }, 202));
     fetchMock.mockResolvedValueOnce(json(snapshot({ active: { ...active, username: "next-user", revision: "rev-2" } })));
+    fetchMock.mockResolvedValueOnce(json(defaultCheckin));
     fireEvent.click(activateButton);
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(5));
-    expect(JSON.parse(fetchMock.mock.calls[3][1]?.body as string)).toEqual({ candidate_id: "candidate-1", key_id: "key-2" });
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(7));
+    expect(JSON.parse(fetchMock.mock.calls[4][1]?.body as string)).toEqual({ candidate_id: "candidate-1", key_id: "key-2" });
     await waitFor(() => expect(screen.queryByText("current-user")).not.toBeInTheDocument());
   });
 
@@ -129,17 +140,18 @@ describe("管理员会话与操作", () => {
     fetchMock.mockResolvedValueOnce(json({ operation_id: running.id }, 202));
     fetchMock.mockResolvedValueOnce(json(snapshot({ operation: running })));
     fetchMock.mockResolvedValueOnce(json(snapshot({ operation: { ...running, status: "failed", error: { code: "upstream_challenge", message: "safe" } } })));
+    fetchMock.mockResolvedValueOnce(json(defaultCheckin));
     await act(async () => fireEvent.click(screen.getByRole("button", { name: "刷新余额" })));
     expect(screen.getByText("1000000.25")).toBeInTheDocument();
     expect(screen.getByText("正在读取余额")).toBeInTheDocument();
     await act(async () => vi.advanceTimersByTime(999));
-    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(fetchMock).toHaveBeenCalledTimes(4);
     await act(async () => vi.advanceTimersByTime(1));
     expect(screen.getByText("上游仍要求验证，暂时无法完成登录")).toBeInTheDocument();
     expect(screen.getByText("current-user")).toBeInTheDocument();
     expect(screen.getByText("1000000.25")).toBeInTheDocument();
     await act(async () => vi.advanceTimersByTime(5000));
-    expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect(fetchMock).toHaveBeenCalledTimes(6);
   });
 
   it("stops polling on transport error and offers retry without clearing old data", async () => {
@@ -153,7 +165,7 @@ describe("管理员会话与操作", () => {
     expect(screen.getByRole("button", { name: "重试读取状态" })).toBeInTheDocument();
     expect(screen.getByText("current-user")).toBeInTheDocument();
     await act(async () => vi.advanceTimersByTime(5000));
-    expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect(fetchMock).toHaveBeenCalledTimes(5);
     fetchMock.mockResolvedValueOnce(json(snapshot()));
     await act(async () => fireEvent.click(screen.getByRole("button", { name: "重试读取状态" })));
     expect(screen.queryByRole("button", { name: "重试读取状态" })).not.toBeInTheDocument();
@@ -177,7 +189,7 @@ describe("管理员会话与操作", () => {
     const pending = deferred();
     fetchMock.mockReturnValueOnce(pending.promise);
     fireEvent.click(screen.getByRole("button", { name: "刷新余额" }));
-    const signal = fetchMock.mock.calls[1][1]?.signal;
+    const signal = fetchMock.mock.calls[2][1]?.signal;
     fetchMock.mockRejectedValueOnce(new TypeError("network"));
     fireEvent.click(screen.getByRole("button", { name: "退出管理" }));
     expect(signal?.aborted).toBe(true);
@@ -186,7 +198,7 @@ describe("管理员会话与操作", () => {
     expect(screen.getByText(/服务端会话注销失败/)).toBeInTheDocument();
     await act(async () => pending.resolve(json({ operation_id: "late" }, 202)));
     expect(screen.queryByRole("heading", { name: "当前账号" })).not.toBeInTheDocument();
-    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(fetchMock).toHaveBeenCalledTimes(4);
   });
 });
 
@@ -196,7 +208,7 @@ describe("密钥查看的短时授权", () => {
     fetchMock.mockResolvedValueOnce(unauthorized());
     dispatchReveal();
     expect(screen.getByLabelText("本地 root 密钥")).toHaveValue("");
-    expect(fetchMock.mock.calls[1]).toEqual(["/api/account/key/reveal", expect.objectContaining({
+    expect(fetchMock.mock.calls[2]).toEqual(["/api/account/key/reveal", expect.objectContaining({
       method: "POST", headers: { Authorization: "Bearer local-root", "Content-Type": "application/json" },
       body: JSON.stringify({ active_revision: "rev-1" }),
     })]);
@@ -210,7 +222,7 @@ describe("密钥查看的短时授权", () => {
     fetchMock.mockReturnValueOnce(task.promise);
     dispatchReveal();
     fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
-    expect(fetchMock.mock.calls[1][1]?.signal?.aborted).toBe(true);
+    expect(fetchMock.mock.calls[2][1]?.signal?.aborted).toBe(true);
     expect(screen.getByRole("button", { name: "查看密钥" })).toHaveFocus();
     await act(async () => task.resolve(json({ active_revision: "rev-1", key_id: "key-1", key: "never-show" })));
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
@@ -256,10 +268,11 @@ describe("密钥查看的短时授权", () => {
     dispatchReveal();
     fetchMock.mockResolvedValueOnce(json({ operation_id: "op-2" }, 202));
     fetchMock.mockResolvedValueOnce(json(snapshot({ active: { ...active, revision: "rev-2" } })));
+    fetchMock.mockResolvedValueOnce(json(defaultCheckin));
     // Synthetic event intentionally exercises a state change from outside the dialog.
     fireEvent.click(screen.getByRole("button", { name: "刷新余额", hidden: true }));
     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
-    expect(fetchMock.mock.calls[1][1]?.signal?.aborted).toBe(true);
+    expect(fetchMock.mock.calls[2][1]?.signal?.aborted).toBe(true);
     await act(async () => task.resolve(json({ active_revision: "rev-1", key_id: "key-1", key: "never-show" })));
     expect(screen.queryByDisplayValue("never-show")).not.toBeInTheDocument();
   });
@@ -272,7 +285,7 @@ describe("密钥查看的短时授权", () => {
     fetchMock.mockResolvedValueOnce(new Response(null, { status: 204 }));
     fireEvent.click(screen.getByRole("button", { name: "退出管理", hidden: true }));
     await screen.findByText("已退出管理会话");
-    expect(fetchMock.mock.calls[1][1]?.signal?.aborted).toBe(true);
+    expect(fetchMock.mock.calls[2][1]?.signal?.aborted).toBe(true);
     await act(async () => task.resolve(json({ active_revision: "rev-1", key_id: "key-1", key: "never-show" })));
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     expect(screen.queryByDisplayValue("never-show")).not.toBeInTheDocument();

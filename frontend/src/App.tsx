@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import { errorText, phases } from "./api";
 import type { AccountBalance, CandidateAccount } from "./api";
+import { CheckinPanel } from "./CheckinPanel";
 import { RevealDialog } from "./RevealDialog";
 import { useManager } from "./useManager";
 
@@ -148,6 +149,35 @@ export function App() {
           <button type="button" disabled={busy} onClick={() => setRevealRevision(state.active!.revision)}>查看密钥</button></div>
       </div> : <div className="empty-state"><h3>尚未配置账号</h3><p className="secondary">登录 AnyRouter 并选择一个已有密钥后，才能配置本地网关。</p></div>}
     </section>
+    <CheckinPanel
+      settings={manager.checkin?.settings}
+      today={manager.checkin?.today ? {
+        ...manager.checkin.today,
+        accountUserId: manager.checkin.today.account_user_id,
+        startedAt: manager.checkin.today.started_at,
+        finishedAt: manager.checkin.today.finished_at,
+        code: manager.checkin.today.code,
+        errorCode: manager.checkin.today.code,
+      } : null}
+      history={manager.checkin?.history ? manager.checkin.history.map(item => ({
+        ...item,
+        accountUserId: item.account_user_id,
+        startedAt: item.started_at,
+        finishedAt: item.finished_at,
+        code: item.code,
+        errorCode: item.code,
+      })) : []}
+      cycleDate={manager.checkin?.cycle_date || null}
+      nextRunAt={manager.checkin?.next_run_at || null}
+      accountConfigured={!!state.active}
+      busy={busy}
+      saving={manager.checkinSaving}
+      fetchError={manager.checkinError}
+      runError={manager.checkinRunError}
+      onRetryRead={() => void manager.loadCheckin()}
+      onSave={settings => manager.saveCheckinSettings(settings)}
+      onRun={options => manager.runCheckinAction(options)}
+    />
     <section className="card" aria-labelledby="candidate-title">
       <div className="section-heading"><h2 id="candidate-title">{state.active ? "更换账号" : "添加账号"}</h2>{state.candidate && !expired && <span className="badge">待确认</span>}</div>
       <p className="secondary">登录后读取余额与已有密钥；确认启用前不会替换当前账号。系统不会创建新密钥。</p>
