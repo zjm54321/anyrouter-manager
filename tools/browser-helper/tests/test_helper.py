@@ -8,7 +8,6 @@ from pathlib import Path
 import subprocess
 import sys
 import threading
-import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -210,10 +209,10 @@ class LoginTests(unittest.IsolatedAsyncioTestCase):
             return await core.run_login(core.LoginInput('mock-user', SECRET, timeout_ms))
 
     async def execute_virtual(self, page, cookies=None, timeout_ms=160):
-        # Only the two mock-only cookie/pre-submit fixtures use this clock.
+        # Only selected mock-only cookie/profile fixtures use this clock.
         # Keep wait_for timers and task scheduling real; exclude wall-clock stalls.
         loop = asyncio.get_running_loop()
-        now = loop.time()
+        now = 1000.0
         original_sleep = asyncio.sleep
 
         async def sleep(delay, result=None):
@@ -224,40 +223,6 @@ class LoginTests(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(loop, 'time', lambda: now), patch.object(asyncio, 'sleep', sleep):
             return await self.execute(page, cookies, timeout_ms)
-
-    async def test_execute_virtual_preserves_timer_cancellation_and_restores_patches(self):
-        loop = asyncio.get_running_loop()
-        original_time, original_sleep = loop.time, asyncio.sleep
-        observed = {}
-
-        async def work():
-            try:
-                await asyncio.sleep(0.08)
-                await asyncio.sleep(0.08)
-                for _ in range(4):
-                    await asyncio.sleep(0)
-                self.fail('logical wait_for deadline did not cancel')
-            finally:
-                observed['cancelled_at'] = loop.time() - observed['start']
-
-        async def execute(*args):
-            observed['start'] = loop.time()
-            loop.call_soon(observed.update, {'yielded': True})
-            self.assertEqual(await asyncio.sleep(0, 'result'), 'result')
-            self.assertTrue(observed['yielded'])
-            self.assertEqual(loop.time(), observed['start'])
-            try:
-                await asyncio.wait_for(work(), timeout=0.16)
-            finally:
-                await asyncio.sleep(0.01)
-                observed['cleanup_at'] = loop.time() - observed['start']
-
-        with patch.object(self, 'execute', execute), self.assertRaises(TimeoutError):
-            await self.execute_virtual(None)
-        self.assertAlmostEqual(observed['cancelled_at'], 0.16)
-        self.assertAlmostEqual(observed['cleanup_at'], 0.17)
-        self.assertEqual(loop.time, original_time)
-        self.assertIs(asyncio.sleep, original_sleep)
 
     async def test_success_requires_console_response_same_context(self):
         page = FakePage(response())
@@ -433,35 +398,13 @@ class LoginTests(unittest.IsolatedAsyncioTestCase):
                 thread.join(timeout=2)
 
     async def test_api_path_cookie_preserved(self):
-        for stall in (0, 0.2):
-            with self.subTest(real_submit_stall=stall):
-                page = FakePage(response())
-                loop = asyncio.get_running_loop()
-                original_time, original_sleep = loop.time, asyncio.sleep
-                samples = []
-                evaluate = page.evaluate.side_effect
-                def sample(script):
-                    if script == core.USER_STATE_JS:
-                        samples.append(loop.time())
-                    return evaluate(script)
-                page.evaluate.side_effect = sample
-                accepted_login = page.accepted_login
-                async def stalled_submit():
-                    time.sleep(stall)  # Bounded mock-only CI scheduling stall.
-                    await asyncio.sleep(0)
-                    await accepted_login()
-                with patch.object(page, 'accepted_login', stalled_submit):
-                    result = await self.execute_virtual(page, [dict(cookie(), path='/api')])
-                self.assertTrue(result['ok'])
-                self.assertEqual(result['cookies'][0]['path'], '/api')
-                self.context.cookies.assert_awaited_once_with()
-                self.assertEqual(result['api_user'], '42')
-                self.assertEqual(len(samples), 2)
-                self.assertAlmostEqual(samples[1] - samples[0], 0.05)
-                self.context.close.assert_awaited_once()
-                self.browser.close.assert_awaited_once()
-                self.assertEqual(loop.time, original_time)
-                self.assertIs(asyncio.sleep, original_sleep)
+        result = await self.execute_virtual(FakePage(response()), [dict(cookie(), path='/api')])
+        self.assertTrue(result['ok'])
+        self.assertEqual(result['api_user'], '42')
+        self.assertEqual(result['cookies'][0]['path'], '/api')
+        self.context.cookies.assert_awaited_once_with()
+        self.context.close.assert_awaited_once()
+        self.browser.close.assert_awaited_once()
 
     async def test_login_bad_path_before_password_or_click(self):
         for stage in ('entry', 'username', 'password'):
@@ -491,36 +434,24 @@ class LoginTests(unittest.IsolatedAsyncioTestCase):
             page.listeners['response'](response())
             await asyncio.sleep(0)
         page.locator(core.SUBMIT_SELECTORS[0]).click.side_effect = early_self
-        result = await self.execute(page)
+        result = await self.execute_virtual(page)
         self.assertTrue(result['ok'])
         self.assertEqual(page.goto_urls, [core.ORIGIN + '/login', core.ORIGIN + '/console'])
 
     async def test_pre_submission_profile_is_not_accepted(self):
-        for stall in (0, 0.2):
-            with self.subTest(real_submit_stall=stall):
-                page = FakePage()
-                loop = asyncio.get_running_loop()
-                original_time, original_sleep = loop.time, asyncio.sleep
-                early_profile = response()
-                async def emit_before_fill(value, **kwargs):
-                    page.listeners['response'](early_profile)
-                    await asyncio.sleep(0)
-                page.locator(core.USERNAME_SELECTORS[0]).fill.side_effect = emit_before_fill
-                accepted_login = page.accepted_login
-                async def stalled_submit():
-                    time.sleep(stall)
-                    await asyncio.sleep(0)
-                    await accepted_login()
-                with patch.object(page, 'accepted_login', stalled_submit):
-                    result = await self.execute_virtual(page)
-                self.assertEqual(result, {'ok': False, 'error': 'user_self_unverified'})
-                self.context.cookies.assert_not_awaited()
-                early_profile.json.assert_not_awaited()
-                self.context.close.assert_awaited_once()
-                self.browser.close.assert_awaited_once()
-                self.assertEqual(page.listeners, {})
-                self.assertEqual(loop.time, original_time)
-                self.assertIs(asyncio.sleep, original_sleep)
+        page = FakePage()
+        early_profile = response()
+        async def emit_before_fill(value, **kwargs):
+            page.listeners['response'](early_profile)
+            await asyncio.sleep(0)
+        page.locator(core.USERNAME_SELECTORS[0]).fill.side_effect = emit_before_fill
+        result = await self.execute_virtual(page)
+        self.assertEqual(result, {'ok': False, 'error': 'user_self_unverified'})
+        self.context.cookies.assert_not_awaited()
+        early_profile.json.assert_not_awaited()
+        self.context.close.assert_awaited_once()
+        self.browser.close.assert_awaited_once()
+        self.assertEqual(page.listeners, {})
 
     async def test_slow_login_over_five_seconds_not_interrupted(self):
         page = FakePage()

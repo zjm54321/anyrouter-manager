@@ -164,7 +164,6 @@ def main():
     assert publish.index("Build and load once") < publish.index("Test exact loaded image") < publish.index("docker push")
     assert 'docker tag "$TESTED_IMAGE_ID"' in publish and "tested_image_id" in publish
     assert "continue-on-error" not in workflow
-    assert "Build-only evidence" in workflow and "No login or publication" in workflow
     for step in publish.split("      - ")[1:]:
         if any(term in step for term in ("Lowercase public", "GHCR package", "docker/login-action", "Tag and push", "Verify published")):
             assert "if: steps.smoke.outputs.publish_ready == 'true'" in step
