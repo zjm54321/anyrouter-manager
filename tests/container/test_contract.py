@@ -7,9 +7,10 @@ import json
 import os
 from pathlib import Path
 import re
+import runpy
 import tomllib
 import tempfile
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -45,6 +46,12 @@ def main():
     assert "USER 1000:1000" in docker and "EXPOSE 8080" in docker
     assert '"/usr/bin/tini", "--"' in docker
     assert "COPY LICENSE THIRD_PARTY_NOTICES.md" in docker
+    missing_copy_sources = [source for source in ("LICENSE", "THIRD_PARTY_NOTICES.md")
+                            if not (ROOT / source).is_file()]
+    assert not missing_copy_sources, "Dockerfile COPY source missing: " + ", ".join(missing_copy_sources)
+    assert 'org.opencontainers.image.licenses="GPL-3.0-or-later"' in docker
+    assert 'dev.anyrouter.browser-license="CloakBrowser Binary License v1.0; separate redistribution permission required;' in docker
+    assert "PROJECT-WRAPPER-LICENSE" in docker and "internal-use image only" not in docker
     assert "PROJECT-BINARY-LICENSE.md" in docker and "CLOAKBROWSER_AUTO_UPDATE=false" in docker
     assert "PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1" in docker
     assert "root_key" not in docker and "playwright install" not in docker
@@ -66,7 +73,7 @@ def main():
         "docker/build-push-action": "c3c9e263c25d99ce0380d002d59b67737d91b0dc",
     }
     validate, publish = workflow.split("  publish:", 1)
-    assert "github.event.repository.private == true" in validate and "github.event.repository.private == true" in publish
+    assert "github.event.repository.private" not in validate and "github.event.repository.private == false" in publish
     assert "packages: write" not in validate and "docker/login-action" not in validate
     assert "needs: validate" in publish and "refs/heads/main" in publish
     assert "github.event.repository.default_branch" in publish
@@ -79,11 +86,11 @@ def main():
     assert "continue-on-error" not in workflow
     assert "Build-only evidence" in workflow and "No login or publication" in workflow
     for step in publish.split("      - ")[1:]:
-        if any(term in step for term in ("Lowercase private", "GHCR package", "docker/login-action", "Tag and push", "Verify published")):
+        if any(term in step for term in ("Lowercase public", "GHCR package", "docker/login-action", "Tag and push", "Verify published")):
             assert "if: steps.smoke.outputs.publish_ready == 'true'" in step
     assert "DOCKER_BUILD_RECORD_UPLOAD: false" in workflow
-    assert "Refuse an existing non-private GHCR package" in publish
-    assert "docker/ghcr_visibility.py --require-existing" in publish
+    assert "Require an existing public GHCR package before login" in publish
+    assert publish.count("run: python3 -B docker/ghcr_visibility.py\n") == 2
     checks += 1
     rust = (ROOT / "docker/rust-tests.sh").read_text()
     assert "RUN /bin/sh /build/rust-tests.sh" in docker
@@ -92,12 +99,16 @@ def main():
     expected = {
         "config::tests::login_diagnostics_is_explicit_and_backward_compatible": "config.rs",
         "config::tests::container_origins_and_executable_are_explicit": "config.rs",
+        "config::tests::insecure_lan_http_is_explicit_and_backward_compatible": "config.rs",
+        "config::tests::insecure_lan_http_requires_all_switches_and_exact_ipv4_range": "config.rs",
+        "config::tests::insecure_lan_opt_in_preserves_https_and_loopback_policy": "config.rs",
         "diagnostics::tests::exact_schema_roundtrip_and_strict_bounds": "diagnostics.rs",
         "error::tests::source_metadata_is_finite_and_absent_by_default": "error.rs",
         "app::runtime_tests::secure_cookie_has_same_creation_deletion_policy": "app.rs",
         "helper::container_command_is_explicit_and_native_command_keeps_namespace": "helper.rs",
         "tests::cookie_structure_requires_finite_expiry_but_not_live_session": "tests.rs",
         "tests::cookie_selection_obeys_domain_secure_expiry_path_and_precedence": "tests.rs",
+        "tests::insecure_lan_http_login_session_logout_preserves_security_contract": "tests.rs",
         "upstream_body::tests::gzip_is_bounded_and_requires_complete_valid_stream": "upstream_body.rs",
         "log_settings::tests::strict_defaults_thresholds_and_fixed_errors": "log_settings.rs",
         "log_settings::tests::update_commit_hot_watch_failure_keeps_old_and_reopen": "log_settings.rs",
@@ -105,7 +116,7 @@ def main():
         "helper::tests::session_payload_expired_is_not_malformed_but_unsafe_fields_still_are": "helper.rs",
     }
     selected = re.findall(r"^    ([a-zA-Z_][\w:]*)[ \t]*\\?$", rust, re.M)
-    assert len(selected) == len(expected) == 13 and set(selected) == set(expected)
+    assert len(selected) == len(expected) == 17 and set(selected) == set(expected)
     assert f"# Execute {len(expected)} reviewed pure tests;" in docker
     for name, source in expected.items():
         assert name in rust
@@ -157,15 +168,55 @@ def main():
     with patch.dict(visibility.os.environ, env), patch.object(visibility, "urlopen") as fetch:
         response = fetch.return_value.__enter__.return_value
         response.read.return_value = b'{"visibility":"private"}'
-        assert visibility.private_or_new(True)
+        assert not visibility.public_existing()
         response.read.return_value = b'{"visibility":"public"}'
-        assert not visibility.private_or_new()
+        assert visibility.public_existing()
+        request = fetch.call_args.args[0]
+        assert request.full_url == "https://api.github.com/users/fixtureowner/packages/container/fixturerepo"
+        assert request.get_method() == "GET" and request.data is None
+        assert request.get_header("Authorization") == "Bearer SENTINEL-CI-TOKEN"
+        assert fetch.call_args.kwargs == {"timeout": 15}
+        response.read.assert_called_with(65537)
+        with patch.dict(visibility.os.environ, {"OWNER_TYPE": "Organization"}):
+            assert visibility.public_existing()
+            assert fetch.call_args.args[0].full_url == "https://api.github.com/orgs/fixtureowner/packages/container/fixturerepo"
         response.read.return_value = b'{"visibility":"internal"}'
-        assert not visibility.private_or_new()
-        fetch.side_effect = visibility.HTTPError("https://fixture.invalid", 404, "SENTINEL", {}, None)
-        assert visibility.private_or_new() and not visibility.private_or_new(True)
-        fetch.side_effect = visibility.HTTPError("https://fixture.invalid", 403, "SENTINEL", {}, None)
-        assert not visibility.private_or_new()
+        assert not visibility.public_existing()
+        response.read.return_value = b'{}'
+        assert not visibility.public_existing()
+        for status in (401, 403, 404, 429, 500):
+            fetch.side_effect = visibility.HTTPError("https://fixture.invalid", status, "SENTINEL", {}, None)
+            assert not visibility.public_existing()
+    for invalid in ({"OWNER_TYPE": "Unknown"}, {"REPOSITORY": "missing-owner"}, {"REPOSITORY": "/package"}):
+        with patch.dict(visibility.os.environ, {**env, **invalid}), patch.object(visibility, "urlopen") as fetch:
+            assert not visibility.public_existing()
+            fetch.assert_not_called()
+    # Execute the real CLI boundary with mocked HTTP; exceptions/API bodies and
+    # token sentinels must never reach stdout/stderr, even for invalid responses.
+    for scenario in ("public", "private", "internal", "missing", "malformed", "wrong_shape", "not_found", "denied", "network", "unexpected_argument"):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with patch.dict(os.environ, env), patch("urllib.request.urlopen") as fetch, \
+                patch("sys.argv", ["ghcr_visibility.py"] + (["--allow-new"] if scenario == "unexpected_argument" else [])), \
+                redirect_stdout(stdout), redirect_stderr(stderr):
+            response = fetch.return_value.__enter__.return_value
+            response.read.return_value = {
+                "malformed": b'SENTINEL-CI-TOKEN', "wrong_shape": b'[]', "missing": b'{}',
+            }.get(scenario, json.dumps({"visibility": scenario, "private_body": "SENTINEL-CI-TOKEN"}).encode())
+            if scenario in ("not_found", "denied"):
+                fetch.side_effect = visibility.HTTPError("https://fixture.invalid", 404 if scenario == "not_found" else 403,
+                                                       "SENTINEL-CI-TOKEN", {}, None)
+            elif scenario == "network":
+                fetch.side_effect = RuntimeError("SENTINEL-CI-TOKEN")
+            try:
+                runpy.run_path(str(ROOT / "docker/ghcr_visibility.py"), run_name="__main__")
+            except SystemExit as exit_status:
+                assert exit_status.code == (0 if scenario == "public" else 1)
+            else:
+                raise AssertionError("visibility CLI did not exit")
+            if scenario == "unexpected_argument":
+                fetch.assert_not_called()
+        assert stdout.getvalue() == json.dumps({"ghcr_visibility": "passed" if scenario == "public" else "blocked"}) + "\n"
+        assert stderr.getvalue() == "" and "SENTINEL" not in stdout.getvalue()
     checks += 1
     spec = importlib.util.spec_from_file_location("container_smoke", ROOT / "tests/container/ci_smoke.py")
     smoke_module = importlib.util.module_from_spec(spec)

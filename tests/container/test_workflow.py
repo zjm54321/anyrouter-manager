@@ -28,8 +28,9 @@ def condition(expression, values):
             assert isinstance(node.op, (ast.And, ast.Or))
             return all(operands) if isinstance(node.op, ast.And) else any(operands)
         if isinstance(node, ast.Compare):
-            assert len(node.ops) == 1 and isinstance(node.ops[0], ast.Eq)
-            return visit(node.left) == visit(node.comparators[0])
+            assert len(node.ops) == 1 and isinstance(node.ops[0], (ast.Eq, ast.NotEq))
+            equal = visit(node.left) == visit(node.comparators[0])
+            return equal if isinstance(node.ops[0], ast.Eq) else not equal
         raise AssertionError("unsupported workflow expression")
 
     return visit(tree)
@@ -43,6 +44,10 @@ def run_body(step):
 def main():
     workflow = (ROOT / ".github/workflows/container.yml").read_text()
     validate, publish = workflow.split("  publish:", 1)
+    assert workflow.startswith("name: Public container\n")
+    assert "group: public-container-${{ github.ref }}" in workflow
+    validate_job = validate.split("  validate:\n", 1)[1]
+    assert not re.search(r"^    if:", validate_job, re.M)
     triggers = workflow.split("permissions:", 1)[0]
     assert re.search(r"^  push:\n(?:    #.*\n)*    branches: \[main\]$", triggers, re.M)
     assert re.search(r"^  workflow_dispatch:\s*$", triggers, re.M)
@@ -51,24 +56,43 @@ def main():
     expression = " ".join(re.search(r"    if: >-\n((?:      .*\n)+)", publish).group(1).split())
     cases = 0
     for private in (True, False):
-        for event in ("push", "workflow_dispatch", "pull_request"):
+        for event in ("push", "workflow_dispatch", "pull_request", "pull_request_target", "schedule"):
             for ref, default in (("main", "main"), ("main", "other"), ("feature", "main")):
-                values = {"true": True, "github.event.repository.private": private,
+                values = {"false": False, "github.event.repository.private": private,
                           "github.event_name": event, "github.ref": "refs/heads/" + ref,
                           "github.ref_name": ref, "github.event.repository.default_branch": default}
-                assert condition(expression, values) == (private and ref == default == "main" and event != "pull_request")
+                assert condition(expression, values) == (not private and ref == default == "main" and event in ("push", "workflow_dispatch"))
                 cases += 1
+    for gate in re.findall(r"^        if: (.*)$", validate, re.M):
+        for event in ("pull_request", "push", "workflow_dispatch"):
+            for ref in ("refs/heads/main", "refs/heads/feature", "refs/pull/1/merge"):
+                assert condition(gate, {"github.event_name": event, "github.ref": ref}) == (
+                    event == "pull_request" or ref != "refs/heads/main")
     assert "packages: write" not in validate and "GITHUB_TOKEN" not in validate
+    assert "secrets." not in validate and "docker/login-action" not in validate
+    assert "permissions:\n  contents: read\n" in validate
+    assert workflow.count("packages: write") == 1
+    assert workflow.count("persist-credentials: false") == 2
     assert "packages: write" in publish and "secrets.GITHUB_TOKEN" in publish
     assert "secrets." not in publish.replace("secrets.GITHUB_TOKEN", "")
     assert "cache-to:" not in workflow and "upload-artifact" not in workflow
     assert workflow.count("DOCKER_BUILD_RECORD_UPLOAD: false") == 2
+    assert workflow.count("DOCKER_BUILD_SUMMARY: false") == 2
+    assert workflow.count("load: true") == 2 and workflow.count("push: false") == 2
+    assert "push: true" not in workflow and "continue-on-error" not in workflow
+    assert "production supervisor/browser gate" in validate
+    assert "python3 -B tests/container/ci_smoke.py anyrouter-manager:ci" in validate
     steps = publish.split("      - ")[1:]
     tag_step = next(step for step in steps if "name: Tag and push" in step)
     smoke_step = next(step for step in steps if "id: smoke" in step)
     assert "exit 2" in smoke_step and "::error::" in smoke_step
     assert publish.count("uses: docker/build-push-action@") == 1
     assert publish.index("id: smoke") < publish.index("docker/login-action") < publish.index("docker push")
+    assert publish.index("Require an existing public GHCR package") < publish.index("docker/login-action")
+    assert publish.index("docker push") < publish.index("Verify published package exists and is public")
+    assert publish.count("run: python3 -B docker/ghcr_visibility.py\n") == 2
+    assert "REPOSITORY: ${{ github.repository }}" in publish
+    assert "TESTED_IMAGE_ID: ${{ steps.smoke.outputs.tested_image_id }}" in tag_step
     for step in steps:
         if any(term in step for term in ("id: image", "GH_TOKEN:", "docker/login-action", "name: Tag and push")):
             gate = re.search(r"^        if: (.*)$", step, re.M).group(1)
@@ -105,15 +129,16 @@ elif sys.argv[1] == "push" and os.environ.get("MOCK_PUSH_FAIL") == "1":
         name_script = re.search(r"^        run: (.*)$", name_step, re.M).group(1)
         assert subprocess.run(["bash", "-e", "-c", name_script], env=env, capture_output=True).returncode == 0
         assert output.read_text() == "name=ghcr.io/fixtureowner/fixturerepo\n"
-        for scenario in ("pass", "changed_id", "push_failed"):
+        for scenario in ("pass", "changed_id", "missing_tested_id", "push_failed"):
             log.write_text("")
+            env["TESTED_IMAGE_ID"] = "" if scenario == "missing_tested_id" else image_id
             env["MOCK_IMAGE_ID"] = image_id if scenario != "changed_id" else "sha256:" + "c" * 64
             env["MOCK_PUSH_FAIL"] = "1" if scenario == "push_failed" else "0"
             result = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", run_body(tag_step)], env=env, capture_output=True)
             calls = [json.loads(line) for line in log.read_text().splitlines()]
             assert (result.returncode == 0) == (scenario == "pass")
             assert not any(call[0] == "build" for call in calls)
-            if scenario == "changed_id":
+            if scenario in ("changed_id", "missing_tested_id"):
                 assert len(calls) == 1  # mutated local tag cannot be published
             else:
                 assert calls[1:3] == [["tag", image_id, env["IMAGE"] + ":sha-" + revision],

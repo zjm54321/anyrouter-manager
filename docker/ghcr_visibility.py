@@ -1,4 +1,4 @@
-"""Fail-closed visibility guard; never print tokens, API bodies, or exceptions."""
+"""Require an existing public package; never change visibility or print secrets."""
 import json
 import os
 import sys
@@ -7,7 +7,7 @@ from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 
-def private_or_new(require_existing=False):
+def public_existing():
     repository = os.environ["REPOSITORY"].lower().split("/")
     if len(repository) != 2 or not all(repository):
         return False
@@ -24,15 +24,15 @@ def private_or_new(require_existing=False):
     try:
         with urlopen(request, timeout=15) as response:
             result = json.loads(response.read(65537))
-        return result.get("visibility") == "private"
-    except HTTPError as error:
-        # An absent package is created private by GHCR. Every other failure blocks.
-        return error.code == 404 and not require_existing
+        return result.get("visibility") == "public"
+    except HTTPError:
+        # Even 404 blocks: a first GHCR publication would default to private.
+        return False
 
 
 if __name__ == "__main__":
     try:
-        passed = private_or_new(require_existing="--require-existing" in sys.argv[1:])
+        passed = not sys.argv[1:] and public_existing()
     except Exception:
         passed = False
     print(json.dumps({"ghcr_visibility": "passed" if passed else "blocked"}))

@@ -1,4 +1,4 @@
-name: Private container
+name: Public container
 
 on:
   pull_request:
@@ -11,13 +11,12 @@ permissions:
   contents: read
 
 concurrency:
-  group: private-container-${{ github.ref }}
+  group: public-container-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   validate:
-    # Never build/export the proprietary binary in a public repository workflow.
-    if: github.event.repository.private == true
+    # Validation is read-only, including public and fork pull requests.
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     permissions:
@@ -61,7 +60,7 @@ jobs:
   publish:
     needs: validate
     if: >-
-      github.event.repository.private == true &&
+      github.event.repository.private == false &&
       github.ref == 'refs/heads/main' &&
       github.ref_name == github.event.repository.default_branch &&
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
@@ -99,13 +98,13 @@ jobs:
              2) printf '%s\n' '::error::Build-only evidence: required production supervisor capability probe is blocked. No login or publication; image remains runner-local. This is not a runtime pass.'; exit 2 ;;
             *) exit "$status" ;;
           esac
-      - name: Lowercase private image name
+      - name: Lowercase public image name
         if: steps.smoke.outputs.publish_ready == 'true'
         id: image
         env:
           REPOSITORY: ${{ github.repository }}
         run: printf 'name=ghcr.io/%s\n' "${REPOSITORY,,}" >> "$GITHUB_OUTPUT"
-      - name: Refuse an existing non-private GHCR package
+      - name: Require an existing public GHCR package before login
         if: steps.smoke.outputs.publish_ready == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -130,10 +129,10 @@ jobs:
           docker tag "$TESTED_IMAGE_ID" "$IMAGE:main"
           docker push "$IMAGE:sha-$REVISION"
           docker push "$IMAGE:main"
-      - name: Verify published package is private
+      - name: Verify published package exists and is public
         if: steps.smoke.outputs.publish_ready == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPOSITORY: ${{ github.repository }}
           OWNER_TYPE: ${{ github.event.repository.owner.type }}
-        run: python3 -B docker/ghcr_visibility.py --require-existing
+        run: python3 -B docker/ghcr_visibility.py

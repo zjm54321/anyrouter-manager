@@ -17,7 +17,7 @@ state_path = "data/account.json"
 # login_diagnostics below separately controls diagnostic metadata in API errors.
 frontend_dir = "frontend/dist"
 browser_helper_dir = "tools/browser-helper"
-# Opt-in container listener. Remote web origins require HTTPS and secure cookies.
+# Opt-in container listener. Remote web origins normally require HTTPS and secure cookies.
 # Container mode uses a dedicated subreaper for browser lifecycle, NOT a sandbox.
 # Requires a private container PID namespace; --pid=host / hostPID is forbidden.
 # Lost cleanup ACK, worker crash, or cleanup timeout fatally exits the service:
@@ -25,6 +25,12 @@ browser_helper_dir = "tools/browser-helper"
 # Non-container mode retains user/PID namespaces, with no automatic fallback.
 container_mode = false
 cookie_secure = false
+# Explicit plaintext LAN exception: container_mode=true, cookie_secure=false,
+# and exact HTTP origins with literal IPv4 ONLY in 192.168.0.0/16, for example
+# allowed_origin = ["http://192.168.1.127:30880"]. No hostnames or other private ranges.
+# WARNING: root key, passwords, session cookies and API traffic travel in plaintext.
+# This is NOT a network firewall. Require a trusted-LAN firewall; never expose publicly.
+allow_insecure_lan_http = false
 # Docker can set an absolute, operator-controlled Python executable (no uv at runtime):
 # browser_helper_executable = "/app/tools/browser-helper/.venv/bin/python"
 helper_timeout = 90

@@ -1,4 +1,4 @@
-# Private internal-use container
+# Container build and public publication
 
 This image targets **linux/amd64** only. It bundles the official, hash-verified,
 unmodified CloakBrowser `146.0.7680.177.5` archive, Python 3.13 with locked
@@ -14,31 +14,46 @@ checks do not claim the floating builder has been executed.
 
 ## License and publication boundary
 
-Use this image only for private personal/internal purposes permitted by the
-separate CloakBrowser binary terms; GPL applies to original application code,
-not to the entire bundled browser. Consult `/app/THIRD_PARTY_NOTICES.md` and
-`/opt/cloakbrowser/PROJECT-BINARY-LICENSE.md`. All archive notices are retained.
-Public distribution or serving third-party customers may require a separate
-CloakHQ OEM license. This workflow never builds in a public repository and never
-publishes for pull requests. It publishes only from trusted `main` when `main` is
-also the private repository's default branch, after successful runtime checks.
+GPL-3.0-or-later applies to original application code, not to the entire bundled
+browser. The Python CloakBrowser wrapper is MIT-licensed; Chromium and bundled
+components retain their own licenses. The compiled CloakBrowser has separate
+proprietary terms: the CloakBrowser Binary License v1.0 (February 2026) does
+**not** grant default public-redistribution rights. Its personal/internal-use
+permission is not permission to distribute a bundled public image or serve
+third-party customers; those uses require separate permission from CloakHQ.
 
-GHCR packages initially default to private, but existing package visibility can
-be changed independently. Confirm the package is private before enabling the
-workflow and after its first publication; do not change it to public. The workflow
-also blocks publication to an existing non-private package and checks visibility
-after publishing. API errors other than an absent package fail closed. Avoid
-concurrent manual visibility changes during publication. No remote
-or package is created by this implementation. CI uses only `GITHUB_TOKEN` with
-`packages: write` in the trusted publication job, not account/login credentials.
-Tags are `sha-<full commit SHA>` and `main`. No registry cache or build records
+For **this delivery only**, the deployment owner has confirmed explicit
+redistribution permission covering the pinned `146.0.7680.177.5` browser in a
+public container. The publisher relies on that confirmation and is responsible
+for remaining within the obtained grant. This does not amend the upstream
+license or grant other publishers redistribution rights; no private grant text
+is committed. Consult [the project notices](../THIRD_PARTY_NOTICES.md), also at
+`/app/THIRD_PARTY_NOTICES.md`, and the full pinned license at
+`/opt/cloakbrowser/PROJECT-BINARY-LICENSE.md`. Original archive notices and the
+upstream wrapper license are retained in `/opt/cloakbrowser/`.
+
+The `Public container` workflow validates pull requests without registry login,
+publication, or uploaded image artifacts. Publication is restricted to a
+**public** repository's trusted `main`, which must also be its default branch,
+after successful mandatory production runtime checks. CI uses only
+`GITHUB_TOKEN`, with `packages: write` only in that trusted publication job;
+checkout does not persist credentials. No account credentials or PAT are needed.
+Tags are only `sha-<full commit SHA>` and `main`. No registry cache or build records
 are uploaded by this workflow.
+
+The expected GHCR package must **already exist and be public** before publication.
+The workflow checks that exact repository-derived package before login and again
+after pushing. A private/internal/missing package, HTTP 404, other API errors, or
+an unrecognized response blocks publication. It does not create a first private
+package or change visibility automatically. Avoid concurrent manual visibility
+changes during publication. These checks enforce visibility, not license rights.
 
 ### Automatic publication after push
 
-Pushing a commit to the private repository's default branch **`main`** automatically
-starts this workflow: build/load → offline runtime smoke → visibility guard →
-GHCR login → tag/push the exact tested image → verify private visibility.
+Pushing a commit to the public repository's default branch **`main`** automatically
+starts this workflow: static validation → build/load once → mandatory offline
+production runtime smoke → existing-public visibility guard → GHCR login →
+tag/push the exact tested image ID → verify existing-public visibility.
 `workflow_dispatch` is only an optional retry, with no required inputs. No per-push
 environment variables or PAT secret are needed. The image name is derived from
 `github.repository`, lowercased: for a hypothetical `Owner/Repo`, the tags are
@@ -47,14 +62,16 @@ Pull requests can build/test but cannot log in or publish; non-main pushes are
 not subscribed. Keep `main` as the default branch or deliberately update both
 the push trigger and trusted-publication branch checks together.
 
-One-time operator setup: create/use a **private** GitHub repository, enable Actions
-and permit this workflow's `GITHUB_TOKEN` to write packages under repository/org
-policy. A new GHCR package is initially private; if an existing package is used,
-keep it private and grant this repository's Actions access in package settings
-(inherited repository permissions may already supply access). No token belongs
-in config, source, Docker build arguments, or image layers. Confirm package privacy
-after the first successful run. The first remote push is also the first actual
-Docker build/runtime verification; no image has been built or published locally.
+Operator prerequisites: use a **public** GitHub repository, enable Actions, and
+permit this workflow's `GITHUB_TOKEN` to write packages under repository/org
+policy. Confirm the expected public GHCR package already exists and grants this
+repository's Actions access in package settings (inherited repository permissions
+may already supply access). First-package creation is outside this workflow:
+GHCR initially defaults new packages to private, so an absent package deliberately
+blocks the job. No token belongs in config, source, Docker build arguments, or
+image layers. A successful static check is not evidence of a Docker build or a
+functional container; the actual CI build and runtime gates must still pass for
+the revision being published.
 
 The trusted job builds/loads once, smokes the immutable loaded image ID, and
 tags/pushes that same ID using Docker CLI. It never rebuilds after testing.
@@ -89,11 +106,11 @@ denial fails closed; readiness checks the supervisor without starting a browser.
 The old user/PID `unshare` prerequisite remains **only for non-container mode**;
 there is no automatic fallback between the modes.
 
-The config contract remains `container_mode`, `cookie_secure`, and
-`browser_helper_executable`. No local Docker engine was available for this change:
-**standard Docker operation is pending the first actual CI run**, not claimed as
-tested or guaranteed. A local engine is required for the commands below; this
-implementation does not install one.
+The config contract includes `container_mode`, `cookie_secure`,
+`browser_helper_executable`, and the default-off `allow_insecure_lan_http` opt-in.
+**Static/mock validation does not prove standard Docker operation**; this
+revision still requires successful actual CI runtime checks. A local engine is
+required for the commands below; this implementation does not install one.
 
 ## Private local run
 
@@ -128,9 +145,13 @@ part of an image layer. The image runs as UID/GID 1000 behind tini with Docker's
 default seccomp policy and private PID namespace; retain both.
 
 Visit `http://localhost:8080`. Exact allowed origins are also used to constrain
-Host checks; `0.0.0.0` is a bind address, not a trusted client origin. Keep local
-publication loopback-only. For remote HTTPS, use exact trusted HTTPS origins and
-`cookie_secure = true`; configure that secure transport separately. No Compose,
+Host checks; `0.0.0.0` is a bind address, not a trusted client origin. The example
+keeps port exposure loopback-only. Optional private-LAN HTTP requires explicit
+`allow_insecure_lan_http = true`, `container_mode = true`, `cookie_secure = false`,
+and exact allowed origins using literal IPv4 addresses in `192.168.0.0/16`.
+This default-off opt-in accepts cleartext transport only within the owner's
+trusted private-LAN security boundary; it does not encrypt root credentials,
+session cookies, or traffic. Do not expose it to untrusted networks. No Compose,
 Kubernetes, Ingress, or node security profiles are included.
 
 `GET /health/live` and `/health/ready` expose only fixed safe health states and
@@ -142,13 +163,14 @@ allowed health Hosts or change port, override the healthcheck accordingly.
 
 `python3 -B tests/container/test_contract.py` checks the static contract with no
 Docker engine, network, or real credentials. `python3 -B tests/container/test_workflow.py`
-also evaluates automatic-push/private/main conditions and runs the publication
+also evaluates automatic-push/public/default-main conditions and runs the publication
 shell against a fake Docker CLI, including changed-ID and push-failure cases.
 The workflow additionally builds
 the image, runs frontend tests/typecheck/build and Python mock tests, and executes
-eight explicitly whitelisted pure Rust tests using `cargo test --locked ... --exact`.
+17 explicitly whitelisted pure/in-process Rust tests using `cargo test --locked ... --exact`.
 The Rust binary test target is compiled/listed, but compilation is not execution.
-The gate reports executed and deferred counts dynamically (eight whitelisted tests;
+The gate reports executed and deferred counts dynamically (17 whitelisted tests,
+including the four LAN-HTTP config and in-process session tests;
 all other listed binary tests are deferred). Integration tests are not copied into or executed by the Docker build;
 the full Rust regression suite is not implied by this gate. Namespace-dependent
 tests and Rust parent-monitor fatal/permit tests remain separate native validation,
@@ -183,6 +205,7 @@ evidence. A failed supervisor/browser/cleanup/readiness probe blocks publication
 No Docker build, runtime, Rust build-stage execution, or Actions execution is
 claimed from local static/mock validation without an engine.
 
-The owner must run the private-repository workflow remotely for the first real
-Docker result. Until it passes, do not publish or describe the image as verified
-under default Docker. Local static checks: `python3 -B tests/container/test_contract.py`.
+The owner must obtain the public-repository workflow's actual build/runtime result
+for this revision. Until the mandatory runtime gates pass, publication must remain
+blocked; do not describe the image as verified under default Docker based on local
+static checks. Local static checks: `python3 -B tests/container/test_contract.py`.

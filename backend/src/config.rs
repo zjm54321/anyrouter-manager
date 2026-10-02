@@ -22,6 +22,7 @@ pub struct Config {
     pub browser_helper_executable: Option<PathBuf>,
     pub container_mode: bool,
     pub cookie_secure: bool,
+    pub allow_insecure_lan_http: bool,
     pub helper_timeout: u64,
     pub login_diagnostics: bool,
     pub allowed_origin: Vec<String>,
@@ -42,6 +43,7 @@ impl Default for Config {
             browser_helper_executable: None,
             container_mode: false,
             cookie_secure: false,
+            allow_insecure_lan_http: false,
             helper_timeout: 90,
             login_diagnostics: false,
             allowed_origin: [
@@ -157,8 +159,22 @@ impl Config {
                 );
             }
             let local = loopback_host(url.host_str().unwrap_or_default());
-            if !local && (!self.container_mode || url.scheme() != "https" || !self.cookie_secure) {
-                return Err("Remote origins require container_mode, HTTPS and cookie_secure.");
+            // The exact-origin check above rejects URL-normalized host spellings.
+            // Parse only literal IPv4 here: no DNS or other private-network ranges.
+            let insecure_lan_http = self.allow_insecure_lan_http
+                && url.scheme() == "http"
+                && !self.cookie_secure
+                && url.host_str().is_some_and(|host| {
+                    host.parse::<std::net::Ipv4Addr>()
+                        .is_ok_and(|ip| ip.octets()[..2] == [192, 168])
+                });
+            if !local
+                && (!self.container_mode
+                    || !(url.scheme() == "https" && self.cookie_secure || insecure_lan_http))
+            {
+                return Err(
+                    "Remote origins require container_mode and HTTPS with cookie_secure, or explicit allow_insecure_lan_http for 192.168.0.0/16 HTTP with cookie_secure=false.",
+                );
             }
         }
         Ok(())
@@ -330,6 +346,144 @@ mod tests {
         assert!(enabled.login_diagnostics);
         assert!(toml::from_str::<Config>("login_diagnostics = 'true'").is_err());
         assert!(Config::default().validate().is_err());
+    }
+
+    #[test]
+    fn insecure_lan_http_is_explicit_and_backward_compatible() {
+        let mut config: Config =
+            toml::from_str("root_key = 'Test-Only-Root-91c7e8aa-2345-SufficientEntropy'").unwrap();
+        config.validate().unwrap();
+        assert!(!config.allow_insecure_lan_http);
+        assert!(!Config::default().allow_insecure_lan_http);
+        config.container_mode = true;
+        config.allowed_origin = vec!["http://192.168.1.127:30880".into()];
+        assert!(config.validate().is_err());
+
+        let enabled: Config = toml::from_str(
+            "root_key = 'Test-Only-Root-91c7e8aa-2345-SufficientEntropy'\ncontainer_mode = true\nallow_insecure_lan_http = true\nallowed_origin = ['http://192.168.1.127:30880']",
+        )
+        .unwrap();
+        enabled.validate().unwrap();
+        assert!(enabled.allow_insecure_lan_http);
+        assert!(!enabled.cookie_secure);
+        assert!(toml::from_str::<Config>("allow_insecure_lan_http = 'true'").is_err());
+        assert!(
+            toml::from_str::<Config>("allow_insecure_lan_http = true\nunknown_field = true")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn insecure_lan_http_requires_all_switches_and_exact_ipv4_range() {
+        let mut config = Config {
+            root_key: "Test-Only-Root-91c7e8aa-2345-SufficientEntropy".into(),
+            container_mode: true,
+            allow_insecure_lan_http: true,
+            ..Config::default()
+        };
+        for origin in [
+            "http://192.168.1.127:30880",
+            "http://192.168.0.1",
+            "http://192.168.42.123:8080",
+            "http://192.168.255.254:30880",
+            "http://192.168.0.0",
+            "http://192.168.255.255",
+        ] {
+            config.allowed_origin = vec![origin.into()];
+            config.validate().unwrap();
+        }
+        config.allowed_origin = vec!["http://192.168.1.127:30880".into()];
+        assert!(config.allowed_hosts().contains("192.168.1.127:30880"));
+        assert!(!config.allowed_hosts().contains("192.168.1.128:30880"));
+        config.container_mode = false;
+        assert!(config.validate().is_err());
+        config.container_mode = true;
+        config.cookie_secure = true;
+        assert!(config.validate().is_err());
+        config.cookie_secure = false;
+        config.allow_insecure_lan_http = false;
+        assert!(config.validate().is_err());
+        config.allow_insecure_lan_http = true;
+        for origin in [
+            "http://10.0.0.1:30880",
+            "http://172.16.0.1:30880",
+            "http://172.31.255.254:30880",
+            "http://192.167.255.255:30880",
+            "http://192.169.0.0:30880",
+            "http://8.8.8.8:30880",
+            "http://0.0.0.0:30880",
+            "http://169.254.1.1:30880",
+            "http://[::]:30880",
+            "http://[fd00::1]:30880",
+            "http://[2001:db8::1]:30880",
+            "http://[::ffff:192.168.1.127]:30880",
+            "http://manager.example:30880",
+            "http://192.168.1.127.example:30880",
+            "http://192.168.*:30880",
+            "http://*.example:30880",
+            "http://192.168.1.999:30880",
+            "http://192.168.1.127:30880/",
+            "http://192.168.1.127:30880/api",
+            "http://192.168.1.127:30880?x=1",
+            "http://192.168.1.127:30880#x",
+            "http://fake:fake@192.168.1.127:30880",
+            "http://192.168.1.127:30880\\api",
+            "http://192.168.001.127:30880",
+            "http://0xc0a8017f:30880",
+            "http://3232235903:30880",
+            "http://192.168.383:30880",
+            "http://192.168.1.127.:30880",
+            "http://%31%39%32.168.1.127:30880",
+            "http://192.168.1.127:80",
+            "not an origin",
+        ] {
+            config.allowed_origin = vec![origin.into()];
+            assert!(config.validate().is_err(), "{origin}");
+        }
+        config.allowed_origin = vec![
+            "http://192.168.1.127:30880".into(),
+            "http://10.0.0.1:30880".into(),
+        ];
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn insecure_lan_opt_in_preserves_https_and_loopback_policy() {
+        let mut config = Config {
+            root_key: "Test-Only-Root-91c7e8aa-2345-SufficientEntropy".into(),
+            allow_insecure_lan_http: true,
+            ..Config::default()
+        };
+        for secure in [false, true] {
+            config.cookie_secure = secure;
+            for origin in [
+                "http://localhost:8080",
+                "http://127.0.0.1:8080",
+                "http://[::1]:8080",
+                "https://localhost:8080",
+            ] {
+                config.allowed_origin = vec![origin.into()];
+                config.validate().unwrap();
+            }
+        }
+        for origin in ["https://manager.example", "https://192.168.1.127:30880"] {
+            config.allowed_origin = vec![origin.into()];
+            config.container_mode = false;
+            assert!(config.validate().is_err());
+            config.container_mode = true;
+            config.cookie_secure = false;
+            assert!(config.validate().is_err());
+            config.cookie_secure = true;
+            config.validate().unwrap();
+        }
+        config.allowed_origin = vec![
+            "https://manager.example".into(),
+            "http://192.168.1.127:30880".into(),
+        ];
+        for secure in [false, true] {
+            config.cookie_secure = secure;
+            assert!(config.validate().is_err());
+        }
     }
 
     #[test]

@@ -1174,6 +1174,219 @@ async fn login_stage_sources_self_and_tokens_do_not_reflect_upstream() {
 }
 
 #[tokio::test]
+async fn insecure_lan_http_login_session_logout_preserves_security_contract() {
+    // In-process router only: no listener, upstream server, browser or helper task.
+    struct NoLogin;
+    #[async_trait]
+    impl LoginProvider for NoLogin {
+        async fn login(&self, _: String, _: String) -> Result<Credentials, SafeError> {
+            panic!("session tests must not invoke account login helpers");
+        }
+    }
+    async fn send(router: &Router, method: &str, path: &str, headers: &[(&str, &str)]) -> Response {
+        let mut request = axum::http::Request::builder().method(method).uri(path);
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let response = router
+            .clone()
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        response
+    }
+    fn assert_http_cookie(response: &Response, age: u32) -> String {
+        let cookie = response.headers()[header::SET_COOKIE].to_str().unwrap();
+        assert!(!cookie.contains("; Secure"));
+        for attribute in ["HttpOnly", "SameSite=Strict", "Path=/api/"] {
+            assert!(cookie.contains(attribute));
+        }
+        assert!(cookie.contains(&format!("Max-Age={age}")));
+        cookie.split(';').next().unwrap().to_owned()
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let config = Config {
+        root_key: ROOT.into(),
+        state_path: directory.path().join("account.json"),
+        bind: "0.0.0.0:8080".parse().unwrap(),
+        container_mode: true,
+        allow_insecure_lan_http: true,
+        cookie_secure: false,
+        allowed_origin: vec!["http://192.168.1.127:30880".into()],
+        ..Config::default()
+    };
+    config.validate().unwrap();
+    let app = App::new(
+        config,
+        model::Portfolio::default(),
+        Upstream::mock("http://127.0.0.1:1".into()),
+        Arc::new(NoLogin),
+    );
+    let router = app::router(app.clone());
+    let host = "192.168.1.127:30880";
+    let origin = "http://192.168.1.127:30880";
+    let authorization = format!("Bearer {ROOT}");
+    for path in ["/api/admin/session", "/api/accounts"] {
+        let method = if path.ends_with("session") {
+            "POST"
+        } else {
+            "GET"
+        };
+        assert_eq!(
+            send(&router, method, path, &[("host", host), ("origin", origin)])
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    assert_eq!(
+        send(
+            &router,
+            "POST",
+            "/api/admin/session",
+            &[
+                ("host", host),
+                ("origin", origin),
+                ("authorization", "Bearer definitely-wrong-root"),
+            ],
+        )
+        .await
+        .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    for (test_host, test_origin) in [
+        (None, Some(origin)),
+        (Some("evil.invalid:30880"), Some(origin)),
+        (Some("192.168.1.128:30880"), Some(origin)),
+        (Some("192.168.1.127:8080"), Some(origin)),
+        (Some(host), None),
+        (Some(host), Some("http://evil.invalid:30880")),
+        (Some(host), Some("http://192.168.1.128:30880")),
+        (Some(host), Some("https://192.168.1.127:30880")),
+        (Some(host), Some("http://192.168.1.127:30880/")),
+        (Some(host), Some("null")),
+    ] {
+        let mut headers = vec![
+            ("authorization", authorization.as_str()),
+            ("x-forwarded-host", host),
+            ("x-forwarded-proto", "http"),
+            ("x-forwarded-for", "192.168.1.10"),
+        ];
+        if let Some(value) = test_host {
+            headers.push(("host", value));
+        }
+        if let Some(value) = test_origin {
+            headers.push(("origin", value));
+        }
+        assert_eq!(
+            send(&router, "POST", "/api/admin/session", &headers)
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+    for duplicate in ["host", "origin"] {
+        assert_eq!(
+            send(
+                &router,
+                "POST",
+                "/api/admin/session",
+                &[
+                    ("host", host),
+                    ("origin", origin),
+                    ("authorization", &authorization),
+                    (duplicate, if duplicate == "host" { host } else { origin }),
+                ],
+            )
+            .await
+            .status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    let response = send(
+        &router,
+        "POST",
+        "/api/admin/session",
+        &[
+            ("host", host),
+            ("origin", origin),
+            ("authorization", &authorization),
+        ],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let cookie = assert_http_cookie(&response, 28800);
+    let browser_headers = [
+        ("host", host),
+        ("origin", origin),
+        ("cookie", cookie.as_str()),
+    ];
+    assert_eq!(
+        send(&router, "GET", "/api/accounts", &browser_headers)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    // Preserve existing read policy: Origin is optional for GET, authentication is not.
+    for authenticated in [false, true] {
+        let mut headers = vec![("host", host)];
+        if authenticated {
+            headers.push(("cookie", cookie.as_str()));
+        }
+        assert_eq!(
+            send(&router, "GET", "/api/accounts", &headers)
+                .await
+                .status(),
+            if authenticated {
+                StatusCode::OK
+            } else {
+                StatusCode::UNAUTHORIZED
+            }
+        );
+    }
+    for (test_host, test_origin) in [
+        (None, Some(origin)),
+        (Some("192.168.1.128:30880"), Some(origin)),
+        (Some(host), None),
+        (Some(host), Some("http://192.168.1.128:30880")),
+    ] {
+        let mut headers = vec![("cookie", cookie.as_str())];
+        if let Some(value) = test_host {
+            headers.push(("host", value));
+        }
+        if let Some(value) = test_origin {
+            headers.push(("origin", value));
+        }
+        assert_eq!(
+            send(&router, "DELETE", "/api/admin/session", &headers)
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+    assert_eq!(
+        send(&router, "GET", "/api/accounts", &browser_headers)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    let response = send(&router, "DELETE", "/api/admin/session", &browser_headers).await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(assert_http_cookie(&response, 0), "session_token=");
+    for (method, path) in [("GET", "/api/accounts"), ("DELETE", "/api/admin/session")] {
+        assert_eq!(
+            send(&router, method, path, &browser_headers).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    assert!(!app.config.state_path.exists());
+    app.shutdown().await;
+}
+
+#[tokio::test]
 async fn session_auth_origin_host_no_store_and_unknown_routes() {
     let f = Fixture::new(false).await;
     let response = f

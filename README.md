@@ -52,7 +52,10 @@ chmod 600 config.toml
   - `GET /v1/models` 在上游返回 200 OK 且体积 $\le 2\text{ MiB}$ 时，精确过滤 13 个指定模型 ID，保留其余模型顺序与属性并重算 `Content-Length`，不拦截客户端推理请求参数。
 - **可选运行时配置**：
   - `container_mode = false`（默认 false）：仅当显式设为 `true` 时，采用 Rust subreaper 监督进程（supervisor）模式管理 helper 进程树，支持绑定非回环地址；本地非容器环境（`false`）仍使用 Linux `unshare` 沙箱。
-  - `cookie_secure = false`（默认 false）：在远程反向代理与 HTTPS 部署时应设为 `true`。
+  - `cookie_secure = false`（默认 false）：非回环 HTTPS 部署必须设为 `true`。
+  - `allow_insecure_lan_http = false`（默认 false）：仅显式启用且 `container_mode = true`、`cookie_secure = false` 时，允许 `192.168.0.0/16` 内的 IPv4 字面量 HTTP origin。例如 `allowed_origin = ["http://192.168.1.127:30880"]`；浏览器地址必须与此精确匹配。不会允许整个网段的 Host/Origin，不支持主机名、其他私网段、公共 IPv4 或 IPv6，也不根据转发头改写 origin。
+    - **明文风险**：此模式下 root key、账号密码、会话 Cookie 与 API 流量在 LAN 链路上均不加密，可被监听或篡改；`HttpOnly`、`SameSite=Strict` 与既有鉴权/CSRF 检查仍保留，但不提供传输加密。推荐 HTTPS；仅在明确接受风险的可信 LAN 中使用。
+    - **必须另行配置 LAN 防火墙**，限制入站来源与访问端口，禁止公网暴露/端口转发。此开关只校验配置的 origin，**不是网络防火墙，也不校验请求来源 IP**；容器或 NodePort 发布后的访问范围由部署侧防火墙负责。
   - `browser_helper_executable`：支持指定用于运行 helper 的 Python 解释器绝对路径。
 - **优雅停机**：原生捕获 `SIGTERM` 与 `SIGINT` 信号，在 10 秒内清理后台跟踪任务，15 秒内排空 HTTP 请求后退出。
 

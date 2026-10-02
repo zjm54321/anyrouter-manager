@@ -1,5 +1,6 @@
 # syntax=docker/dockerfile:1
-# Internal-use image only: CloakBrowser binaries have separate proprietary terms.
+# Public delivery relies on owner-confirmed permission for the pinned CloakBrowser binary.
+# Its separate proprietary terms still apply; see THIRD_PARTY_NOTICES.md.
 # Build only linux/amd64; application dependencies remain locked, base tags track updates.
 FROM node:24-bookworm-slim AS frontend
 WORKDIR /build/frontend
@@ -13,7 +14,7 @@ WORKDIR /build/backend
 COPY backend/Cargo.toml backend/Cargo.lock ./
 COPY backend/src/ ./src/
 COPY docker/rust-tests.sh /build/rust-tests.sh
-# Execute 13 reviewed pure tests; production supervisor probes run on the loaded image.
+# Execute 17 reviewed pure tests; production supervisor probes run on the loaded image.
 RUN /bin/sh /build/rust-tests.sh && cargo build --locked --release
 
 FROM python:3.13-slim-bookworm AS helper
@@ -54,7 +55,7 @@ FROM python:3.13-slim-bookworm AS runtime
 # The label describes original application code, not the separately licensed browser.
 LABEL org.opencontainers.image.title="AnyRouter Manager" \
       org.opencontainers.image.licenses="GPL-3.0-or-later" \
-      dev.anyrouter.browser-license="CloakBrowser Binary License; internal-use image only"
+      dev.anyrouter.browser-license="CloakBrowser Binary License v1.0; separate redistribution permission required; see /app/THIRD_PARTY_NOTICES.md"
 # hadolint ignore=DL3008
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates tini util-linux fonts-liberation fonts-noto-cjk fonts-noto-color-emoji \
