@@ -27,6 +27,12 @@ pub struct LoginDiagnostics {
     pending_login: bool,
     failure_request: FailureRequest,
     exception: Exception,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    action: Option<Action>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    action_timeout_ms: Option<ActionMillis>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    action_elapsed_ms: Option<ActionMillis>,
 }
 
 impl LoginDiagnostics {
@@ -52,6 +58,9 @@ impl LoginDiagnostics {
             pending_login: false,
             failure_request: FailureRequest::None,
             exception: Exception::Timeout,
+            action: None,
+            action_timeout_ms: None,
+            action_elapsed_ms: None,
         }
     }
 }
@@ -141,6 +150,35 @@ enum Exception {
     Unexpected,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum Action {
+    NoticeClose,
+    NoticeWaitHidden,
+    SubmitTrial,
+    PageRecheck,
+    SubmitClick,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(try_from = "u64", into = "u64")]
+struct ActionMillis(u64);
+impl TryFrom<u64> for ActionMillis {
+    type Error = &'static str;
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        if value <= 120_000 {
+            Ok(Self(value))
+        } else {
+            Err("Invalid diagnostic action duration.")
+        }
+    }
+}
+impl From<ActionMillis> for u64 {
+    fn from(value: ActionMillis) -> Self {
+        value.0
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn fixture() -> serde_json::Value {
     serde_json::json!({
@@ -200,6 +238,41 @@ mod tests {
             let mut boundary = fixture();
             boundary["login_status"] = json!(value);
             assert!(serde_json::from_value::<LoginDiagnostics>(boundary).is_ok());
+        }
+    }
+
+    #[test]
+    fn optional_action_fields_preserve_v1_and_reject_unsafe_values() {
+        let old = fixture();
+        let parsed: LoginDiagnostics = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), old);
+        for action in [
+            "notice_close",
+            "notice_wait_hidden",
+            "submit_trial",
+            "page_recheck",
+            "submit_click",
+        ] {
+            let mut value = fixture();
+            value["phase"] = json!("submit");
+            value["action"] = json!(action);
+            value["action_timeout_ms"] = json!(120000);
+            value["action_elapsed_ms"] = json!(0);
+            let parsed: LoginDiagnostics = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(serde_json::to_value(parsed).unwrap(), value);
+        }
+        for (key, bad) in [
+            ("action", json!("secret-selector")),
+            ("action_elapsed_ms", json!(-1)),
+            ("action_timeout_ms", json!(120001)),
+            ("action_elapsed_ms", json!(true)),
+            ("action_elapsed_ms", json!(1.5)),
+            ("action_timeout_ms", json!("secret")),
+            ("action_exception", json!("secret-password")),
+        ] {
+            let mut value = fixture();
+            value[key] = bad;
+            assert!(serde_json::from_value::<LoginDiagnostics>(value).is_err());
         }
     }
 }

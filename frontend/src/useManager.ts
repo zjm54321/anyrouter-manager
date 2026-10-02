@@ -532,11 +532,14 @@ export function useManager() {
     if (completedOperation && session === "open") {
       void loadGlobalCheckin();
       void loadLogs();
+      // Completion is recorded once by the current-session account reader.
+      // Log failures stay in systemLogsError, separate from the login outcome.
+      if (completedOperation.kind === "login") void loadSystemLogs();
       if (selectedAccountRef.current) {
         void loadAccountCheckin(selectedAccountRef.current);
       }
     }
-  }, [completedOperation, session, loadGlobalCheckin, loadLogs, loadAccountCheckin]);
+  }, [completedOperation, session, loadGlobalCheckin, loadLogs, loadSystemLogs, loadAccountCheckin]);
 
   // Check candidate expiration every second
   useEffect(() => {

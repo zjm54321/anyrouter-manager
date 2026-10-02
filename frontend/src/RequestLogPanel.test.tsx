@@ -2,6 +2,7 @@ import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { RequestLogPanel, formatLogTime } from "./RequestLogPanel";
 import type { RequestLogEntry } from "./accountsTypes";
+import type { LoginDiagnostics, SystemLogsResponse } from "./api";
 
 function makeLog(partial: Partial<RequestLogEntry>): RequestLogEntry {
   return {
@@ -126,5 +127,54 @@ describe("RequestLogPanel", () => {
   it("panel-level error notice renders safely", () => {
     render(<RequestLogPanel logs={[]} error="日志服务暂时不可用" />);
     expect(screen.getByRole("alert")).toHaveTextContent("日志服务暂时不可用");
+  });
+
+  it.each(["legacy", "null", "measured"] as const)("existing diagnostics detail renders structured %s action metadata", mode => {
+    const diagnostics: LoginDiagnostics = {
+      version: 1, phase: "submit", page: "login",
+      login_requested: false, login_status: null, login_json: false, login_success: null,
+      self_requested: false, self_status: null, self_json: false, self_success: null,
+      self_id_type: "absent", self_id_valid: false, self_user_header_present: false,
+      user_state_ready: false, pending_login: false, failure_request: "none", exception: "timeout",
+    };
+    if (mode !== "legacy") {
+      diagnostics.action = mode === "null" ? null : "submit_trial";
+      diagnostics.action_timeout_ms = mode === "null" ? null : 1500;
+      diagnostics.action_elapsed_ms = mode === "null" ? null : 1499;
+    }
+    const systemLogs: SystemLogsResponse = {
+      items: [{
+        id: "synthetic-helper-result", timestamp: "2026-10-01T02:00:00Z",
+        level: "debug", event: "helper_result", operation_id: "synthetic-login",
+        account_id: null, stage: "helper_result", elapsed_ms: 28000,
+        http_status: null, reason: null, diagnostics,
+      }],
+      dropped_count: 0,
+    };
+    const refresh = vi.fn();
+    render(<RequestLogPanel logs={[]} systemLogs={systemLogs} onRefreshSystemLogs={refresh} />);
+    fireEvent.click(screen.getByRole("button", { name: /系统运行日志/ }));
+    const button = screen.getByRole("button", { name: "诊断" });
+    expect(button).toHaveAttribute("aria-expanded", "false");
+    fireEvent.click(button);
+    const region = screen.getByRole("region", { name: "诊断详情 · helper_result" });
+    const text = region.querySelector("pre")?.textContent;
+    expect(text).toBe(JSON.stringify(diagnostics, null, 2));
+    expect(text).toContain('"phase": "submit"');
+    expect(text).toContain('"exception": "timeout"');
+    if (mode === "measured") {
+      expect(text).toContain('"action": "submit_trial"');
+      expect(text).toContain('"action_timeout_ms": 1500');
+      expect(text).toContain('"action_elapsed_ms": 1499');
+    } else if (mode === "null") {
+      expect(text).toContain('"action": null');
+      expect(text).toContain('"action_timeout_ms": null');
+      expect(text).toContain('"action_elapsed_ms": null');
+    } else {
+      expect(text).not.toContain('"action');
+    }
+    expect(refresh).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "关闭" }));
+    expect(screen.queryByRole("region", { name: "诊断详情 · helper_result" })).not.toBeInTheDocument();
   });
 });

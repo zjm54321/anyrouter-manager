@@ -519,6 +519,43 @@ class LoginTests(unittest.IsolatedAsyncioTestCase):
 
 class RegressionTests(unittest.IsolatedAsyncioTestCase):
     execute = LoginTests.execute
+    async def test_submit_substep_timeout_attribution(self):
+        from playwright.async_api import TimeoutError as PlaywrightTimeout
+        for action in ('submit_trial', 'page_recheck', 'submit_click'):
+            page = FakePage(response())
+            submit = page.locator(core.SUBMIT_SELECTORS[0])
+            original_click = submit.click.side_effect
+            trial_done = False
+            async def click(**kwargs):
+                nonlocal trial_done
+                if kwargs.get('trial'):
+                    if action == 'submit_trial':
+                        raise PlaywrightTimeout(SECRET)
+                    trial_done = True
+                    return
+                if action == 'submit_click':
+                    raise PlaywrightTimeout(SECRET)
+                await original_click(**kwargs)
+            submit.click = AsyncMock(side_effect=click)
+            original_check = core.require_safe_page
+            async def check(p, state):
+                if action == 'page_recheck' and trial_done:
+                    raise PlaywrightTimeout(SECRET)
+                return await original_check(p, state)
+            with patch.dict(os.environ, {'BROWSER_HELPER_DIAGNOSTICS': '1'}), patch.object(core, 'require_safe_page', check):
+                result = await self.execute(page)
+            diagnostic = result['diagnostics']
+            self.assertEqual(diagnostic['action'], action)
+            self.assertEqual(diagnostic['phase'], 'submit')
+            self.assertEqual(diagnostic['exception'], 'timeout')
+            self.assertTrue(0 <= diagnostic['action_elapsed_ms'] <= 120000)
+            if action == 'page_recheck':
+                self.assertNotIn('action_timeout_ms', diagnostic)
+            else:
+                self.assertTrue(0 < diagnostic['action_timeout_ms'] <= 5000)
+            self.assertNotIn(SECRET, json.dumps(result))
+            self.context.close.assert_awaited_once()
+
     async def test_non_json_login_error_is_safe_and_challenge_specific(self):
         for challenged in (False, True):
             page = FakePage(response())
@@ -643,6 +680,10 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result['error'], 'user_self_unverified' if phase == 'profile_wait' else 'timeout')
             self.assertEqual(result['diagnostics']['phase'], phase)
             self.assertEqual(result['diagnostics']['exception'], 'timeout')
+            if phase == 'submit':
+                self.assertEqual(result['diagnostics']['action'], 'submit_click')
+            else:
+                self.assertNotIn('action', result['diagnostics'])
             self.context.close.assert_awaited_once()
             self.assertLessEqual(page.locator(core.SUBMIT_SELECTORS[0]).click.await_count, 1)
 

@@ -12,6 +12,7 @@ for name in \
     config::tests::insecure_lan_http_requires_all_switches_and_exact_ipv4_range \
     config::tests::insecure_lan_opt_in_preserves_https_and_loopback_policy \
     diagnostics::tests::exact_schema_roundtrip_and_strict_bounds \
+    diagnostics::tests::optional_action_fields_preserve_v1_and_reject_unsafe_values \
     error::tests::source_metadata_is_finite_and_absent_by_default \
     app::runtime_tests::secure_cookie_has_same_creation_deletion_policy \
     helper::container_command_is_explicit_and_native_command_keeps_namespace \

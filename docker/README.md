@@ -167,9 +167,9 @@ also evaluates automatic-push/public/default-main conditions and runs the public
 shell against a fake Docker CLI, including changed-ID and push-failure cases.
 The workflow additionally builds
 the image, runs frontend tests/typecheck/build and Python mock tests, and executes
-17 explicitly whitelisted pure/in-process Rust tests using `cargo test --locked ... --exact`.
+18 explicitly whitelisted pure/in-process Rust tests using `cargo test --locked ... --exact`.
 The Rust binary test target is compiled/listed, but compilation is not execution.
-The gate reports executed and deferred counts dynamically (17 whitelisted tests,
+The gate reports executed and deferred counts dynamically (18 whitelisted tests,
 including the four LAN-HTTP config and in-process session tests;
 all other listed binary tests are deferred). Integration tests are not copied into or executed by the Docker build;
 the full Rust regression suite is not implied by this gate. Namespace-dependent

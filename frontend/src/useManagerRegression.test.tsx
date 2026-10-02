@@ -1,7 +1,7 @@
 import { StrictMode } from "react";
 import { act, cleanup, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { AccountDTO, AccountsResponse, OperationDTO } from "./api";
+import type { AccountDTO, AccountsResponse, OperationDTO, SystemLogsResponse } from "./api";
 import { useManager } from "./useManager";
 
 function deferred<T>() {
@@ -22,6 +22,12 @@ const operation = (id: string, kind: OperationDTO["kind"], status: OperationDTO[
 const json = (value: unknown, status = 200) => new Response(status === 204 ? null : JSON.stringify(value), { status, headers: { "Content-Type": "application/json" } });
 const settings = { level: "info", system_retention_days: 7, request_retention_days: 7 };
 const checkin = (id: string) => ({ account_id: id, cycle_date: "2026-10-01", today: null, history: [], next_run_at: null });
+const systemPage = (id: string): SystemLogsResponse => ({
+  items: [{ id, timestamp: "2026-10-01T12:00:00Z", level: "info", event: "login_finish",
+    operation_id: "login-1", account_id: null, stage: "helper_result", elapsed_ms: 28000,
+    http_status: null, reason: "deadline_expired", diagnostics: null }],
+  dropped_count: 0,
+});
 let snapshot: AccountsResponse;
 let readAccounts: () => Promise<Response>;
 let custom: (path: string, init: RequestInit) => Promise<Response> | undefined;
@@ -72,6 +78,7 @@ async function mount() {
   expect(hook.result.current.session).toBe("open");
   return hook;
 }
+const systemLogReads = () => fetchMock.mock.calls.filter(([path]) => path === "/api/system-logs").length;
 
 describe("production manager async regressions (local fetch fixtures only)", () => {
   it("completes candidate polling with every read slower than 1000ms and no overlapping GETs", async () => {
@@ -237,6 +244,157 @@ describe("production manager async regressions (local fetch fixtures only)", () 
     await act(async () => { await hook.result.current.clearSystemLogs(); });
     await act(async () => { stale.resolve(json({ items: [], dropped_count: 99 })); });
     expect(hook.result.current.systemLogs?.dropped_count).toBe(0);
+  });
+
+  it.each([
+    ["succeeded", false], ["failed", false],
+    ["succeeded", true], ["failed", true],
+  ] as const)("refreshes logs exactly once for %s login (immediate completion: %s)", async (status, immediate) => {
+    const hook = await mount();
+    const initialReads = systemLogReads();
+    const terminal = operation("login-1", "login", status);
+    if (immediate) snapshot.operation = terminal;
+    await act(async () => { await hook.result.current.addAccount({ username: "fixture", password: "fixture" }); });
+    if (!immediate) {
+      expect(systemLogReads()).toBe(initialReads);
+      snapshot.operation = operation("login-1", "login", "running");
+      await tick(1000);
+      expect(systemLogReads()).toBe(initialReads);
+      snapshot.operation = terminal;
+      await tick(1000);
+    }
+    expect(hook.result.current.state.operation?.status).toBe(status);
+    expect(systemLogReads()).toBe(initialReads + 1);
+    await act(async () => { await hook.result.current.load(); await hook.result.current.load(); });
+    await tick(5000);
+    expect(systemLogReads()).toBe(initialReads + 1);
+    expect(posts).toEqual(["/api/accounts/login"]);
+  });
+
+  it.each(["succeeded", "failed"] as const)("refreshes once when an observed login becomes %s under StrictMode", async status => {
+    snapshot.operation = operation("login-1", "login", "running");
+    const hook = renderHook(() => useManager(), { wrapper: StrictMode });
+    await flush();
+    const initialReads = systemLogReads();
+    snapshot.operation = operation("login-1", "login", status);
+    await tick(1000);
+    expect(systemLogReads()).toBe(initialReads + 1);
+    await act(async () => { await hook.result.current.load(); });
+    await tick(3000);
+    expect(systemLogReads()).toBe(initialReads + 1);
+    expect(posts).toEqual([]);
+  });
+
+  it.each(["refresh", "save", "select_key", "checkin"] as const)("does not refresh system logs for terminal %s", async kind => {
+    snapshot.operation = operation("other-1", kind, "running", "a");
+    await mount();
+    const initialReads = systemLogReads();
+    snapshot.operation = operation("other-1", kind, "succeeded", "a");
+    await tick(1000);
+    expect(systemLogReads()).toBe(initialReads);
+  });
+
+  it.each(["http", "network"] as const)("keeps prior logs and the original login failure when log refresh fails (%s)", async failure => {
+    const previous = systemPage("previous-log");
+    custom = path => path === "/api/system-logs" ? Promise.resolve(json(previous)) : undefined;
+    const hook = await mount();
+    expect(hook.result.current.systemLogs).toEqual(previous);
+    custom = path => path === "/api/system-logs"
+      ? failure === "http" ? Promise.resolve(json({ error: { code: "logging_unavailable", message: "Logging unavailable." } }, 503))
+        : Promise.reject(new TypeError("Local mock network failure"))
+      : undefined;
+    const originalError = { code: "upstream_timeout", message: "上游浏览器登录流程超时。" };
+    snapshot.operation = { ...operation("login-1", "login", "failed"), error: originalError };
+    await act(async () => { await hook.result.current.addAccount({ username: "fixture", password: "fixture" }); });
+    expect(hook.result.current.state.operation?.error).toEqual(originalError);
+    expect(hook.result.current.systemLogs).toEqual(previous);
+    expect(hook.result.current.systemLogsError).toBe("无法读取系统日志，请检查后端状态后重试");
+    expect(hook.result.current.systemLogsLoading).toBe(false);
+    expect(hook.result.current.notice).toBe("");
+    expect(hook.result.current.session).toBe("open");
+    custom = path => path === "/api/system-logs" ? Promise.resolve(json({ items: [], dropped_count: 0 })) : undefined;
+    await act(async () => { await hook.result.current.loadSystemLogs(); });
+    expect(hook.result.current.systemLogs).toEqual({ items: [], dropped_count: 0 });
+    expect(hook.result.current.systemLogsError).toBeNull();
+    expect(hook.result.current.state.operation?.error).toEqual(originalError);
+  });
+
+  it("still locks the session on a current system-log 401", async () => {
+    const hook = await mount();
+    custom = path => path === "/api/system-logs" ? Promise.resolve(json(null, 401)) : undefined;
+    await act(async () => { await hook.result.current.loadSystemLogs(); });
+    expect(hook.result.current.session).toBe("locked");
+    expect(hook.result.current.systemLogs).toBeNull();
+    expect(hook.result.current.systemLogsError).toBeNull();
+  });
+
+  it.each([false, true])("late login completion cannot refresh logs after logout (replacement session: %s)", async reopen => {
+    const hook = await mount();
+    await act(async () => { await hook.result.current.addAccount({ username: "fixture", password: "fixture" }); });
+    const late = deferred<Response>();
+    readAccounts = () => late.promise;
+    act(() => { void hook.result.current.load(); });
+    await act(async () => { await hook.result.current.logout(); });
+    if (reopen) {
+      snapshot = base();
+      readAccounts = async () => json(snapshot);
+      await act(async () => { await hook.result.current.unlock("only-local-root-fixture"); });
+    }
+    const callsBeforeLate = fetchMock.mock.calls.length;
+    const logsBeforeLate = hook.result.current.systemLogs;
+    await act(async () => { late.resolve(json({ ...base(), operation: operation("login-1", "login", "failed") })); });
+    await tick(3000);
+    expect(fetchMock.mock.calls).toHaveLength(callsBeforeLate);
+    expect(hook.result.current.systemLogs).toEqual(logsBeforeLate);
+    expect(hook.result.current.systemLogsError).toBeNull();
+    expect(hook.result.current.state.operation).toBeNull();
+    expect(hook.result.current.session).toBe(reopen ? "open" : "locked");
+  });
+
+  it("late login acceptance after logout cannot read accounts or logs", async () => {
+    const hook = await mount();
+    const late = deferred<Response>();
+    custom = path => path === "/api/accounts/login" ? late.promise : undefined;
+    let add!: Promise<void>;
+    act(() => { add = hook.result.current.addAccount({ username: "fixture", password: "fixture" }); });
+    await act(async () => { await hook.result.current.logout(); });
+    const callsBeforeLate = fetchMock.mock.calls.length;
+    await act(async () => { late.resolve(json({ operation_id: "login-1" }, 202)); await add; });
+    await tick(3000);
+    expect(fetchMock.mock.calls).toHaveLength(callsBeforeLate);
+    expect(hook.result.current.session).toBe("locked");
+    expect(hook.result.current.systemLogs).toBeNull();
+  });
+
+  it.each(["success", "http", "network", "unauthorized"] as const)("discards old-session terminal-login log responses (%s)", async outcome => {
+    const hook = await mount();
+    const late = deferred<Response>();
+    let oldSignal: AbortSignal | null | undefined;
+    custom = (path, init) => {
+      if (path !== "/api/system-logs") return undefined;
+      oldSignal = init.signal;
+      return late.promise;
+    };
+    snapshot.operation = operation("login-1", "login", "failed");
+    await act(async () => { await hook.result.current.addAccount({ username: "fixture", password: "fixture" }); });
+    expect(hook.result.current.systemLogsLoading).toBe(true);
+    await act(async () => { await hook.result.current.logout(); });
+    expect(oldSignal?.aborted).toBe(true);
+    snapshot = base();
+    const current = systemPage("current-session");
+    custom = path => path === "/api/system-logs" ? Promise.resolve(json(current)) : undefined;
+    await act(async () => { await hook.result.current.unlock("only-local-root-fixture"); });
+    expect(hook.result.current.systemLogs).toEqual(current);
+    const callsBeforeLate = fetchMock.mock.calls.length;
+    await act(async () => {
+      if (outcome === "network") late.reject(new TypeError("Local mock network failure"));
+      else late.resolve(json(systemPage("old-session"), outcome === "http" ? 503 : outcome === "unauthorized" ? 401 : 200));
+    });
+    expect(fetchMock.mock.calls).toHaveLength(callsBeforeLate);
+    expect(hook.result.current.systemLogs).toEqual(current);
+    expect(hook.result.current.systemLogsError).toBeNull();
+    expect(hook.result.current.systemLogsLoading).toBe(false);
+    expect(hook.result.current.session).toBe("open");
   });
 
   it("settings save cannot be overwritten by an earlier settings GET", async () => {

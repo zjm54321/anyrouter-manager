@@ -11,6 +11,7 @@ import re
 import secrets
 import time
 from dataclasses import dataclass
+from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -65,6 +66,23 @@ DIAGNOSTIC_ENUMS = {
 }
 DIAGNOSTIC_BOOLS = ('login_requested', 'login_json', 'self_requested', 'self_json',
                     'self_id_valid', 'self_user_header_present', 'user_state_ready', 'pending_login')
+DIAGNOSTIC_ACTIONS = ('notice_close', 'notice_wait_hidden', 'submit_trial', 'page_recheck', 'submit_click')
+
+
+@contextmanager
+def diagnostic_action(state, action, timeout_ms=None):
+    """Observe existing operations without changing their budgets or exceptions."""
+    active = state.get('phase') == 'submit'
+    if active:
+        # The process watchdog may exit without finally: unknown is not zero.
+        state.pop('action_elapsed_ms', None)
+        state.update(action=action, action_timeout_ms=timeout_ms)
+        started = time.monotonic()
+    try:
+        yield
+    finally:
+        if active:
+            state['action_elapsed_ms'] = min(MAX_TIMEOUT_MS, max(0, int((time.monotonic() - started) * 1000)))
 
 
 def diagnostics(state):
@@ -81,6 +99,12 @@ def diagnostics(state):
     for key in ('login_success', 'self_success'):
         value = state.get(key)
         result[key] = value if type(value) is bool else None
+    if state.get('phase') == 'submit' and state.get('action') in DIAGNOSTIC_ACTIONS:
+        result['action'] = state['action']
+        for key in ('action_timeout_ms', 'action_elapsed_ms'):
+            value = state.get(key)
+            if type(value) is int and 0 <= value <= MAX_TIMEOUT_MS:
+                result[key] = value
     return result
 
 
@@ -389,8 +413,12 @@ async def dismiss_notice_once(page, state):
     if not await close.is_visible() or not await close.is_enabled():
         return False
     state['notice_dismiss_attempted'] = True
-    await close.click(timeout=action_timeout(state))
-    await dialog.wait_for(state='hidden', timeout=action_timeout(state))
+    timeout = action_timeout(state)
+    with diagnostic_action(state, 'notice_close', timeout):
+        await close.click(timeout=timeout)
+    timeout = action_timeout(state)
+    with diagnostic_action(state, 'notice_wait_hidden', timeout):
+        await dialog.wait_for(state='hidden', timeout=timeout)
     return True
 
 
@@ -573,13 +601,20 @@ async def login_work(credentials, launch, resources, state):
             raise Failure('login_form_unavailable')
         state['phase'] = 'submit'
         await dismiss_notice_once(page, state)
-        await submit.click(trial=True, timeout=action_timeout(state))
-        if not safe_url(page.url, '/login') or await require_safe_page(page, state):
-            raise Failure('challenge_or_block')
+        timeout = action_timeout(state)
+        with diagnostic_action(state, 'submit_trial', timeout):
+            await submit.click(trial=True, timeout=timeout)
+        with diagnostic_action(state, 'page_recheck'):
+            if not safe_url(page.url, '/login') or await require_safe_page(page, state):
+                raise Failure('challenge_or_block')
         state['submitted'] = True
         # Never retry submit: a timed out click may already have sent credentials.
-        await submit.click(timeout=action_timeout(state))
+        timeout = action_timeout(state)
+        with diagnostic_action(state, 'submit_click', timeout):
+            await submit.click(timeout=timeout)
         state['phase'] = 'profile_wait'
+        for key in ('action', 'action_timeout_ms', 'action_elapsed_ms'):
+            state.pop(key, None)
         navigated = False
         previous_ready = None
         ready_samples = 0

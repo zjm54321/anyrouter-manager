@@ -147,6 +147,34 @@ export interface LogSettings {
   request_retention_days: number;
 }
 
+// Exact version-1 metadata serialized by backend/src/diagnostics.rs.
+// Core nullable fields are present on the wire; the backend validates statuses as 100–599.
+export interface LoginDiagnostics {
+  version: 1;
+  phase: "launch" | "navigation" | "form_wait" | "fill" | "submit" | "profile_wait" | "cookie_read" | "done";
+  page: "login" | "console" | "other";
+  login_requested: boolean;
+  login_status: number | null;
+  login_json: boolean;
+  login_success: boolean | null;
+  self_requested: boolean;
+  self_status: number | null;
+  self_json: boolean;
+  self_success: boolean | null;
+  self_id_type: "absent" | "integer" | "string" | "other";
+  self_id_valid: boolean;
+  self_user_header_present: boolean;
+  user_state_ready: boolean;
+  pending_login: boolean;
+  failure_request: "none" | "navigation" | "login" | "self" | "resource";
+  exception: "none" | "timeout" | "navigation_transient" | "network" | "unexpected";
+  // Optional v1 action metadata: absent fields stay absent; null is also accepted.
+  action?: "notice_close" | "notice_wait_hidden" | "submit_trial" | "page_recheck" | "submit_click" | null;
+  // The backend validates non-null durations as integers in 0–120000 ms.
+  action_timeout_ms?: number | null;
+  action_elapsed_ms?: number | null;
+}
+
 export interface SystemEvent {
   id: string;
   timestamp: string;
@@ -158,7 +186,7 @@ export interface SystemEvent {
   elapsed_ms: number | null;
   http_status: number | null;
   reason: string | null;
-  diagnostics: string | null;
+  diagnostics: LoginDiagnostics | null;
 }
 
 export interface SystemLogsResponse {
@@ -420,14 +448,7 @@ export async function fetchSystemLogs(
   if (params?.operation_id) query.set("operation_id", params.operation_id);
   const qStr = query.toString();
   const endpoint = `/api/system-logs${qStr ? `?${qStr}` : ""}`;
-  try {
-    return await request<SystemLogsResponse>(endpoint, { signal });
-  } catch (error) {
-    if (error instanceof ApiError && error.status === 401) {
-      throw error;
-    }
-    return { items: [], dropped_count: 0 };
-  }
+  return request<SystemLogsResponse>(endpoint, { signal });
 }
 
 export async function clearSystemLogs(signal?: AbortSignal): Promise<void> {

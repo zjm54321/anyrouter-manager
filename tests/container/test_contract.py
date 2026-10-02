@@ -103,6 +103,7 @@ def main():
         "config::tests::insecure_lan_http_requires_all_switches_and_exact_ipv4_range": "config.rs",
         "config::tests::insecure_lan_opt_in_preserves_https_and_loopback_policy": "config.rs",
         "diagnostics::tests::exact_schema_roundtrip_and_strict_bounds": "diagnostics.rs",
+        "diagnostics::tests::optional_action_fields_preserve_v1_and_reject_unsafe_values": "diagnostics.rs",
         "error::tests::source_metadata_is_finite_and_absent_by_default": "error.rs",
         "app::runtime_tests::secure_cookie_has_same_creation_deletion_policy": "app.rs",
         "helper::container_command_is_explicit_and_native_command_keeps_namespace": "helper.rs",
@@ -116,7 +117,7 @@ def main():
         "helper::tests::session_payload_expired_is_not_malformed_but_unsafe_fields_still_are": "helper.rs",
     }
     selected = re.findall(r"^    ([a-zA-Z_][\w:]*)[ \t]*\\?$", rust, re.M)
-    assert len(selected) == len(expected) == 17 and set(selected) == set(expected)
+    assert len(selected) == len(expected) == 18 and set(selected) == set(expected)
     assert f"# Execute {len(expected)} reviewed pure tests;" in docker
     for name, source in expected.items():
         assert name in rust
