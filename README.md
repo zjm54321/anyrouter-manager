@@ -104,4 +104,4 @@ npm --prefix frontend test
 
 ## 许可证 (License)
 
-本项目原创代码基于 [GNU General Public License v3.0 or later (GPL-3.0-or-later)](LICENSE) 开源，第三方依赖许可证声明详见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+本项目原创代码基于 [GNU General Public License v3.0 or later (GPL-3.0-or-later)](LICENSE) 开源.
