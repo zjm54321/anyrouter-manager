@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from browser_probe import browser_failure
 
 ROOT = Path(__file__).resolve().parents[2]
 PROBES = ("http_probe.py", "supervisor_probe.py", "browser_probe.py")
@@ -47,11 +48,36 @@ def error_category(stderr):
     return "command_failed"
 
 
+def supervisor_failure(data):
+    """Untrusted probe stdout: bounded, exact schema, finite values only."""
+    try:
+        if len(data) > 4096:
+            return None
+        value = json.loads(data)
+        if (type(value) is not dict or not {'supervisor_probe', 'stage'} <= value.keys()
+                or value.keys() - {'supervisor_probe', 'stage', 'browser_failure'}
+                or value['supervisor_probe'] not in ('failed', 'blocked')
+                or value['stage'] not in ('capability', 'synthetic_normal', 'synthetic_timeout',
+                    'synthetic_cancel', 'synthetic_termination', 'synthetic_parent_death', 'browser_normal', 'browser_timeout')
+                or (value['supervisor_probe'] == 'blocked') != (value['stage'] == 'capability')):
+            return None
+        result = {'stage': value['stage']}
+        if 'browser_failure' in value:
+            detail = browser_failure(value['browser_failure'])
+            if value['stage'] not in ('browser_normal', 'browser_timeout') or detail is None:
+                return None
+            result['browser_failure'] = detail
+        return result
+    except (ValueError, TypeError, RecursionError):
+        return None
+
+
 class Evidence:
     def __init__(self):
         self.kind = "none"
         self.returncode = None
         self.category = "internal_error"
+        self.probe_failure = None
 
     def run(self, kind, args, **kwargs):
         self.kind, self.returncode, self.category = kind, None, "internal_error"
@@ -91,8 +117,11 @@ class Evidence:
                     exitcode = number if -255 <= number <= 255 else None
             except Exception:
                 pass
-        return {"cmdkind": self.kind, "returncode": self.returncode,
-                "category": self.category, "container_state": state, "container_exitcode": exitcode}
+        result = {"cmdkind": self.kind, "returncode": self.returncode,
+                  "category": self.category, "container_state": state, "container_exitcode": exitcode}
+        if self.probe_failure is not None:
+            result['probe_failure'] = self.probe_failure
+        return result
 
 
 def install_probe(name, probe, evidence):
@@ -114,6 +143,8 @@ def runtime_gate(name, evidence):
         install_probe(name, probe, evidence)
     result = evidence.run("supervisor_capability", ["docker", "exec", name, "python", "-B", "/tmp/supervisor_probe.py",
                       "--capability"], timeout=15)
+    if result.returncode:
+        evidence.probe_failure = supervisor_failure(result.stdout)
     if result.returncode == 2 and evidence.payload(result) == {
             "supervisor_probe": "blocked", "stage": "capability"}:
         return "blocked", "supervisor_capability", False
@@ -123,6 +154,8 @@ def runtime_gate(name, evidence):
     # The real image's Rust worker launches both fixtures and browser. The observer
     # checks pidfds at ACK receipt, before Docker rm can hide leaked descendants.
     result = evidence.run("supervisor_lifecycle", ["docker", "exec", name, "python", "-B", "/tmp/supervisor_probe.py"], timeout=150)
+    if result.returncode:
+        evidence.probe_failure = supervisor_failure(result.stdout)
     evidence.require_success(result)
     assert evidence.payload(result) == {
         "supervisor_probe": "passed", "modes": ["normal", "timeout", "cancel", "termination", "parent_death"],

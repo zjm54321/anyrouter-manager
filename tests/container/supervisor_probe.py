@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from browser_probe import browser_failure
 
 BACKEND = "/app/anyrouter-manager-backend"
 PYTHON = "/app/tools/browser-helper/.venv/bin/python"
@@ -144,6 +145,28 @@ def bridge(fd, directory):
         signal.pause()
 
 
+class LifecycleFailure(Exception):
+    def __init__(self, detail=None):
+        super().__init__()
+        self.detail = detail
+
+
+def exited_browser_failure(child):
+    """Only after cleanup: never wait on a pipe held by a live descendant."""
+    try:
+        if child.poll() is None:
+            return None
+        fd = child.stdout.fileno()
+        os.set_blocking(fd, False)
+        data = os.read(fd, 4097)
+        # Require EOF too: an exited worker alone does not prove all writers died.
+        if len(data) > 4096 or os.read(fd, 1) != b'':
+            return None
+        return browser_failure(json.loads(data))
+    except Exception:
+        return None
+
+
 def lifecycle(mode, browser=False):
     with tempfile.TemporaryDirectory(prefix="worker-probe-", dir="/tmp") as directory:
         directory = Path(directory)
@@ -151,6 +174,7 @@ def lifecycle(mode, browser=False):
         child = parent = None
         control = ack = output = worker_fd = parent_fd = None
         owned = []
+        failure = detail = None
         try:
             if mode == "parent_death":
                 outer, inner = socket.socketpair()
@@ -201,23 +225,39 @@ def lifecycle(mode, browser=False):
                 assert len(child.stdout.read(256 * 1024 + 1)) <= 256 * 1024
             # On parent death tini must reap the orphan worker in this container.
             wait_until(lambda: reaped(worker_fd))
+        except Exception as exc:
+            failure = exc
         finally:
             # Failure still propagates. Closing control asks Rust to clean up; no
             # observer kill of descendants or Docker rm can turn failure into pass.
-            if control is not None:
-                os.close(control)
-            if child:
-                try:
-                    child.wait(timeout=10)
-                except subprocess.TimeoutExpired:
-                    pass
-                child.stdout.close()
-            if parent and parent.poll() is None:
-                signal.pidfd_send_signal(parent_fd, signal.SIGKILL)
-                parent.wait(timeout=5)
-            for fd in [ack, output, worker_fd, parent_fd, *(fd for fd, _ in owned)]:
-                if fd is not None:
-                    os.close(fd)
+            try:
+                if control is not None:
+                    os.close(control)
+                if child:
+                    try:
+                        child.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        pass
+                if parent and parent.poll() is None:
+                    signal.pidfd_send_signal(parent_fd, signal.SIGKILL)
+                    parent.wait(timeout=5)
+                for fd in [ack, output, worker_fd, parent_fd, *(fd for fd, _ in owned)]:
+                    if fd is not None:
+                        os.close(fd)
+            except Exception as exc:
+                if failure is None:
+                    failure = exc
+            finally:
+                if child:
+                    if failure is not None and browser:
+                        detail = exited_browser_failure(child)
+                    try:
+                        child.stdout.close()
+                    except Exception as exc:
+                        if failure is None:
+                            failure = exc
+        if failure is not None:
+            raise LifecycleFailure(detail) from failure
 
 
 def main():
@@ -235,8 +275,11 @@ def main():
         for mode in BROWSER_MODES:
             stage = "browser_" + mode
             lifecycle(mode, browser=True)
-    except Exception:
-        print(json.dumps({"supervisor_probe": "blocked" if stage == "capability" else "failed", "stage": stage}))
+    except Exception as exc:
+        report = {"supervisor_probe": "blocked" if stage == "capability" else "failed", "stage": stage}
+        if isinstance(exc, LifecycleFailure) and exc.detail is not None:
+            report['browser_failure'] = exc.detail
+        print(json.dumps(report))
         return 2 if stage == "capability" else 1
     print(json.dumps({"supervisor_probe": "passed", "modes": MODES,
         "browser_modes": BROWSER_MODES, "identity": "pidfd", "ack_after_reap": True,

@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import runpy
+import sys
 import tomllib
 import tempfile
 from contextlib import redirect_stderr, redirect_stdout
@@ -24,6 +25,10 @@ def browser_notice_wiring():
     spec = importlib.util.spec_from_file_location("browser_probe", ROOT / "tests/container/browser_probe.py")
     adapter = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(adapter)
+    spec = importlib.util.spec_from_file_location("local_browser_smoke", ROOT / "tools/browser-helper/tests/local_browser_smoke.py")
+    fixture_module = importlib.util.module_from_spec(spec)
+    with patch.object(sys, 'path', sys.path.copy()):
+        spec.loader.exec_module(fixture_module)
     for scenario in ("normal", "timeout", "fixture_failure", "wrong_count", "render_failure",
                       "navigation_failure", "navigation_wrong_count", "self_failure", "self_wrong_count"):
         page = SimpleNamespace(goto=AsyncMock(), evaluate=AsyncMock(return_value=2),
@@ -66,24 +71,21 @@ def browser_notice_wiring():
         async def self_fixture(actual_browser, actual_context, actual_page, report):
             assert (actual_browser, actual_context, actual_page) == (browser, context, page)
             if scenario == "self_failure":
-                raise AssertionError("self_fixture_failed")
+                raise fixture_module.ProactiveSelfFailure('helper_result', 'user_self_unverified')
             report["native_proactive_self_cases"] = 0 if scenario == "self_wrong_count" else 1
 
         proactive = AsyncMock(side_effect=self_fixture)
         modules = {"browser_helper.core": SimpleNamespace(browser_launcher=launcher),
-                    "local_browser_smoke": SimpleNamespace(notice_backdrop_cases=invoke,
-                                                           navigation_readiness_case=navigation,
-                                                           proactive_self_case=proactive)}
+                     "local_browser_smoke": SimpleNamespace(notice_backdrop_cases=invoke,
+                                                            navigation_readiness_case=navigation,
+                                                            proactive_self_case=proactive,
+                                                            ProactiveSelfFailure=fixture_module.ProactiveSelfFailure)}
         with patch.dict("sys.modules", modules), patch.object(adapter.sys, "path", adapter.sys.path.copy()), \
                 patch.object(adapter.sys, "stdin", SimpleNamespace(buffer=io.BytesIO(b"{}\n"))), \
                 patch.object(adapter, "Path", side_effect=lambda name: ready if name == "ready" else finish), \
                 patch.object(adapter.asyncio, "sleep", sleep), redirect_stdout(io.StringIO()) as printed:
-            try:
-                asyncio.run(adapter.main())
-            except (AssertionError, RuntimeError):
-                assert scenario != "normal"
-            else:
-                assert scenario == "normal", "fixture failure swallowed"
+            status = asyncio.run(adapter.main())
+            assert status == (0 if scenario == "normal" else 1)
         launcher.assert_called_once_with()
         launch.assert_awaited_once_with(headless=True)
         ready.write_text.assert_called_once()
@@ -102,9 +104,136 @@ def browser_notice_wiring():
             context.close.assert_awaited_once()
             browser.close.assert_awaited_once()
         else:
-            assert printed.getvalue() == ""  # Rust must receive helper failure, not success.
+            failure = json.loads(printed.getvalue())
+            assert adapter.browser_failure(failure) == failure
+            assert failure['phase'] == {
+                'timeout': 'ready_wait', 'fixture_failure': 'notice', 'render_failure': 'notice',
+                'wrong_count': 'navigation', 'navigation_failure': 'navigation',
+                'navigation_wrong_count': 'final_check', 'self_failure': 'proactive_self',
+                'self_wrong_count': 'final_check'}[scenario]
+            assert failure['category'] == ('unexpected' if scenario in ('timeout', 'render_failure') else 'assertion')
+            if scenario == 'self_failure':
+                assert failure['assertion_kind'] == 'helper_result' and failure['helper_error'] == 'user_self_unverified'
         if scenario == "render_failure":
             page.unroute.assert_awaited_once()  # Synthetic route cannot survive render failure.
+    return fixture_module.ProactiveSelfFailure
+
+
+def diagnostic_envelopes(smoke, native, proactive_type):
+    """Real projection boundaries, mocked lifecycle; no browser or worker runs."""
+    from unittest.mock import Mock
+    import browser_probe as browser
+
+    sentinel = 'SENTINEL-private-body-cookie-url'
+    for exc, category in ((TimeoutError(sentinel), 'timeout'), (AssertionError(sentinel), 'assertion'),
+                          (ImportError(sentinel), 'import'), (OSError(sentinel), 'os_error'),
+                          (RuntimeError(sentinel), 'unexpected')):
+        detail = browser.exception_report('notice', exc)
+        assert detail == {'fixture': 'failed', 'phase': 'notice', 'category': category}
+    with patch.object(browser, 'run', side_effect=ImportError(sentinel)), redirect_stdout(io.StringIO()) as printed:
+        assert asyncio.run(browser.main()) == 1
+    assert json.loads(printed.getvalue()) == browser.exception_report('launch', ImportError())
+    for phase in browser.PHASES:
+        assert browser.browser_failure(browser.exception_report(phase, AssertionError())) is not None
+    with patch.object(browser, 'run', side_effect=asyncio.CancelledError), redirect_stdout(io.StringIO()) as printed:
+        try:
+            asyncio.run(browser.main())
+        except asyncio.CancelledError:
+            pass
+        else:
+            raise AssertionError('cancellation swallowed')
+        assert printed.getvalue() == ''
+    for kind in browser.ASSERTIONS:
+        for error in (*browser.HELPER_ERRORS, sentinel):
+            detail = browser.exception_report('proactive_self', proactive_type(kind, error), proactive_type)
+            assert detail['assertion_kind'] == kind and sentinel not in json.dumps(detail)
+            assert ('helper_error' in detail) == (kind == 'helper_result' and error != sentinel)
+            assert len(json.dumps(detail).encode()) < 4096
+    detail = browser.exception_report('proactive_self', proactive_type('helper_result', 'user_self_unverified'), proactive_type)
+    envelope = {'supervisor_probe': 'failed', 'stage': 'browser_normal', 'browser_failure': detail}
+    for stage in ('capability', *(f'synthetic_{mode}' for mode in native.MODES), 'browser_normal', 'browser_timeout'):
+        assert smoke.supervisor_failure(json.dumps({'supervisor_probe': 'blocked' if stage == 'capability' else 'failed',
+                                                   'stage': stage}).encode()) == {'stage': stage}
+    for invalid in (b'', b'not-json-' + sentinel.encode(), b'[]', b'x' * 4097,
+                    json.dumps(envelope | {'secret': sentinel}).encode(),
+                    json.dumps(envelope | {'stage': sentinel}).encode(),
+                    json.dumps(envelope | {'browser_failure': detail | {'secret': sentinel}}).encode(),
+                    json.dumps(envelope | {'browser_failure': detail | {'helper_error': sentinel}}).encode(),
+                    json.dumps(envelope | {'browser_failure': detail | {'category': []}}).encode()):
+        assert smoke.supervisor_failure(invalid) is None
+    assert browser.browser_failure(detail | {'phase': sentinel}) is None
+
+    # Real bounded nonblocking pipe reader: even an exited worker may leave a
+    # live inherited writer. Missing EOF must not hang or yield trusted evidence.
+    for body, running, writer_open in ((json.dumps(detail).encode(), False, False),
+                                      (json.dumps(detail).encode(), True, False),
+                                      (json.dumps(detail).encode(), False, True),
+                                      (b'x' * 4097, False, False),
+                                      (json.dumps(detail | {'secret': sentinel}).encode(), False, False)):
+        reader, writer = os.pipe()
+        stream = os.fdopen(reader, 'rb')
+        try:
+            os.write(writer, body)
+            if not writer_open:
+                os.close(writer)
+            child = SimpleNamespace(poll=lambda: None if running else 0, stdout=stream)
+            result = native.exited_browser_failure(child)
+            assert result == (detail if not running and not writer_open and body == json.dumps(detail).encode() else None)
+        finally:
+            stream.close()
+            if writer_open:
+                os.close(writer)
+
+    # Failure -> existing cancel/wait/FD cleanup -> diagnostic read, not ACK proof.
+    real_close = os.close
+    for cleanup_fails in (False, True):
+        events = []
+        original = AssertionError(sentinel)
+        child = Mock(pid=100)
+        child.wait.side_effect = lambda **kw: events.append('wait') or 0
+        def close(fd):
+            if fd not in (80, 81, 82, 142, 143, 144, 145):
+                return real_close(fd)
+            events.append(('close', fd))
+            if cleanup_fails:
+                raise OSError(sentinel)
+        with patch.object(native, 'start_worker', return_value=(child, 80, 81)), \
+                patch.object(native, 'wait_until'), patch.object(native, 'descendants', return_value=[(i, 'crashpad') for i in range(142, 146)]), \
+                patch.object(native, 'accept_ack', side_effect=original), patch.object(native.os, 'pidfd_open', return_value=82), \
+                patch.object(native.os, 'close', side_effect=close), \
+                patch.object(native, 'exited_browser_failure', side_effect=lambda child: events.append('diagnostic') or detail):
+            try:
+                native.lifecycle('normal', browser=True)
+            except native.LifecycleFailure as exc:
+                assert exc.__cause__ is original and exc.detail == detail
+            else:
+                raise AssertionError('failure became success')
+        assert events.index(('close', 80)) < events.index('diagnostic')
+        if not cleanup_fails:
+            assert events.index('wait') < events.index(('close', 82)) < events.index('diagnostic')
+        child.stdout.close.assert_called_once()
+
+    # Actual supervisor main -> bounded outer decoder -> safe final evidence.
+    def lifecycle(mode, browser=False):
+        if browser:
+            raise native.LifecycleFailure(detail)
+    with patch.object(native, 'capability', return_value=True), patch.object(native, 'lifecycle', lifecycle), \
+            patch.object(native.sys, 'argv', ['probe']), redirect_stdout(io.StringIO()) as printed:
+        assert native.main() == 1
+    assert json.loads(printed.getvalue()) == envelope
+    evidence = smoke.Evidence()
+    results = [SimpleNamespace(returncode=0, stdout=b'{"supervisor_probe":"passed","stage":"capability"}', stderr=b''),
+               SimpleNamespace(returncode=1, stdout=printed.getvalue().encode(), stderr=sentinel.encode())]
+    with patch.object(smoke, 'install_probe'), patch.object(smoke, 'command', side_effect=results):
+        try:
+            smoke.runtime_gate('fixture', evidence)
+        except smoke.SmokeFailure:
+            pass
+        else:
+            raise AssertionError('failed lifecycle accepted')
+    failure = evidence.failure('fixture', False)
+    assert failure['probe_failure'] == {'stage': 'browser_normal', 'browser_failure': detail}
+    assert sentinel not in json.dumps(failure)
 
 
 def main():
@@ -331,6 +460,8 @@ def main():
                     "modes": ["normal", "timeout", "cancel", "termination", "parent_death"],
                     "browser_modes": ["normal", "timeout"], "identity": "pidfd", "ack_after_reap": True,
                     "before_container_removal": True, "production_worker": True}).encode()
+                if scenario == 'browser_failed':
+                    body = b'{"supervisor_probe":"failed","stage":"browser_normal","browser_failure":{"fixture":"failed","phase":"proactive_self","category":"assertion","assertion_kind":"helper_result","helper_error":"user_self_unverified"}}'
             elif args[1] == "exec" and args[-1] == "/app/docker/healthcheck.py":
                 code = 1 if scenario == "readiness_failed" else 0
             elif args[1] == "rm":
@@ -347,6 +478,8 @@ def main():
             assert report["web_smoke"] == "passed" and report["publish_ready"] == (scenario == "passed")
             assert ("publish_ready=true" in output.read_text()) == (scenario == "passed")
             assert ("tested_image_id=" in output.read_text()) == (scenario == "passed")
+            if scenario == 'browser_failed':
+                assert report['failure']['probe_failure']['browser_failure']['helper_error'] == 'user_self_unverified'
         lifecycle_calls = [args for args in calls if args[1] != "inspect"]
         assert lifecycle_calls[-1][1] == "rm"
         if scenario == "denied":
@@ -593,7 +726,7 @@ def main():
     assert browser_probe.index('await navigation_readiness_case(page, report)') < browser_probe.index(
         'await proactive_self_case(browser, context, page, report)') < browser_probe.index('await context.close()')
     assert 'assert report == {"native_notice_backdrop_cases": 10, "native_navigation_readiness_cases": 1, "native_proactive_self_cases": 1}' in browser_probe
-    browser_notice_wiring()
+    diagnostic_envelopes(smoke_module, native, browser_notice_wiring())
     checks += 1
     assert '/tmp/browser_probe.py' in probe and 'start_worker(helper, directory)' in probe
     assert '"/tmp/browser_probe.py"' not in smoke  # never docker-exec Python browser directly

@@ -156,6 +156,14 @@ async def navigation_readiness_case(page, report):
     report['native_navigation_readiness_cases'] = 1
 
 
+class ProactiveSelfFailure(AssertionError):
+    """Test-only classification; reporters must allowlist both attributes."""
+    def __init__(self, kind, helper_error=None):
+        super().__init__()
+        self.kind = kind
+        self.helper_error = helper_error
+
+
 async def proactive_self_case(browser, context, page, report):
     """One real login on loopback, borrowing ONLY the worker-owned resources."""
     from types import SimpleNamespace
@@ -243,9 +251,12 @@ async def proactive_self_case(browser, context, page, report):
             with patch.object(core, 'ORIGIN', origin), patch.object(core, 'safe_url', local_safe), \
                     patch.object(core, 'filtered_cookies', local_cookies), patch.object(core, 'browser_launcher', return_value=launch):
                 result = await core.run_login(core.LoginInput('synthetic-user', 'synthetic-password', 2000))
-            assert result['ok'] and result['api_user'] == '42'
-            assert any(c['name'] == 'fixture_session' and c['http_only'] and c['path'] == '/api' for c in result['cookies'])
-            assert observed == {'self': 1, 'authorized': True, 'marker_absent': True}
+            if not (result['ok'] and result['api_user'] == '42'):
+                raise ProactiveSelfFailure('helper_result', result.get('error'))
+            if not any(c['name'] == 'fixture_session' and c['http_only'] and c['path'] == '/api' for c in result['cookies']):
+                raise ProactiveSelfFailure('returned_cookie')
+            if observed != {'self': 1, 'authorized': True, 'marker_absent': True}:
+                raise ProactiveSelfFailure('server_observation')
     finally:
         try:
             await release()
