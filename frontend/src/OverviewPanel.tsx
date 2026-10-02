@@ -83,12 +83,14 @@ export function OverviewPanel({
     let totalQuotaRawBig = 0n;
     let totalUsedQuotaRawBig = 0n;
     let latestFetchedAt: string | null = null;
+    let hasAnyValidBalance = false;
 
     for (const acc of accounts) {
       if (acc.balance) {
         try {
           if (acc.balance.quotaRaw) {
             totalQuotaRawBig += BigInt(acc.balance.quotaRaw.split(".")[0]);
+            hasAnyValidBalance = true;
           }
           if (acc.balance.usedQuotaRaw) {
             totalUsedQuotaRawBig += BigInt(acc.balance.usedQuotaRaw.split(".")[0]);
@@ -105,8 +107,12 @@ export function OverviewPanel({
     }
 
     return {
-      remainingUsd: formatRemainingUsd(totalQuotaRawBig.toString(), totalUsedQuotaRawBig.toString()),
-      usedUsd: formatQuotaUsd(totalUsedQuotaRawBig.toString()),
+      remainingUsd: hasAnyValidBalance
+        ? formatRemainingUsd(totalQuotaRawBig.toString(), totalUsedQuotaRawBig.toString())
+        : "—",
+      usedUsd: hasAnyValidBalance
+        ? formatQuotaUsd(totalUsedQuotaRawBig.toString())
+        : "—",
       latestFetchedAt,
     };
   }, [accounts]);
@@ -208,22 +214,22 @@ export function OverviewPanel({
           <div className="metric-header">
             <span className="metric-label flex items-center gap-1.5">
               <Wallet size={15} className="text-secondary" />
-              <span>额度汇总（USD）</span>
+              <span>额度统计（换算参考）</span>
             </span>
             {aggregateQuota.latestFetchedAt && (
-              <span className="secondary small numeric font-mono">
+              <span className="secondary small numeric font-mono" title="最新刷新时间">
                 {formatShanghaiDateTime(aggregateQuota.latestFetchedAt)}
               </span>
             )}
           </div>
           <div className="quota-summary-numbers numeric">
             <div>
-              <span className="secondary small">总剩余：</span>
+              <span className="secondary small">剩余：</span>
               <strong className="text-teal font-mono">{aggregateQuota.remainingUsd}</strong>
             </div>
             <div>
-              <span className="secondary small">总已用：</span>
-              <span className="font-mono">{aggregateQuota.usedUsd}</span>
+              <span className="secondary small">已用：</span>
+              <span className="font-mono text-secondary">{aggregateQuota.usedUsd}</span>
             </div>
           </div>
         </div>
@@ -256,8 +262,8 @@ export function OverviewPanel({
                 <tr>
                   <th scope="col" className="col-account">名称</th>
                   <th scope="col" className="col-activity">调用情况</th>
-                  <th scope="col" className="col-quota">剩余额度</th>
-                  <th scope="col" className="col-quota">已用额度</th>
+                  <th scope="col" className="col-quota">剩余额度（参考）</th>
+                  <th scope="col" className="col-quota">已用额度（参考）</th>
                   <th scope="col" className="col-time">更新时间</th>
                   <th scope="col" className="col-actions text-right">操作</th>
                 </tr>

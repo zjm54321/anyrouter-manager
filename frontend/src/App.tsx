@@ -22,6 +22,7 @@ import {
   ShieldCheck,
   User,
   Users,
+  Wallet,
   X,
 } from "lucide-react";
 import { AccountsPanel } from "./AccountsPanel";
@@ -31,6 +32,7 @@ import type { GlobalCheckinConfig } from "./accountsTypes";
 import {
   formatQuotaUsd,
   formatRemainingUsd,
+  formatShanghaiDateTime,
   mapAccountDtoToManaged,
   mapLogItemToEntry,
 } from "./accountsTypes";
@@ -39,22 +41,6 @@ import { SettingsPanel } from "./SettingsPanel";
 import { RevealDialog } from "./RevealDialog";
 
 export type AppPage = "overview" | "accounts" | "logs" | "settings";
-
-function formatShanghaiDateTime(iso: string | null | undefined): string {
-  if (!iso) return "-";
-  const date = new Date(iso);
-  if (Number.isNaN(date.getTime())) return iso;
-  return new Intl.DateTimeFormat("zh-CN", {
-    timeZone: "Asia/Shanghai",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false,
-  }).format(date);
-}
 
 export function App() {
   const manager = useManager();
@@ -463,6 +449,10 @@ export function App() {
                 refreshingAccountId={manager.refreshingAccountId}
                 accountRefreshError={manager.accountRefreshError}
                 accountCheckin={manager.accountCheckin}
+                quotaAutoRefreshEnabled={manager.quotaAutoRefreshEnabled}
+                quotaRefreshIntervalMinutes={manager.quotaRefreshIntervalMinutes}
+                onToggleQuotaAutoRefresh={manager.setQuotaAutoRefreshEnabled}
+                onChangeQuotaRefreshInterval={manager.setQuotaRefreshIntervalMinutes}
               />
 
               {/* Comprehensive Account Detail View */}
@@ -491,6 +481,46 @@ export function App() {
                     >
                       关闭详情
                     </button>
+                  </div>
+
+                  {/* Quota & Balance Detail */}
+                  <div className="account-subcard stack compact">
+                    <div className="subcard-header flex items-center justify-between">
+                      <span className="subcard-label flex items-center gap-1.5 text-xs font-semibold text-secondary">
+                        <Wallet size={14} />
+                        <span>额度字段与刷新状态</span>
+                      </span>
+                      <span className="text-xs text-secondary font-mono">
+                        刷新时间：{selectedAccount.balance?.fetched_at ? formatShanghaiDateTime(selectedAccount.balance.fetched_at) : "尚未刷新"}
+                      </span>
+                    </div>
+                    <div className="quota-detail-grid">
+                      <div className="card quota-detail-item">
+                        <span className="text-secondary text-xs">剩余额度</span>
+                        <div className="flex items-baseline gap-2">
+                          <span className="text-base font-bold font-mono text-teal tabular-nums">
+                            {formatRemainingUsd(selectedAccount.balance?.quota_raw, selectedAccount.balance?.used_quota_raw)}
+                          </span>
+                          <span className="text-xs text-secondary font-mono">
+                            (原始 raw: {selectedAccount.balance?.quota_raw || "—"})
+                          </span>
+                        </div>
+                      </div>
+                      <div className="card quota-detail-item">
+                        <span className="text-secondary text-xs">已用额度</span>
+                        <div className="flex items-baseline gap-2">
+                          <span className="text-base font-bold font-mono text-secondary tabular-nums">
+                            {formatQuotaUsd(selectedAccount.balance?.used_quota_raw)}
+                          </span>
+                          <span className="text-xs text-secondary font-mono">
+                            (原始 raw: {selectedAccount.balance?.used_quota_raw || "—"})
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+                    <div className="text-xs text-secondary flex items-center justify-between">
+                      <span>换算说明：按当前 500,000 raw / USD 参考计算，具体核算口径待上游确认。</span>
+                    </div>
                   </div>
 
                   {/* Account Action Bar: Key Selection, Reveal & Route */}

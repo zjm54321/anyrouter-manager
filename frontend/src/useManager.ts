@@ -42,6 +42,14 @@ const emptyState: AccountsResponse = {
 
 const statusUnavailable = "暂时无法确认任务状态，请重试读取状态；不要重复提交操作";
 const monitorWindowMs = 180_000;
+const quotaPreferenceKey = "anyrouter-manager.quota-auto-refresh.v1";
+function quotaPreferences(): { enabled: boolean; minutes: 5 | 10 } {
+  try {
+    const saved = JSON.parse(localStorage.getItem(quotaPreferenceKey) || "null");
+    return { enabled: typeof saved?.enabled === "boolean" ? saved.enabled : true,
+      minutes: saved?.minutes === 5 ? 5 : 10 };
+  } catch { return { enabled: true, minutes: 10 }; }
+}
 type PendingOperation = {
   id: string;
   kind: OperationDTO["kind"];
@@ -49,13 +57,19 @@ type PendingOperation = {
   startedAt: number;
   missingReads: number;
 };
+type OperationAdmission = { pending: PendingOperation | null };
 
 export function useManager() {
   const [session, setSession] = useState<"loading" | "locked" | "open">("loading");
   const [state, setState] = useState<AccountsResponse>(emptyState);
   const [pendingRouteAccountId, setPendingRouteAccountId] = useState<string | null>(null);
   const [notice, setNotice] = useState("");
-  const [sending, setSending] = useState(false);
+  const [sending, setSendingState] = useState(false);
+  const sendingRef = useRef(false);
+  const setSending = useCallback((value: boolean) => {
+    sendingRef.current = value;
+    setSendingState(value);
+  }, []);
   const [loadError, setLoadError] = useState(false);
   const [candidateExpired, setCandidateExpired] = useState(false);
 
@@ -75,6 +89,34 @@ export function useManager() {
   // Per-account refresh tracking
   const [refreshingAccountId, setRefreshingAccountId] = useState<string | null>(null);
   const [accountRefreshError, setAccountRefreshError] = useState<Record<string, string>>({});
+  const [quotaPreference, setQuotaPreference] = useState(quotaPreferences);
+  const quotaPreferenceChanged = useRef(false);
+  const quotaAutoRefreshEnabled = quotaPreference.enabled;
+  const quotaRefreshIntervalMinutes = quotaPreference.minutes;
+  const operationAdmission = useRef<OperationAdmission | null>(null);
+  const quotaOpenedAt = useRef<number | null>(null);
+  const quotaBackoff = useRef(new Map<string, number>());
+  const quotaPaused = useRef(new Map<string, string>());
+  const quotaRound = useRef({ startedAt: 0, seen: new Set<string>() });
+  const quotaReconciling = useRef(false);
+  const [quotaVisible, setQuotaVisible] = useState(document.visibilityState === "visible");
+  const [quotaWake, setQuotaWake] = useState(0);
+  const latestState = useRef(state);
+  latestState.current = state;
+  const setQuotaAutoRefreshEnabled = useCallback((enabled: boolean) => {
+    quotaPreferenceChanged.current = true;
+    setQuotaPreference(previous => ({ ...previous, enabled }));
+  }, []);
+  const setQuotaRefreshIntervalMinutes = useCallback((minutes: 5 | 10) => {
+    if (minutes === 5 || minutes === 10) {
+      quotaPreferenceChanged.current = true;
+      setQuotaPreference(previous => ({ ...previous, minutes }));
+    }
+  }, []);
+  useEffect(() => {
+    if (!quotaPreferenceChanged.current) return;
+    try { localStorage.setItem(quotaPreferenceKey, JSON.stringify(quotaPreference)); } catch { /* optional preference */ }
+  }, [quotaPreference]);
 
   // System logs & settings state
   const [logSettings, setLogSettings] = useState<LogSettings | null>(null);
@@ -106,6 +148,12 @@ export function useManager() {
     pendingRef.current = null;
     observedRunning.current = null;
     monitorPaused.current = false;
+    operationAdmission.current = null;
+    quotaOpenedAt.current = null;
+    quotaBackoff.current.clear();
+    quotaPaused.current.clear();
+    quotaRound.current = { startedAt: 0, seen: new Set() };
+    quotaReconciling.current = false;
     controllers.current.forEach(controller => controller.abort());
     controllers.current.clear();
   }, []);
@@ -145,12 +193,35 @@ export function useManager() {
     setCandidateExpired(false);
   }, [abortAll]);
 
-  const trackOperation = useCallback((id: string, kind: OperationDTO["kind"], accountId: string | null = null) => {
+  // Reserve synchronously before allocating a request: React's busy state may
+  // not have rendered yet when another manual action or timer fires.
+  function reserveOperation(): OperationAdmission | null {
+    if (sessionRef.current !== "open" || sendingRef.current || operationAdmission.current
+        || pendingRef.current || latestState.current.operation?.status === "running" || monitorPaused.current) return null;
+    const owner = { pending: null };
+    operationAdmission.current = owner;
+    setSending(true);
+    return owner;
+  }
+
+  function finishSubmission(owner: OperationAdmission) {
+    // A matched terminal read can admit a new operation before this finally.
+    // Likewise logout/reopening invalidates the old owner, not just its request.
+    if (operationAdmission.current !== owner) return;
+    if (!owner.pending) {
+      operationAdmission.current = null;
+      setQuotaWake(value => value + 1);
+    }
+    setSending(false);
+  }
+
+  const trackOperation = useCallback((owner: OperationAdmission, id: string, kind: OperationDTO["kind"], accountId: string | null = null) => {
     // Acceptance is not completion. Invalidate only snapshots started BEFORE
     // this POST, never an in-flight read merely because another poll wants it.
     accountsVersion.current++;
     if (!id) throw new Error(statusUnavailable);
     const pending = { id, kind, accountId, startedAt: Date.now(), missingReads: 0 };
+    owner.pending = pending;
     pendingRef.current = pending;
     setPendingOperation(pending);
     monitorPaused.current = false;
@@ -210,11 +281,21 @@ export function useManager() {
         const matches = operation?.id === pending.id && operation.kind === pending.kind &&
           (pending.accountId === null || operation.account_id === pending.accountId);
         if (matches && operation.status !== "running") {
+          if (operationAdmission.current?.pending === pending) {
+            operationAdmission.current = null;
+            setSending(false);
+          }
           pendingRef.current = null;
           setPendingOperation(null);
           setCompletedOperation(operation);
           if (pending.kind === "refresh" && pending.accountId) {
             const accountId = pending.accountId;
+            quotaBackoff.current.set(accountId, Date.now());
+            const refreshed = data.accounts.find(account => account.id === accountId);
+            if (operation.status === "succeeded") quotaPaused.current.delete(accountId);
+            else if (operation.error?.code === "upstream_session_expired" && refreshed) {
+              quotaPaused.current.set(accountId, refreshed.revision + ":" + refreshed.balance.fetched_at);
+            }
             setRefreshingAccountId(previous => previous === accountId ? null : previous);
             setAccountRefreshError(previous => {
               const next = { ...previous };
@@ -241,6 +322,8 @@ export function useManager() {
         : data);
       setSession("open");
       sessionRef.current = "open";
+      if (quotaOpenedAt.current === null) quotaOpenedAt.current = Date.now();
+      latestState.current = data;
       setLoadError(uncertain);
       monitorPaused.current = uncertain;
       setNotice(uncertain ? statusUnavailable : "");
@@ -562,7 +645,13 @@ export function useManager() {
     if (session !== "open") return;
     const onVisibility = () => {
       if (document.visibilityState === "visible") {
-        void load();
+        quotaReconciling.current = true;
+        const epoch = generation.current;
+        void load().finally(() => {
+          if (epoch !== generation.current) return;
+          quotaReconciling.current = false;
+          setQuotaWake(value => value + 1);
+        });
         void loadGlobalCheckin();
         void loadLogs();
         if (selectedAccountId) {
@@ -655,16 +744,17 @@ export function useManager() {
 
   // Add account by logging in
   async function addAccount(credentials: { username: string; password: string }) {
+    const owner = reserveOperation();
+    if (!owner) { credentials.password = ""; return; }
     const epoch = generation.current;
     const task = createController();
-    setSending(true);
     setNotice("");
     try {
       const pending = loginAccount(credentials.username, credentials.password, task.signal);
       credentials.password = "";
       const accepted = await pending;
       if (epoch !== generation.current) return;
-      trackOperation(accepted.operation_id, "login");
+      trackOperation(owner, accepted.operation_id, "login");
       await load();
     } catch (error) {
       if (epoch !== generation.current || task.signal.aborted) return;
@@ -675,20 +765,21 @@ export function useManager() {
     } finally {
       credentials.password = "";
       controllers.current.delete(task);
-      if (epoch === generation.current) setSending(false);
+      finishSubmission(owner);
     }
   }
 
   // Save candidate as account
   async function saveCandidate(candidateId: string, keyId?: string | null) {
+    const owner = reserveOperation();
+    if (!owner) return;
     const epoch = generation.current;
     const task = createController();
-    setSending(true);
     setNotice("");
     try {
       const accepted = await saveAccount(candidateId, keyId ?? null, task.signal);
       if (epoch !== generation.current) return;
-      trackOperation(accepted.operation_id, "save");
+      trackOperation(owner, accepted.operation_id, "save");
       await load();
     } catch (error) {
       if (epoch !== generation.current || task.signal.aborted) return;
@@ -703,16 +794,18 @@ export function useManager() {
       throw new Error(failureText(error));
     } finally {
       controllers.current.delete(task);
-      if (epoch === generation.current) setSending(false);
+      finishSubmission(owner);
     }
   }
 
   // Refresh account balance
   async function refreshAccountBalance(accountId: string) {
+    const owner = reserveOperation();
+    if (!owner) return;
+    quotaRound.current.seen.add(accountId);
     const epoch = generation.current;
     const task = createController();
     let accepted = false;
-    setSending(true);
     setRefreshingAccountId(accountId);
     setAccountRefreshError(prev => {
       const next = { ...prev };
@@ -723,38 +816,99 @@ export function useManager() {
     try {
       const response = await apiRefreshAccount(accountId, task.signal);
       if (epoch !== generation.current) return;
-      trackOperation(response.operation_id, "refresh", accountId);
+      trackOperation(owner, response.operation_id, "refresh", accountId);
       accepted = true;
       await load();
     } catch (error) {
       if (epoch !== generation.current || task.signal.aborted) return;
       if (error instanceof ApiError && error.status === 401) {
-        setAccountRefreshError(prev => ({ ...prev, [accountId]: "管理请求未通过鉴权，请重试或重新建立管理会话" }));
+        lock();
         return;
+      }
+      quotaBackoff.current.set(accountId, Date.now());
+      if (error instanceof ApiError && error.detail.code === "upstream_session_expired") {
+        const account = latestState.current.accounts.find(value => value.id === accountId);
+        if (account) quotaPaused.current.set(accountId, account.revision + ":" + account.balance.fetched_at);
       }
       const errText = failureText(error);
       setAccountRefreshError(prev => ({ ...prev, [accountId]: errText }));
+      if (!(error instanceof ApiError)) {
+        // A lost acceptance response does not prove that the server did no work.
+        monitorPaused.current = true;
+        setLoadError(true);
+      }
     } finally {
       controllers.current.delete(task);
-      if (epoch === generation.current) {
-        setSending(false);
-        if (!accepted) setRefreshingAccountId(previous => previous === accountId ? null : previous);
+      if (operationAdmission.current === owner) {
+        if (!accepted) {
+          setRefreshingAccountId(previous => previous === accountId ? null : previous);
+        }
+        finishSubmission(owner);
       }
     }
   }
+
+  // Page-local scheduling only; no cross-tab lock and no server-side cancellation.
+  useEffect(() => {
+    const onVisibility = () => {
+      if (document.visibilityState !== "visible") quotaReconciling.current = true;
+      else if (sessionRef.current !== "open") quotaReconciling.current = false;
+      setQuotaVisible(document.visibilityState === "visible");
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => document.removeEventListener("visibilitychange", onVisibility);
+  }, []);
+
+  useEffect(() => {
+    if (!quotaAutoRefreshEnabled || session !== "open" || !quotaVisible || loadError
+        || sending || pendingOperation || state.operation?.status === "running"
+        || operationAdmission.current || quotaReconciling.current || quotaOpenedAt.current === null) return;
+    const interval = quotaRefreshIntervalMinutes * 60_000;
+    const now = Date.now();
+    // One admission per account per interval-sized round; never replay missed
+    // rounds after inactivity. Oldest due accounts precede recently attempted ones.
+    if (now >= quotaRound.current.startedAt + interval) {
+      quotaRound.current = { startedAt: now, seen: new Set() };
+    }
+    const due = state.accounts.slice(0, 64).flatMap(account => {
+      const fingerprint = account.revision + ":" + account.balance.fetched_at;
+      if (quotaPaused.current.get(account.id) === fingerprint) return [];
+      quotaPaused.current.delete(account.id);
+      const fetched = Date.parse(account.balance.fetched_at);
+      const time = Math.max(quotaOpenedAt.current! + interval,
+        Number.isFinite(fetched) ? fetched + interval : quotaOpenedAt.current! + interval,
+        (quotaBackoff.current.get(account.id) ?? -Infinity) + interval,
+        quotaRound.current.seen.has(account.id) ? quotaRound.current.startedAt + interval : 0);
+      return [{ id: account.id, time }];
+    }).sort((a, b) => a.time - b.time || a.id.localeCompare(b.id));
+    if (!due.length) return;
+    const epoch = generation.current;
+    const timer = window.setTimeout(() => {
+      if (epoch !== generation.current || sessionRef.current !== "open"
+          || document.visibilityState !== "visible" || quotaReconciling.current) return;
+      if (Date.now() < due[0].time) {
+        setQuotaWake(value => value + 1);
+        return;
+      }
+      void refreshAccountBalance(due[0].id);
+    }, Math.min(interval, Math.max(0, due[0].time - now)));
+    return () => window.clearTimeout(timer);
+  }, [quotaAutoRefreshEnabled, quotaRefreshIntervalMinutes, quotaVisible, quotaWake, session,
+    loadError, sending, pendingOperation, state]);
 
   // Select account key
   async function selectAccountKey(accountId: string, keyId: string) {
     const targetAccount = state.accounts.find(a => a.id === accountId);
     if (!targetAccount) return;
+    const owner = reserveOperation();
+    if (!owner) return;
     const epoch = generation.current;
     const task = createController();
-    setSending(true);
     setNotice("");
     try {
       const accepted = await apiSelectAccountKey(accountId, targetAccount.revision, keyId, task.signal);
       if (epoch !== generation.current) return;
-      trackOperation(accepted.operation_id, "select_key", accountId);
+      trackOperation(owner, accepted.operation_id, "select_key", accountId);
       await load();
     } catch (error) {
       if (epoch !== generation.current || task.signal.aborted) return;
@@ -765,7 +919,7 @@ export function useManager() {
       setNotice(failureText(error));
     } finally {
       controllers.current.delete(task);
-      if (epoch === generation.current) setSending(false);
+      finishSubmission(owner);
     }
   }
 
@@ -843,9 +997,10 @@ export function useManager() {
 
   // Run account manual checkin
   async function runAccountCheckin(accountId: string, options: { confirmRetry: boolean }) {
+    const owner = reserveOperation();
+    if (!owner) return;
     const epoch = generation.current;
     const task = createController();
-    setSending(true);
     setCheckinRunError("");
     try {
       const res = await apiRunAccountCheckin(accountId, options.confirmRetry, task.signal);
@@ -854,7 +1009,7 @@ export function useManager() {
         await loadGlobalCheckin();
         await loadAccountCheckin(accountId);
       } else {
-        trackOperation(res.operation_id ?? "", "checkin", accountId);
+        trackOperation(owner, res.operation_id ?? "", "checkin", accountId);
         await load();
         void loadGlobalCheckin();
       }
@@ -881,7 +1036,7 @@ export function useManager() {
       throw error;
     } finally {
       controllers.current.delete(task);
-      if (epoch === generation.current) setSending(false);
+      finishSubmission(owner);
     }
   }
 
@@ -962,6 +1117,10 @@ export function useManager() {
     logsError,
     refreshingAccountId,
     accountRefreshError,
+    quotaAutoRefreshEnabled,
+    quotaRefreshIntervalMinutes,
+    setQuotaAutoRefreshEnabled,
+    setQuotaRefreshIntervalMinutes,
     logSettings,
     systemLogs,
     systemLogsLoading,

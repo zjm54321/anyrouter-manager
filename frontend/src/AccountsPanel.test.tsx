@@ -410,4 +410,67 @@ describe("AccountsPanel", () => {
     fireEvent.click(screen.getByRole("button", { name: "刷新余额" }));
     await waitFor(() => expect(onRefreshBalance).toHaveBeenCalledWith("acc-1"));
   });
+
+  describe("Quota auto-refresh UI controls", () => {
+    it("renders auto-refresh toggle and interval select reflecting props", () => {
+      const onToggle = vi.fn();
+      const onChangeInterval = vi.fn();
+      render(
+        <AccountsPanel
+          {...baseProps}
+          quotaAutoRefreshEnabled={true}
+          quotaRefreshIntervalMinutes={10}
+          onToggleQuotaAutoRefresh={onToggle}
+          onChangeQuotaRefreshInterval={onChangeInterval}
+        />
+      );
+
+      const checkbox = screen.getByRole("checkbox", { name: "自动刷新余额" });
+      const select = screen.getByRole("combobox", { name: "自动刷新间隔" });
+
+      expect(checkbox).toBeChecked();
+      expect(select).toHaveValue("10");
+      expect(select).not.toBeDisabled();
+      expect(screen.getByText("（仅页面开启时）")).toBeInTheDocument();
+    });
+
+    it("disables interval select when auto-refresh toggle is disabled", () => {
+      render(
+        <AccountsPanel
+          {...baseProps}
+          quotaAutoRefreshEnabled={false}
+          quotaRefreshIntervalMinutes={5}
+        />
+      );
+
+      const checkbox = screen.getByRole("checkbox", { name: "自动刷新余额" });
+      const select = screen.getByRole("combobox", { name: "自动刷新间隔" });
+
+      expect(checkbox).not.toBeChecked();
+      expect(select).toBeDisabled();
+      expect(select).toHaveValue("5");
+    });
+
+    it("triggers onToggleQuotaAutoRefresh and onChangeQuotaRefreshInterval callbacks", () => {
+      const onToggle = vi.fn();
+      const onChangeInterval = vi.fn();
+      render(
+        <AccountsPanel
+          {...baseProps}
+          quotaAutoRefreshEnabled={true}
+          quotaRefreshIntervalMinutes={10}
+          onToggleQuotaAutoRefresh={onToggle}
+          onChangeQuotaRefreshInterval={onChangeInterval}
+        />
+      );
+
+      const checkbox = screen.getByRole("checkbox", { name: "自动刷新余额" });
+      fireEvent.click(checkbox);
+      expect(onToggle).toHaveBeenCalledWith(false);
+
+      const select = screen.getByRole("combobox", { name: "自动刷新间隔" });
+      fireEvent.change(select, { target: { value: "5" } });
+      expect(onChangeInterval).toHaveBeenCalledWith(5);
+    });
+  });
 });

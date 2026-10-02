@@ -389,7 +389,7 @@ describe("管理员会话与操作", () => {
     });
 
     await act(async () => fireEvent.click(screen.getByRole("button", { name: "刷新余额" })));
-    expect(screen.getByText("$1.95")).toBeInTheDocument();
+    expect(screen.getByText("$2.00")).toBeInTheDocument();
     expect(screen.getByText("正在读取余额")).toBeInTheDocument();
 
     // Next poll returns failed
@@ -414,7 +414,7 @@ describe("管理员会话与操作", () => {
     await act(async () => vi.advanceTimersByTime(1000));
     expect(screen.getAllByText("上游仍要求验证，暂时无法完成登录").length).toBeGreaterThan(0);
     expect(screen.getAllByText("current-user")[0]).toBeInTheDocument();
-    expect(screen.getByText("$1.95")).toBeInTheDocument();
+    expect(screen.getByText("$2.00")).toBeInTheDocument();
   });
 
   it("stops polling on transport error and offers retry without clearing old data", async () => {
@@ -471,7 +471,7 @@ describe("管理员会话与操作", () => {
     expect(screen.queryByRole("button", { name: "重试读取状态" })).not.toBeInTheDocument();
   });
 
-  it("POST 401 remains inline; GET account 401 clears session state", async () => {
+  it("POST 401 locks management session; avoids active view or auto-refresh", async () => {
     await open();
     fetchMock.mockImplementation(async (url: string | URL | Request) => {
       const urlStr = typeof url === "string" ? url : url.toString();
@@ -481,8 +481,8 @@ describe("管理员会话与操作", () => {
     });
 
     fireEvent.click(screen.getByRole("button", { name: "刷新余额" }));
-    await screen.findByText(/管理请求未通过鉴权/);
-    expect(screen.getAllByText("current-user")[0]).toBeInTheDocument();
+    await screen.findByLabelText("密钥");
+    expect(screen.queryByText("current-user")).not.toBeInTheDocument();
 
     // GET accounts returns 401
     fetchMock.mockImplementation(async (url: string | URL | Request) => {
@@ -491,8 +491,7 @@ describe("管理员会话与操作", () => {
       return json({});
     });
 
-    fireEvent.click(screen.getByRole("button", { name: "退出管理" }));
-    await screen.findByLabelText("密钥");
+    expect(screen.getByLabelText("密钥")).toBeInTheDocument();
     expect(screen.queryByText("current-user")).not.toBeInTheDocument();
   });
 
@@ -709,9 +708,9 @@ describe("多账号与路由切换", () => {
 
     expect(screen.getAllByText("current-user")[0]).toBeInTheDocument();
     expect(screen.getByText("secondary-user")).toBeInTheDocument();
-    expect(screen.getByText("$1.95")).toBeInTheDocument();
+    expect(screen.getByText("$2.00")).toBeInTheDocument();
     expect(screen.getByText("$0.05")).toBeInTheDocument();
-    expect(screen.getByText("$0.98")).toBeInTheDocument();
+    expect(screen.getByText("$1.00")).toBeInTheDocument();
     expect(screen.getByText("$0.02")).toBeInTheDocument();
     expect(await screen.findByText("已签到")).toBeInTheDocument();
   });

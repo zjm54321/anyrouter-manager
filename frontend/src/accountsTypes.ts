@@ -82,6 +82,10 @@ export interface AccountsPanelProps {
   requestLogs?: RequestLogEntry[];
   refreshingAccountId?: string | null;
   accountRefreshError?: Record<string, string>;
+  quotaAutoRefreshEnabled?: boolean;
+  quotaRefreshIntervalMinutes?: 5 | 10;
+  onToggleQuotaAutoRefresh?: (enabled: boolean) => void;
+  onChangeQuotaRefreshInterval?: (minutes: 5 | 10) => void;
 }
 
 export interface RequestLogEntry {
@@ -174,7 +178,7 @@ export function formatTimeInSlot(startTime: string, intervalMinutes: number, ind
 export function formatShanghaiDateTime(iso: string | null | undefined): string {
   if (!iso) return "-";
   const date = new Date(iso);
-  if (Number.isNaN(date.getTime())) return iso;
+  if (Number.isNaN(date.getTime())) return "-";
   return new Intl.DateTimeFormat("zh-CN", {
     timeZone: "Asia/Shanghai",
     year: "numeric",
@@ -220,27 +224,15 @@ export function formatQuotaUsd(raw: string | number | null | undefined): string 
   }
 }
 /**
- * Calculates remaining balance in USD: (quota_raw - used_quota_raw) converted via New API policy.
- * Returns "—" if quota_raw is invalid.
+ * Formats remaining wallet quota as reference USD amount ($X.XX) based on 500,000 raw per unit.
+ * In upstream New API semantics, `quota` represents the current remaining wallet quota directly.
+ * (used_quota is tracked independently, so deducting used from quota would double-subtract).
+ * Note: 500,000 raw per USD factor is an unverified reference convention.
+ * Returns "—" for invalid/empty/negative inputs.
  */
 export function formatRemainingUsd(
   quotaRaw: string | number | null | undefined,
-  usedRaw: string | number | null | undefined
+  _usedRaw?: string | number | null | undefined
 ): string {
-  if (quotaRaw === null || quotaRaw === undefined) return "—";
-  const qStr = String(quotaRaw).trim().split(".")[0];
-  const uStr = (usedRaw !== null && usedRaw !== undefined ? String(usedRaw) : "0").trim().split(".")[0];
-  if (!/^-?\d+$/.test(qStr) || !/^-?\d+$/.test(uStr)) return "—";
-  try {
-    const q = BigInt(qStr);
-    const u = BigInt(uStr);
-    if (q < 0n) return "—";
-    const rem = q > u ? q - u : 0n;
-    const cents = (rem * 100n + 250000n) / 500000n;
-    const dollars = cents / 100n;
-    const remCents = cents % 100n;
-    return `$${dollars.toString()}.${remCents.toString().padStart(2, "0")}`;
-  } catch {
-    return "—";
-  }
+  return formatQuotaUsd(quotaRaw);
 }

@@ -23,6 +23,7 @@ import {
   UserCheck,
   UserPlus,
   Users,
+  Wallet,
   X,
 } from "lucide-react";
 import type { AccountCheckinRecord, AccountCheckinResponse, CandidateDTO, OperationDTO } from "./api";
@@ -482,6 +483,10 @@ export function AccountsPanel({
   refreshingAccountId = null,
   accountRefreshError = {},
   accountCheckin = null,
+  quotaAutoRefreshEnabled = true,
+  quotaRefreshIntervalMinutes = 10,
+  onToggleQuotaAutoRefresh,
+  onChangeQuotaRefreshInterval,
 }: ExtendedAccountsPanelProps) {
   const [showAddModal, setShowAddModal] = useState(() => Boolean(candidate));
   const [confirmRetryAccount, setConfirmRetryAccount] = useState<ManagedAccount | null>(null);
@@ -519,6 +524,36 @@ export function AccountsPanel({
           </span>
         </div>
         <div className="accounts-header-actions">
+          {/* Polished Compact Quota Auto-Refresh Controls */}
+          <div className="quota-auto-refresh-controls flex items-center gap-2">
+            <label className="auto-refresh-toggle flex items-center gap-1.5 cursor-pointer text-xs font-medium text-secondary">
+              <input
+                type="checkbox"
+                aria-label="自动刷新余额"
+                checked={quotaAutoRefreshEnabled}
+                onChange={e => onToggleQuotaAutoRefresh?.(e.target.checked)}
+                className="auto-refresh-checkbox"
+              />
+              <span>自动刷新</span>
+            </label>
+            <select
+              aria-label="自动刷新间隔"
+              value={quotaRefreshIntervalMinutes}
+              disabled={!quotaAutoRefreshEnabled}
+              onChange={e => onChangeQuotaRefreshInterval?.(Number(e.target.value) as 5 | 10)}
+              className="select-sm font-mono text-xs"
+            >
+              <option value={5}>每 5 分钟</option>
+              <option value={10}>每 10 分钟</option>
+            </select>
+            <span
+              className="auto-refresh-hint text-xs text-secondary"
+              title="仅在浏览器当前标签页处于前台激活时自动执行刷新"
+            >
+              （仅页面开启时）
+            </span>
+          </div>
+
           {hasActiveCandidate && (
             <button
               type="button"
@@ -595,8 +630,8 @@ export function AccountsPanel({
               <tr>
                 <th scope="col" className="col-account">名称</th>
                 <th scope="col" className="col-activity">调用情况</th>
-                <th scope="col" className="col-quota">剩余额度</th>
-                <th scope="col" className="col-quota">已用额度</th>
+                <th scope="col" className="col-quota">剩余额度（参考）</th>
+                <th scope="col" className="col-quota">已用额度（参考）</th>
                 <th scope="col" className="col-time">更新时间</th>
                 <th scope="col" className="col-actions text-right">操作</th>
               </tr>
@@ -775,6 +810,46 @@ export function AccountsPanel({
                               >
                                 收起详情
                               </button>
+                            </div>
+
+                            {/* Quota & Balance Detail */}
+                            <div className="account-subcard stack compact">
+                              <div className="subcard-header flex items-center justify-between">
+                                <span className="subcard-label flex items-center gap-1.5 text-xs font-semibold text-secondary">
+                                  <Wallet size={14} />
+                                  <span>额度字段与刷新状态</span>
+                                </span>
+                                <span className="text-xs text-secondary font-mono">
+                                  刷新时间：{account.balance?.fetchedAt ? formatShanghaiDateTime(account.balance.fetchedAt) : "尚未刷新"}
+                                </span>
+                              </div>
+                              <div className="quota-detail-grid">
+                                <div className="card quota-detail-item">
+                                  <span className="text-secondary text-xs">剩余额度</span>
+                                  <div className="flex items-baseline gap-2">
+                                    <span className="text-base font-bold font-mono text-teal tabular-nums">
+                                      {formatRemainingUsd(account.balance?.quotaRaw, account.balance?.usedQuotaRaw)}
+                                    </span>
+                                    <span className="text-xs text-secondary font-mono">
+                                      (原始 raw: {account.balance?.quotaRaw || "—"})
+                                    </span>
+                                  </div>
+                                </div>
+                                <div className="card quota-detail-item">
+                                  <span className="text-secondary text-xs">已用额度</span>
+                                  <div className="flex items-baseline gap-2">
+                                    <span className="text-base font-bold font-mono text-secondary tabular-nums">
+                                      {formatQuotaUsd(account.balance?.usedQuotaRaw)}
+                                    </span>
+                                    <span className="text-xs text-secondary font-mono">
+                                      (原始 raw: {account.balance?.usedQuotaRaw || "—"})
+                                    </span>
+                                  </div>
+                                </div>
+                              </div>
+                              <div className="text-xs text-secondary flex items-center justify-between">
+                                <span>换算说明：按当前 500,000 raw / USD 参考计算，具体核算口径待上游确认。</span>
+                              </div>
                             </div>
 
                             {/* Action Controls Bar */}
