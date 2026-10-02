@@ -13,7 +13,8 @@ class NavigationBudgetTests(unittest.IsolatedAsyncioTestCase):
                                  timeout_ms=40_000, never_ready=False, final_url=None):
         loop = asyncio.get_running_loop()
         original_time, original_sleep = loop.time, asyncio.sleep
-        now = start = loop.time()
+        # Exact epoch keeps integer-millisecond budgets independent of host uptime.
+        now = start = 1000.0
         self.context = FakeContext(page)
         self.browser = FakeBrowser(self.context)
         self.state, self.navigation_calls, self.cancelled = {}, [], []
@@ -93,7 +94,9 @@ class NavigationBudgetTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_launch_cost_cannot_be_replaced_with_a_fresh_navigation_budget(self):
         page = FakePage(response())
-        result = await self.execute_navigation(page, launch_seconds=15)
+        # This ambient origin rounded the old remaining budget down to 24999ms.
+        with patch.object(asyncio.get_running_loop(), 'time', return_value=1000.1):
+            result = await self.execute_navigation(page, launch_seconds=15)
         self.assertEqual(result, {'ok': False, 'error': 'timeout'})
         self.assertEqual(self.navigation_calls[0][1], {'wait_until': 'domcontentloaded', 'timeout': 25_000})
         self.assertEqual(self.elapsed, 40)
