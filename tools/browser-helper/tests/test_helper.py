@@ -67,7 +67,7 @@ class FakePage:
         self.inputs = {}
         self.goto_urls = []
         self.ready = False
-        self.evaluate = AsyncMock(side_effect=lambda script: {'id': 42 if self.ready else None, 'ready': True} if script == core.USER_STATE_JS else self.challenge)
+        self.evaluate = AsyncMock(side_effect=lambda script, arg=None: {'error': 'network'} if script == core.SESSION_PROFILE_JS else ({'id': 42 if self.ready else None, 'ready': True} if script == core.USER_STATE_JS else self.challenge))
 
     async def accepted_login(self):
         self.listeners['response'](response({'success': True}, url=core.ORIGIN + '/api/user/login'))
@@ -236,6 +236,151 @@ class LoginTests(unittest.IsolatedAsyncioTestCase):
         self.browser.close.assert_awaited_once()
         self.assertEqual(page.goto_urls, [core.ORIGIN + '/login'])
         self.assertEqual(page.listeners, {})
+
+    def proactive_page(self, reply=None, after=None, before=None):
+        page = FakePage()
+        original = page.evaluate.side_effect
+        page.proof_routes = []
+
+        async def evaluate(script, arg=None):
+            if script != core.SESSION_PROFILE_JS:
+                return original(script)
+            self.assertEqual(arg['url'], core.ORIGIN + '/api/user/self')
+            self.assertEqual(arg['user'], '42')
+            self.assertEqual(arg['limit'], core.MAX_PROFILE_BYTES)
+            self.assertGreater(arg['timeout'], 0)
+            self.assertLess(arg['timeout'], 160)
+            request = SimpleNamespace(url=arg['url'], method='GET', redirected_from=None, frame=page.main_frame,
+                                      headers={'new-api-user': arg['user'], 'x-helper-proof': arg['proof']})
+            route = SimpleNamespace(request=request, continue_=AsyncMock(), fetch=AsyncMock(), abort=AsyncMock())
+            if before:
+                await before(page, arg, route)
+            await self.context.route.await_args.args[1](route)
+            route.continue_.assert_awaited_once_with(headers={'new-api-user': '42'})
+            route.fetch.assert_not_awaited()
+            page.proof_routes.append(route)
+            # Neither the correlated event nor a concurrent unsolicited event
+            # may invoke the uncapped response.json reader or supply identity.
+            correlated = response()
+            correlated.request = request
+            for event in (correlated, response()):
+                event.json.side_effect = AssertionError('uncapped_self_read')
+                page.listeners['response'](event)
+                await asyncio.sleep(0)
+                event.json.assert_not_awaited()
+            if after:
+                await after(page, arg, route)
+            return reply if reply is not None else dict(status=200, type='application/json',
+                                                       body='{"success":true,"data":{"id":42}}')
+
+        page.evaluate.side_effect = evaluate
+        return page
+
+    async def test_proactive_self_without_spa_one_context_no_reload(self):
+        page = self.proactive_page()
+        result = await self.execute_virtual(page)
+        self.assertTrue(result['ok'])
+        self.assertEqual(result['api_user'], '42')
+        self.assertTrue(result['cookies'][0]['http_only'])
+        self.assertEqual(len(page.proof_routes), 1)
+        self.assertEqual(page.goto_urls, [core.ORIGIN + '/login'])
+        self.browser.new_context.assert_awaited_once_with(service_workers='block')
+        self.context.cookies.assert_awaited_once()
+        self.context.close.assert_awaited_once()
+        self.browser.close.assert_awaited_once()
+        self.assertEqual(page.listeners, {})
+
+    async def test_proactive_marker_cannot_authorize_other_requests(self):
+        async def before(page, arg, owned):
+            for changes in ({'url': arg['url'] + '?extra=1'}, {'method': 'POST'},
+                            {'frame': object()}, {'redirected_from': owned.request},
+                            {'headers': {'x-helper-proof': 'wrong', 'new-api-user': '42'}}):
+                request = SimpleNamespace(**(vars(owned.request) | changes))
+                route = SimpleNamespace(request=request, continue_=AsyncMock(), fetch=AsyncMock(), abort=AsyncMock())
+                await self.context.route.await_args.args[1](route)
+                route.abort.assert_awaited_once()
+                route.continue_.assert_not_awaited()
+                route.fetch.assert_not_awaited()
+        async def after(page, arg, route):
+            route.continue_.reset_mock()
+            await self.context.route.await_args.args[1](route)
+            route.abort.assert_awaited_once()
+            route.continue_.assert_not_awaited()
+        self.assertTrue((await self.execute_virtual(self.proactive_page(before=before, after=after)))['ok'])
+
+    async def test_proactive_self_rejection_never_exports_cookies(self):
+        for reply in (dict(status=200, type='application/json', body=body) for body in (
+                '{"success":true,"data":{"id":43}}', '{"success":false}',
+                '{"success":true,"data":{"id":"42"}}', 'malformed-private-body',
+                ' ' * (core.MAX_PROFILE_BYTES + 1))):
+            page = self.proactive_page(reply)
+            result = await self.execute_virtual(page)
+            self.assertEqual(result, {'ok': False, 'error': 'user_self_unverified'})
+            self.assertEqual(len(page.proof_routes), 1)
+            self.context.cookies.assert_not_awaited()
+        for reply in (dict(error='oversize'), dict(error='network'),
+                      dict(status=302, type='application/json', body='{"success":true,"id":42}')):
+            self.assertFalse((await self.execute_virtual(self.proactive_page(reply)))['ok'])
+            self.context.cookies.assert_not_awaited()
+
+    async def test_proactive_self_rechecks_console_and_identity(self):
+        for change in ('url', 'identity', 'challenge'):
+            async def after(page, arg, route):
+                if change == 'url':
+                    page.url = core.ORIGIN + '/other'
+                elif change == 'identity':
+                    page.evaluate.side_effect = lambda script: {'id': 43, 'ready': True} if script == core.USER_STATE_JS else False
+                else:
+                    page.challenge = True
+            page = self.proactive_page(after=after)
+            self.assertFalse((await self.execute_virtual(page))['ok'])
+            self.context.cookies.assert_not_awaited()
+
+    async def test_proactive_self_no_retry_on_transient_or_cancellation(self):
+        for mode in ('transient', 'cancel'):
+            async def after(page, arg, route):
+                if mode == 'transient':
+                    from playwright.async_api import Error
+                    raise Error('Execution context was destroyed')
+                await asyncio.sleep(arg['timeout'] / 1000)
+                await asyncio.Future()
+            page = self.proactive_page(after=after)
+            self.assertFalse((await self.execute_virtual(page))['ok'])
+            self.assertEqual(len(page.proof_routes), 1)
+            self.context.cookies.assert_not_awaited()
+            self.context.close.assert_awaited_once()
+            self.browser.close.assert_awaited_once()
+            self.assertEqual(page.listeners, {})
+
+    async def test_proactive_self_gates_and_existing_spa_no_duplicate(self):
+        for mode in ('unaccepted', 'unstable', 'unsafe', 'existing'):
+            page = self.proactive_page()
+            if mode == 'unaccepted':
+                page.ready = True  # Storage alone cannot authorize a proof fetch.
+                page.accepted_login = AsyncMock()
+            elif mode == 'unstable':
+                original = page.evaluate.side_effect
+                count = 0
+                async def evaluate(script, arg=None):
+                    nonlocal count
+                    if script == core.USER_STATE_JS:
+                        count += 1
+                        return {'id': 42 + count % 2, 'ready': True}
+                    return await original(script, arg)
+                page.evaluate.side_effect = evaluate
+            elif mode == 'unsafe':
+                original_login = page.accepted_login
+                async def accepted():
+                    await original_login()
+                    page.challenge = True
+                page.accepted_login = accepted
+            else:
+                page.profile = response()
+            result = await self.execute_virtual(page)
+            self.assertEqual(result['ok'], mode == 'existing')
+            self.assertEqual(page.proof_routes, [])
+            if mode != 'existing':
+                self.context.cookies.assert_not_awaited()
 
     async def test_failed_profiles_never_read_cookies(self):
         for profile in (None, response({'success': False, 'data': {'id': 42}}),

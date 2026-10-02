@@ -156,6 +156,107 @@ async def navigation_readiness_case(page, report):
     report['native_navigation_readiness_cases'] = 1
 
 
+async def proactive_self_case(browser, context, page, report):
+    """One real login on loopback, borrowing ONLY the worker-owned resources."""
+    from types import SimpleNamespace
+
+    assert page.context is context and context.browser is browser
+    observed = {'self': 0, 'authorized': False, 'marker_absent': True}
+
+    class Local(BaseHTTPRequestHandler):
+        def reply(self, status, body, content_type, session=False):
+            self.send_response(status)
+            self.send_header('Content-Type', content_type)
+            self.send_header('Content-Length', str(len(body)))
+            if session:
+                self.send_header('Set-Cookie', 'fixture_session=synthetic; Path=/api; HttpOnly; SameSite=Strict')
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            if self.path == '/login':
+                self.reply(200, b"<form class='semi-form'><input id='username'><input id='password' type='password'><button type='submit'>Continue</button></form><script>document.querySelector('form').onsubmit=async e=>{e.preventDefault();const r=await fetch('/api/user/login',{method:'POST',body:'synthetic'});if((await r.json()).success){localStorage.setItem('user',JSON.stringify({id:42}));location.href='/console';}};</script>", 'text/html')
+            elif self.path == '/console':
+                # Deliberately NO SPA self fetch: the helper must initiate proof.
+                self.reply(200, b'<title>Synthetic console</title>', 'text/html')
+            elif self.path == '/api/user/self':
+                observed['self'] += 1
+                observed['authorized'] = ('fixture_session=synthetic' in self.headers.get('Cookie', '')
+                                          and self.headers.get('New-Api-User') == '42')
+                observed['marker_absent'] &= self.headers.get('X-Helper-Proof') is None
+                self.reply(200 if observed['authorized'] else 401,
+                           b'{"success":true,"data":{"id":42}}' if observed['authorized'] else b'{"success":false}', 'application/json')
+            else:
+                self.reply(404, b'', 'text/plain')
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get('Content-Length', 0)))
+            self.reply(200 if self.path == '/api/user/login' else 404,
+                       b'{"success":true}', 'application/json', session=self.path == '/api/user/login')
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(('127.0.0.1', 0), Local)
+    thread = threading.Thread(target=lambda: server.serve_forever(poll_interval=.05), daemon=True)
+    thread.start()
+    origin = f'http://127.0.0.1:{server.server_port}'
+    guards = []
+    original_filter, original_safe = core.filtered_cookies, core.safe_url
+
+    def local_safe(url, path=None):
+        parsed = urlsplit(url)
+        return (url in tuple(origin + endpoint for endpoint in ('/login', '/console', '/api/user/login', '/api/user/self'))
+                and (path is None or parsed.path == path))
+
+    def local_cookies(cookies, source):
+        assert local_safe(source, '/console')
+        translated = [dict(c, domain='anyrouter.top') for c in cookies if c['domain'] == '127.0.0.1']
+        with patch.object(core, 'safe_url', original_safe):
+            return original_filter(translated, 'https://anyrouter.top/console')
+
+    async def install(pattern, handler):
+        guards.append((pattern, handler))
+        await context.route(pattern, handler)
+
+    async def release():
+        while guards:
+            pattern, handler = guards.pop()
+            await context.unroute(pattern, handler)
+
+    async def same_page():
+        return page
+
+    async def no_close():
+        pass
+
+    async def same_context(**options):
+        assert options == {'service_workers': 'block'}
+        return SimpleNamespace(route=install, new_page=same_page, cookies=context.cookies, close=release)
+
+    async def launch(**options):
+        assert options == {'headless': True}
+        return SimpleNamespace(new_context=same_context, close=no_close)
+
+    try:
+        async with asyncio.timeout(3):
+            with patch.object(core, 'ORIGIN', origin), patch.object(core, 'safe_url', local_safe), \
+                    patch.object(core, 'filtered_cookies', local_cookies), patch.object(core, 'browser_launcher', return_value=launch):
+                result = await core.run_login(core.LoginInput('synthetic-user', 'synthetic-password', 2000))
+            assert result['ok'] and result['api_user'] == '42'
+            assert any(c['name'] == 'fixture_session' and c['http_only'] and c['path'] == '/api' for c in result['cookies'])
+            assert observed == {'self': 1, 'authorized': True, 'marker_absent': True}
+    finally:
+        try:
+            await release()
+            await context.clear_cookies()
+        finally:
+            await asyncio.to_thread(server.shutdown)
+            server.server_close()
+            thread.join(timeout=1)
+    report['native_proactive_self_cases'] = 1
+
+
 async def ui_policy_cases(page, report, render):
     # Actual browser HTML5 .form resolution, including explicit external owners.
     fields = "<input id='username'><input id='password' type='password'>"

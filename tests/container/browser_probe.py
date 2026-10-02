@@ -13,7 +13,7 @@ async def main():
     from browser_helper.core import browser_launcher
 
     browser = await browser_launcher()(headless=True)
-    context = await browser.new_context()
+    context = await browser.new_context(service_workers='block')
     await context.route("**/*", lambda route: route.abort())
     page = await context.new_page()
     await page.goto("about:blank")
@@ -24,7 +24,7 @@ async def main():
     # Only NORMAL receives finish. The intentional timeout is still cancelled
     # above, with the original supervisor deadlines/ownership and reap checks.
     sys.path.insert(0, "/app/tools/browser-helper/tests")
-    from local_browser_smoke import notice_backdrop_cases, navigation_readiness_case
+    from local_browser_smoke import notice_backdrop_cases, navigation_readiness_case, proactive_self_case
 
     async def render(html):
         async def serve(route):
@@ -41,12 +41,13 @@ async def main():
     report = {}
     await notice_backdrop_cases(page, report, render)
     await navigation_readiness_case(page, report)
-    assert report == {"native_notice_backdrop_cases": 10, "native_navigation_readiness_cases": 1}
+    await proactive_self_case(browser, context, page, report)
+    assert report == {"native_notice_backdrop_cases": 10, "native_navigation_readiness_cases": 1, "native_proactive_self_cases": 1}
     await page.goto("about:blank")
     assert await page.evaluate("1 + 1") == 2
     await context.close()
     await browser.close()
-    print('{"fixture":"done","notice_backdrop_cases":10,"notice_backdrop":"passed","navigation_readiness_cases":1}', flush=True)
+    print('{"fixture":"done","notice_backdrop_cases":10,"notice_backdrop":"passed","navigation_readiness_cases":1,"proactive_self_cases":1}', flush=True)
 
 
 if __name__ == "__main__":

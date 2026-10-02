@@ -479,11 +479,35 @@ async def login_work(credentials, launch, resources, state):
     browser = resources['browser']
     resources['context'] = await browser.new_context(service_workers='block')
     context = resources['context']
+    proof = secrets.token_hex(32)
+    explicit_attempted = False
+    explicit_active = False
+    explicit_request = None
+    explicit_user = None
 
     async def guard_route(route):
+        nonlocal explicit_request
         request = route.request
+        headers = getattr(request, 'headers', {})
+        if 'x-helper-proof' in headers:
+            # Only the one owned browser fetch may stream. Strip its private
+            # marker before transmission; never buffer it through route.fetch.
+            if (explicit_active and explicit_request is None
+                    and request.url == ORIGIN + '/api/user/self'
+                    and request.method == 'GET' and request.redirected_from is None
+                    and request.frame == page.main_frame
+                    and headers.get('x-helper-proof') == proof
+                    and headers.get('new-api-user') == explicit_user):
+                explicit_request = request
+                state.update(self_requested=True, self_user_header_present=True)
+                outgoing = dict(headers)
+                outgoing.pop('x-helper-proof')
+                await route.continue_(headers=outgoing)
+            else:
+                await route.abort()
+            return
         # continue_ lets Chromium follow 307/308 and resend a POST body without
-        # routing the redirect. Fetch EVERY request without following redirects,
+        # routing the redirect. Fetch all other requests without following redirects,
         # then fulfill only the non-redirect result. No third-party allowlist.
         kind = request_kind(request)
         if kind == 'navigation' and getattr(request, 'frame', None) != page.main_frame:
@@ -582,6 +606,14 @@ async def login_work(credentials, launch, resources, state):
             return
         if request_kind(response.request) not in ('login', 'self'):
             return
+        # The owned fetch decodes its stream in JS. No second, uncapped JSON
+        # read, and no concurrent unsolicited self response can replace proof.
+        if explicit_attempted and request_kind(response.request) == 'self':
+            return
+        if request_kind(response.request) == 'self':
+            # Record observation before scheduling JSON work, so the explicit
+            # fallback cannot race a qualifying SPA response awaiting capture.
+            state['self_requested'] = True
         task = asyncio.create_task(capture(response))
         tasks.add(task)
         task.add_done_callback(tasks.discard)
@@ -626,7 +658,7 @@ async def login_work(credentials, launch, resources, state):
                 raise Failure('timeout' if state['exception'] == 'timeout' else ('user_self_unverified' if state['failure_request'] == 'self' else 'login_failed'))
             state['challenge'] = await require_safe_page(page, state)
             on_console = safe_url(page.url, '/console')
-            if not state['challenge'] and state['login_success'] is True:
+            if not state['challenge'] and state.get('login_status') == 200 and state['login_success'] is True:
                 user_state = await safe_evaluate(page, USER_STATE_JS, state)
                 value = user_state.get('id') if isinstance(user_state, dict) else None
                 ready = (isinstance(user_state, dict) and user_state.get('ready') is True
@@ -642,14 +674,48 @@ async def login_work(credentials, launch, resources, state):
                     break
                 # Observe SPA navigation first. A completed login alone is NOT
                 # ready: require a stable safe page AND validated user storage.
-                if not navigated and ready_samples >= 2 and not state['pending_login'] and (not on_console or not state.get('self_requested', False)):
+                if not navigated and ready_samples >= 2 and not state['pending_login'] and not on_console:
                     if not on_console and not safe_url(page.url, '/login'):
                         raise Failure('user_self_unverified')
                     navigated = True
                     response = await page.goto(ORIGIN + '/console', wait_until='domcontentloaded', timeout=20_000)
                     state['http_block'] = response is not None and response.status in (403, 429, 503)
                     continue
+                if (on_console and safe_url(page.url, '/console') and ready_samples >= 2 and not state['pending_login']
+                        and not state.get('self_requested', False) and not explicit_attempted):
+                    # Storage supplies only the EXPECTED ID/header, never proof.
+                    # Latch before awaiting: navigation errors must not retry.
+                    explicit_attempted = True
+                    explicit_active = True
+                    explicit_user = str(value)
+                    try:
+                        reply = await page.evaluate(SESSION_PROFILE_JS, dict(
+                            url=ORIGIN + '/api/user/self', user=explicit_user,
+                            timeout=action_timeout(state, MAX_TIMEOUT_MS),
+                            limit=MAX_PROFILE_BYTES, proof=proof))
+                    except Exception as exc:
+                        state.update(failure_request='self', exception=exception_kind(exc))
+                        raise Failure('user_self_unverified') from None
+                    finally:
+                        explicit_active = False
+                    if explicit_request is None:
+                        raise Failure('user_self_unverified')
+                    try:
+                        captured = session_profile(reply, explicit_user, state)
+                    except Failure:
+                        raise Failure('user_self_unverified') from None
+                    continue
             await asyncio.sleep(0.05)
+        # Recheck the current document/state after proof, before exporting any
+        # cookie. A navigation or changed local identity invalidates the result.
+        if not safe_url(page.url, '/console') or await require_safe_page(page, state):
+            raise Failure('user_self_unverified')
+        current = await safe_evaluate(page, USER_STATE_JS, state)
+        if (not safe_url(page.url, '/console') or not isinstance(current, dict)
+                or current.get('ready') is not True or type(current.get('id')) is not int
+                or not 0 < current['id'] <= 2**53 - 1 or str(current['id']) != captured
+                or state['pending_login'] or state['network_failed']):
+            raise Failure('user_self_unverified')
         state['phase'] = 'cookie_read'
         cookies = filtered_cookies(await context.cookies(), page.url)
         if not cookies:
