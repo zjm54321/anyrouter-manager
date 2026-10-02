@@ -14,12 +14,33 @@ HELPER_ERRORS = ('invalid_input', 'browser_unavailable', 'login_failed', 'timeou
                  'challenge_or_block', 'login_form_unavailable', 'user_self_unverified', 'session_expired')
 
 
+def helper_diagnostics(value):
+    # Standalone wire subset of core.diagnostics; outer observers have no helper
+    # dependencies. Do not import the browser runtime just to validate evidence.
+    enums = {
+        'phase': ('launch', 'navigation', 'form_wait', 'fill', 'submit', 'profile_wait', 'cookie_read', 'done'),
+        'page': ('login', 'console', 'other'),
+        'exception': ('none', 'timeout', 'navigation_transient', 'network', 'unexpected'),
+        'failure_request': ('none', 'navigation', 'login', 'self', 'resource'),
+    }
+    booleans = ('login_requested', 'login_json', 'pending_login', 'self_requested', 'self_json', 'user_state_ready')
+    statuses, successes = ('login_status', 'self_status'), ('login_success', 'self_success')
+    if (type(value) is not dict or value.keys() != set(enums) | set(booleans + statuses + successes)
+            or any(type(value[key]) is not str or value[key] not in allowed for key, allowed in enums.items())
+            or any(type(value[key]) is not bool for key in booleans)
+            or any(value[key] is not None and (type(value[key]) is not int or not 100 <= value[key] <= 599)
+                   for key in statuses)
+            or any(value[key] is not None and type(value[key]) is not bool for key in successes)):
+        return None
+    return dict(value)
+
+
 def browser_failure(value):
     """Strict wire boundary shared by both observers; never forward extra fields."""
     required = {'fixture', 'phase', 'category'}
     if (type(value) is not dict or not required <= value.keys()
-            or value.keys() - required - {'assertion_kind', 'helper_error'}
-            or any(type(v) is not str for v in value.values())
+            or value.keys() - required - {'assertion_kind', 'helper_error', 'diagnostics'}
+            or any(type(v) is not str for key, v in value.items() if key != 'diagnostics')
             or value['fixture'] != 'failed' or value['phase'] not in PHASES
             or value['category'] not in CATEGORIES):
         return None
@@ -28,6 +49,9 @@ def browser_failure(value):
         return None
     if 'helper_error' in value and (value.get('assertion_kind') != 'helper_result'
                                    or value['helper_error'] not in HELPER_ERRORS):
+        return None
+    if 'diagnostics' in value and (value.get('assertion_kind') != 'helper_result'
+                                  or helper_diagnostics(value['diagnostics']) is None):
         return None
     return dict(value)
 
@@ -46,6 +70,10 @@ def exception_report(phase, exc, proactive_type=None):
             report['assertion_kind'] = exc.kind
             if exc.kind == 'helper_result' and type(exc.helper_error) is str and exc.helper_error in HELPER_ERRORS:
                 report['helper_error'] = exc.helper_error
+            if exc.kind == 'helper_result':
+                diagnostics = helper_diagnostics(getattr(exc, 'diagnostics', None))
+                if diagnostics is not None:
+                    report['diagnostics'] = diagnostics
     return browser_failure(report)
 
 

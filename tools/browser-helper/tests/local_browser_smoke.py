@@ -157,11 +157,15 @@ async def navigation_readiness_case(page, report):
 
 
 class ProactiveSelfFailure(AssertionError):
-    """Test-only classification; reporters must allowlist both attributes."""
-    def __init__(self, kind, helper_error=None):
+    """Test-only classification; reporters must validate all attributes."""
+    def __init__(self, kind, helper_error=None, diagnostics=None):
         super().__init__()
         self.kind = kind
         self.helper_error = helper_error
+        self.diagnostics = None if diagnostics is None else {key: diagnostics[key] for key in (
+            'phase', 'page', 'exception', 'failure_request', 'login_requested', 'login_json',
+            'pending_login', 'self_requested', 'self_json', 'user_state_ready',
+            'login_status', 'self_status', 'login_success', 'self_success')}
 
 
 async def proactive_self_case(browser, context, page, report):
@@ -248,11 +252,12 @@ async def proactive_self_case(browser, context, page, report):
 
     try:
         async with asyncio.timeout(3):
+            state = {}
             with patch.object(core, 'ORIGIN', origin), patch.object(core, 'safe_url', local_safe), \
                     patch.object(core, 'filtered_cookies', local_cookies), patch.object(core, 'browser_launcher', return_value=launch):
-                result = await core.run_login(core.LoginInput('synthetic-user', 'synthetic-password', 2000))
+                result = await core.run_login(core.LoginInput('synthetic-user', 'synthetic-password', 2000), state)
             if not (result['ok'] and result['api_user'] == '42'):
-                raise ProactiveSelfFailure('helper_result', result.get('error'))
+                raise ProactiveSelfFailure('helper_result', result.get('error'), core.diagnostics(state))
             if not any(c['name'] == 'fixture_session' and c['http_only'] and c['path'] == '/api' for c in result['cookies']):
                 raise ProactiveSelfFailure('returned_cookie')
             if observed != {'self': 1, 'authorized': True, 'marker_absent': True}:

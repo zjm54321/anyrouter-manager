@@ -150,6 +150,30 @@ def diagnostic_envelopes(smoke, native, proactive_type):
             assert ('helper_error' in detail) == (kind == 'helper_result' and error != sentinel)
             assert len(json.dumps(detail).encode()) < 4096
     detail = browser.exception_report('proactive_self', proactive_type('helper_result', 'user_self_unverified'), proactive_type)
+    # Distinguish failed JSON observation from an explicit negative login while
+    # forwarding only the approved finite subset through both wire boundaries.
+    from browser_helper import core
+    for login_json, login_success in ((False, None), (True, False)):
+        state = {'phase': 'profile_wait', 'page': 'console', 'login_requested': True,
+                 'login_status': 200, 'login_json': login_json, 'login_success': login_success,
+                 'body': sentinel, 'cookie': sentinel, 'url': sentinel}
+        exc = proactive_type('helper_result', 'login_failed', core.diagnostics(state))
+        detail = browser.exception_report('proactive_self', exc, proactive_type)
+        diagnostics = detail['diagnostics']
+        assert diagnostics['login_json'] is login_json and diagnostics['login_success'] is login_success
+        wire = json.dumps({'supervisor_probe': 'failed', 'stage': 'browser_normal', 'browser_failure': detail}).encode()
+        assert len(wire) < 4096 and sentinel.encode() not in wire
+        assert smoke.supervisor_failure(wire)['browser_failure'] == detail
+        for invalid in (diagnostics | {'body': sentinel}, diagnostics | {'phase': sentinel},
+                        diagnostics | {'login_json': 1}, diagnostics | {'login_success': 'false'},
+                        diagnostics | {'login_status': True}, diagnostics | {'self_status': 600}):
+            rejected = detail | {'diagnostics': invalid}
+            assert browser.browser_failure(rejected) is None
+            assert smoke.supervisor_failure(json.dumps({'supervisor_probe': 'failed', 'stage': 'browser_normal',
+                                                       'browser_failure': rejected}).encode()) is None
+        assert browser.browser_failure(detail | {'assertion_kind': 'returned_cookie'}) is None
+    # Keep diagnostics on the detail used below: real pipe, supervisor main and
+    # final smoke evidence must all preserve it without turning failure to pass.
     envelope = {'supervisor_probe': 'failed', 'stage': 'browser_normal', 'browser_failure': detail}
     for stage in ('capability', *(f'synthetic_{mode}' for mode in native.MODES), 'browser_normal', 'browser_timeout'):
         assert smoke.supervisor_failure(json.dumps({'supervisor_probe': 'blocked' if stage == 'capability' else 'failed',
