@@ -105,5 +105,3 @@ npm --prefix frontend test
 ## 许可证 (License)
 
 本项目原创代码基于 [GNU General Public License v3.0 or later (GPL-3.0-or-later)](LICENSE) 开源，第三方依赖许可证声明详见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
-
-本项目引用的 CloakBrowser 预编译二进制遵循其独立的专有许可条款（详见 [CloakBrowser BINARY-LICENSE](https://github.com/CloakHQ/CloakBrowser/blob/7e626ee7a1b0e72ab2c9b98315c36302148df1ce/BINARY-LICENSE.md)）。依据该许可证的“Cloud Container Internal Use”条款，用户用于个人内部私有容器环境（非公开分发）符合其许可规范。严禁将 CloakBrowser 专有二进制整体声称为 GPL。
