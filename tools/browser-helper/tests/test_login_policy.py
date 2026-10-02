@@ -28,9 +28,10 @@ class LoginPolicyTests(unittest.IsolatedAsyncioTestCase):
         from playwright._impl._driver import compute_driver_executable
 
         fixtures = [({'title': title}, True) for title in
-                    ('公告', '通知', 'Notice', 'Announcement', 'notice', '系统公告')]
+                    ('公告', '通知', 'Notice', 'System Notice', 'Announcement', 'notice', '系统公告')]
         fixtures += [({'title': title}, False) for title in
-                     ('系统通知', '系统公告说明', '重要系统公告', '公告验证', 'Unknown', '')]
+                     ('系统通知', '系统公告说明', '重要系统公告', '公告验证', 'Unknown', '',
+                      'System Notification', 'System Notice Extra', 'Important System Notice')]
         fixtures += [({'body': word}, False) for word in
                      ('验证码', '验证', '协议', '条款', '同意', 'captcha', 'verify',
                       'agreement', 'terms', 'consent')]
@@ -42,6 +43,9 @@ class LoginPolicyTests(unittest.IsolatedAsyncioTestCase):
         fixtures += [({'close_count': count}, False) for count in (0, 2)]
         fixtures += [({'close_form': True}, False), ({'close_type': 'submit'}, False)]
         fixtures += [({'body': '登录后可以查看服务通知 / Registration and login information'}, True)]
+        # Apply the same exclusions to the newly observed English title.
+        fixtures += [(dict(fixture, title='System Notice'), expected)
+                     for fixture, expected in fixtures.copy() if 'title' not in fixture]
         script = r"""
 const {predicate, fixtures} = JSON.parse(require('node:fs').readFileSync(0, 'utf8'));
 const eligible = eval('(' + predicate + ')');

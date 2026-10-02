@@ -1,5 +1,6 @@
 """Mock/static evidence only. Does not claim an image or runtime was tested."""
 import ast
+import asyncio
 import base64
 import importlib.util
 import io
@@ -15,6 +16,73 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def browser_notice_wiring():
+    """Execute the real adapter with mocks, not a browser/runtime pass."""
+    from unittest.mock import AsyncMock, Mock
+    spec = importlib.util.spec_from_file_location("browser_probe", ROOT / "tests/container/browser_probe.py")
+    adapter = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(adapter)
+    for scenario in ("normal", "timeout", "fixture_failure", "wrong_count", "render_failure"):
+        page = SimpleNamespace(goto=AsyncMock(), evaluate=AsyncMock(return_value=2),
+                               route=AsyncMock(), unroute=AsyncMock())
+        context = SimpleNamespace(new_page=AsyncMock(return_value=page), route=AsyncMock(), close=AsyncMock())
+        browser = SimpleNamespace(new_context=AsyncMock(return_value=context), close=AsyncMock())
+        launch = AsyncMock(return_value=browser)
+        launcher = Mock(return_value=launch)
+        finish = Mock()
+        finish.exists.side_effect = [False, True]
+        ready = Mock()
+        sleep = AsyncMock(side_effect=RuntimeError("intentional_timeout") if scenario == "timeout" else None)
+
+        async def fixture(actual_page, report, render):
+            assert actual_page is page
+            if scenario == "fixture_failure":
+                raise AssertionError("fixture_failed")
+            if scenario == "render_failure":
+                page.goto.side_effect = RuntimeError("render_failed")
+            await render("<h5>synthetic fixture</h5>")
+            url, serve = page.route.await_args.args
+            assert url == "https://anyrouter.top/login"
+            route = SimpleNamespace(fulfill=AsyncMock())
+            await serve(route)
+            route.fulfill.assert_awaited_once_with(status=200, content_type="text/html; charset=utf-8",
+                                                  body="<h5>synthetic fixture</h5>")
+            page.unroute.assert_awaited_once_with(url, serve)
+            report["native_notice_backdrop_cases"] = 9 if scenario == "wrong_count" else 10
+
+        invoke = AsyncMock(side_effect=fixture)
+        modules = {"browser_helper.core": SimpleNamespace(browser_launcher=launcher),
+                   "local_browser_smoke": SimpleNamespace(notice_backdrop_cases=invoke)}
+        with patch.dict("sys.modules", modules), patch.object(adapter.sys, "path", adapter.sys.path.copy()), \
+                patch.object(adapter.sys, "stdin", SimpleNamespace(buffer=io.BytesIO(b"{}\n"))), \
+                patch.object(adapter, "Path", side_effect=lambda name: ready if name == "ready" else finish), \
+                patch.object(adapter.asyncio, "sleep", sleep), redirect_stdout(io.StringIO()) as printed:
+            try:
+                asyncio.run(adapter.main())
+            except (AssertionError, RuntimeError):
+                assert scenario != "normal"
+            else:
+                assert scenario == "normal", "fixture failure swallowed"
+        launcher.assert_called_once_with()
+        launch.assert_awaited_once_with(headless=True)
+        ready.write_text.assert_called_once()
+        sleep.assert_awaited_once_with(.01)
+        context.route.assert_awaited_once()
+        assert context.route.await_args.args[0] == "**/*"
+        assert invoke.await_count == (0 if scenario == "timeout" else 1)
+        if scenario == "normal":
+            assert json.loads(printed.getvalue()) == {
+                "fixture": "done", "notice_backdrop_cases": 10, "notice_backdrop": "passed"}
+            assert page.goto.await_args.args == ("about:blank",)
+            assert page.evaluate.await_count == 2
+            context.close.assert_awaited_once()
+            browser.close.assert_awaited_once()
+        else:
+            assert printed.getvalue() == ""  # Rust must receive helper failure, not success.
+        if scenario == "render_failure":
+            page.unroute.assert_awaited_once()  # Synthetic route cannot survive render failure.
 
 
 def main():
@@ -496,6 +564,12 @@ def main():
     assert "stdout=subprocess.PIPE, stderr=subprocess.DEVNULL" in probe
     browser_probe = (ROOT / "tests/container/browser_probe.py").read_text()
     assert 'await context.route("**/*"' in browser_probe and 'page.goto("about:blank")' in browser_probe
+    assert 'from local_browser_smoke import notice_backdrop_cases' in browser_probe
+    assert browser_probe.index('while not Path("finish").exists():') < browser_probe.index(
+        'await notice_backdrop_cases(page, report, render)') < browser_probe.index('await context.close()')
+    assert 'assert report == {"native_notice_backdrop_cases": 10}' in browser_probe
+    browser_notice_wiring()
+    checks += 1
     assert '/tmp/browser_probe.py' in probe and 'start_worker(helper, directory)' in probe
     assert '"/tmp/browser_probe.py"' not in smoke  # never docker-exec Python browser directly
     checks += 1

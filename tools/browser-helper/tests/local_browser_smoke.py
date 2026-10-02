@@ -22,6 +22,68 @@ from browser_helper.__main__ import reserve_protocol_fd, write_all
 BINARY = '/nix/store/sv231g34qjil8r23fc43i1mnlmyvgzhn-cloakbrowser-chromium-146.0.7680.177.5/bin/cloakbrowser-chrome'
 
 
+async def notice_backdrop_cases(page, report, render):
+    # Only synthetic DOM: no credentials, submit events, or upstream requests.
+    cases = [(title, '', delayed, True) for title in ('系统公告', 'System Notice')
+             for delayed in (False, True)]
+    cases += [('System Notification', '', False, False)]
+    cases += [('System Notice', body, False, False) for body in
+              ('Please accept the agreement and terms', 'Verify captcha',
+               '<input>', '<iframe></iframe>', '<div class="g-recaptcha"></div>')]
+    for index, (title, body, delayed, expected) in enumerate(cases):
+        report['phase'] = 'notice_backdrop_' + str(index)
+        content = (
+            '<div class="semi-modal-content" style="position:relative;z-index:1">'
+            f'<h5 class="semi-modal-title" style="display:flex">{title}</h5>{body}'
+            '<button type="button" class="semi-modal-close" '
+            'onclick="window.closedCount++;document.querySelector(\'#notice-shell\').remove()">'
+            '<span class="semi-icon-close">X</span></button></div>')
+        await render(
+            '<script>window.closedCount=0;window.submitCount=0</script>'
+            '<form onsubmit="event.preventDefault();window.submitCount++">'
+            '<input id="username"><input id="password" type="password">'
+            '<button id="continue" type="submit">Continue</button></form>'
+            '<div id="notice-shell" style="position:fixed;inset:0;z-index:100">'
+            '<div id="backdrop" style="position:absolute;inset:0;background:white"></div>'
+            + (f'<template id="pending-modal">{content}</template>' if delayed else
+               f'<div role="dialog">{content}</div>') + '</div>')
+        button = await core.owned_submit(page, page.locator('#username'), page.locator('#password'))
+        assert button is not None
+        unobstructed = """b => {
+            const r=b.getBoundingClientRect();
+            const hit=document.elementFromPoint(r.x+r.width/2,r.y+r.height/2);
+            return hit===b || b.contains(hit);
+        }"""
+        assert not await button.evaluate(unobstructed)
+        if delayed:
+            # Deterministic fixture mounting, NOT a production wait/race fix.
+            assert await page.locator('[role="dialog"]').count() == 0
+            await page.evaluate("""() => {
+                const dialog=document.createElement('div');
+                dialog.setAttribute('role','dialog');
+                dialog.append(document.querySelector('#pending-modal').content.cloneNode(true));
+                document.querySelector('#notice-shell').append(dialog);
+            }""")
+        dialog = page.locator('[role="dialog"]')
+        await dialog.wait_for(state='visible', timeout=3000)
+        assert await dialog.locator('h5.semi-modal-title').inner_text() == title
+        assert await dialog.evaluate(core.NOTICE_ELIGIBLE_JS) == expected
+        state = dict(deadline=asyncio.get_running_loop().time()+5, submitted=False)
+        assert await core.dismiss_notice_once(page, state) == expected
+        assert not await core.dismiss_notice_once(page, state)
+        assert await page.evaluate('window.closedCount') == int(expected)
+        if expected:
+            assert await page.locator('#notice-shell').count() == 0
+            assert await button.evaluate(unobstructed)
+            await button.click(trial=True, timeout=3000)
+        else:
+            assert await dialog.is_visible()
+            assert not await button.evaluate(unobstructed)
+        assert await page.evaluate('window.submitCount') == 0
+    report['native_notice_backdrop_cases'] = len(cases)
+    report.pop('phase', None)
+
+
 async def ui_policy_cases(page, report, render):
     # Actual browser HTML5 .form resolution, including explicit external owners.
     fields = "<input id='username'><input id='password' type='password'>"
@@ -74,6 +136,7 @@ async def ui_policy_cases(page, report, render):
         assert await core.dismiss_notice_once(page, state) == (not challenge)
         assert await page.evaluate('window.closedCount') == int(not challenge)
     report['native_nested_notice_cases'] = 2
+    await notice_backdrop_cases(page, report, render)
     report.pop('phase', None)
 
 
