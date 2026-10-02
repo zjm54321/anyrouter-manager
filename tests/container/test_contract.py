@@ -206,7 +206,8 @@ def main():
             assert report["web_smoke"] == "passed" and report["publish_ready"] == (scenario == "passed")
             assert ("publish_ready=true" in output.read_text()) == (scenario == "passed")
             assert ("tested_image_id=" in output.read_text()) == (scenario == "passed")
-        assert calls[-1][1] == "rm"
+        lifecycle_calls = [args for args in calls if args[1] != "inspect"]
+        assert lifecycle_calls[-1][1] == "rm"
         if scenario == "denied":
             assert report["capability_gate"] == "blocked" and report["descendant_cleanup"] == "not_passed"
             assert not any(args[1] == "exec" and args[-1] == "/tmp/supervisor_probe.py" for args in calls)
@@ -216,6 +217,120 @@ def main():
         assert next(args for args in calls if args[1] == "run")[-1] == "sha256:" + "a" * 64
     for flags in ((False, "passed", True, True), (True, "blocked", True, True), (True, "passed", False, True), (True, "passed", True, False)):
         assert not smoke_module.publication_ready(*flags)
+    checks += 1
+
+    # Three probe sources share one stdin transport. Credentials travel only in
+    # the later HTTP invocation, not argv, environment, or installed source.
+    calls = []
+
+    def transport_command(args, **kwargs):
+        calls.append((args, kwargs))
+        return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    with patch.object(smoke_module, "command", transport_command):
+        for probe in smoke_module.PROBES:
+            smoke_module.install_probe("fixture-container", probe, smoke_module.Evidence())
+    assert len(calls) == 3
+    for (args, kwargs), probe in zip(calls, smoke_module.PROBES):
+        assert args == ["docker", "exec", "--interactive", "fixture-container", "python", "-B",
+                        "-c", smoke_module.PROBE_WRITER, probe]
+        assert kwargs["input"] == (ROOT / "tests/container" / probe).read_bytes()
+        assert kwargs["timeout"] == 15 and "env" not in kwargs
+    assert '"docker", "cp"' not in smoke
+    checks += 1
+
+    # Execute the actual fixed writer against in-memory stdin/file mocks, never
+    # local /tmp probe files. Creation is exclusive, no-follow, and private.
+    from unittest.mock import MagicMock
+    source = b'print("synthetic probe")\n'
+    for probe in smoke_module.PROBES:
+        stream = MagicMock()
+        with patch.object(smoke_module.sys, "argv", ["-c", probe]), \
+                patch.object(smoke_module.sys, "stdin", SimpleNamespace(buffer=io.BytesIO(source))), \
+                patch.object(smoke_module.os, "open", return_value=71) as opened, \
+                patch.object(smoke_module.os, "fdopen", return_value=stream):
+            exec(compile(smoke_module.PROBE_WRITER, "<fixed-probe-writer>", "exec"), {})
+        opened.assert_called_once_with("/tmp/" + probe, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        stream.__enter__.return_value.write.assert_called_once_with(source)
+    for probe, content in (("../arbitrary", source), ("http_probe.py", b""), ("http_probe.py", b"x" * 65537)):
+        with patch.object(smoke_module.sys, "argv", ["-c", probe]), \
+                patch.object(smoke_module.sys, "stdin", SimpleNamespace(buffer=io.BytesIO(content))), \
+                patch.object(smoke_module.os, "open") as opened:
+            try:
+                exec(compile(smoke_module.PROBE_WRITER, "<fixed-probe-writer>", "exec"), {})
+            except AssertionError:
+                pass
+            else:
+                raise AssertionError("unsafe probe transport accepted")
+            opened.assert_not_called()
+    checks += 1
+
+    # A transport denial, stopped backend, or invalid zero-exit probe output
+    # must block publication and preserve fixed evidence BEFORE Docker removal.
+    for scenario in ("readonly_transport", "stopped", "invalid_json", "transport_timeout", "supervisor_transport", "browser_transport"):
+        calls = []
+        sentinel = "SENTINEL-private-never-reflect"
+
+        def diagnostic_command(args, **kwargs):
+            calls.append(args)
+            code, body, stderr = 0, b"", b""
+            assert sentinel not in " ".join(args)
+            if args[1:3] == ["image", "inspect"]:
+                body = ("sha256:" + "a" * 64 + "\n").encode()
+            elif args[1] == "inspect":
+                assert args[2:4] == ["--format", smoke_module.STATE_FORMAT]
+                body = b"exited 1\n" if scenario == "stopped" else b"running 0\n"
+            elif args[1] == "exec" and "-c" in args:
+                assert sentinel.encode() not in kwargs["input"] and "env" not in kwargs
+                if scenario == "transport_timeout":
+                    raise smoke_module.subprocess.TimeoutExpired(args, 15, output=sentinel, stderr=sentinel)
+                if scenario in ("readonly_transport", "stopped") or (
+                        scenario == "supervisor_transport" and args[-1] == "supervisor_probe.py") or (
+                        scenario == "browser_transport" and args[-1] == "browser_probe.py"):
+                    code = 1
+                    stderr = (("container is not running " if scenario == "stopped" else "Read-only file system ") + sentinel).encode()
+            elif args[-1] == "/tmp/http_probe.py":
+                assert json.loads(kwargs["input"]) == {"root": sentinel}
+                body = sentinel.encode() if scenario == "invalid_json" else b'{"http_probe":"passed"}'
+            return SimpleNamespace(returncode=code, stdout=body, stderr=stderr)
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "outputs"
+            with patch.object(smoke_module, "command", diagnostic_command), \
+                    patch.object(smoke_module.os, "getuid", return_value=1000), \
+                    patch.object(smoke_module.secrets, "token_urlsafe", return_value=sentinel), \
+                    patch.dict(os.environ, {"GITHUB_OUTPUT": str(output)}), \
+                    redirect_stdout(io.StringIO()) as printed:
+                status = smoke_module.main("fixture:ci")
+            report = json.loads(printed.getvalue())
+            assert status == 1 and report["publish_ready"] is False and report["cleanup"] is True
+            assert output.read_text() == "publish_ready=false\n"
+            assert sentinel not in printed.getvalue()
+            failure = report["failure"]
+            assert set(failure) == {"cmdkind", "returncode", "category", "container_state", "container_exitcode"}
+            assert failure["category"] == {
+                "readonly_transport": "read_only_filesystem", "stopped": "container_not_running",
+                "invalid_json": "invalid_probe_response", "transport_timeout": "command_timeout",
+                "supervisor_transport": "read_only_filesystem", "browser_transport": "read_only_filesystem"}[scenario]
+            assert failure["cmdkind"] == ("http_probe" if scenario == "invalid_json" else "probe_install")
+            expected_stage = "http_auth" if scenario == "invalid_json" else (
+                "supervisor_browser_cleanup" if scenario in ("supervisor_transport", "browser_transport") else "http_probe_install")
+            assert report["stage"] == expected_stage
+            assert failure["container_state"] == ("exited" if scenario == "stopped" else "running")
+            assert failure["container_exitcode"] == (1 if scenario == "stopped" else 0)
+            assert failure["returncode"] == (None if scenario == "transport_timeout" else 0 if scenario == "invalid_json" else 1)
+            assert calls[-2][1] == "inspect" and calls[-1][1] == "rm"
+            assert not any(args[-1] == "--capability" for args in calls)
+    checks += 1
+
+    # Malicious/oversized inspect or stderr output cannot become report text.
+    evidence = smoke_module.Evidence()
+    for body in (b"SENTINEL-private-state", b"running 0\n" + b"x" * 200, b"running 999\n"):
+        with patch.object(smoke_module, "command", return_value=SimpleNamespace(returncode=0, stdout=body)):
+            detail = evidence.failure("fixture", True)
+        assert detail["container_exitcode"] is None and "SENTINEL" not in json.dumps(detail)
+    assert smoke_module.error_category(b"SENTINEL-private-docker-error") == "command_failed"
+    assert smoke_module.error_category(b"x" * 8192 + b"permission denied") == "command_failed"
     checks += 1
 
     spec = importlib.util.spec_from_file_location("supervisor_probe", ROOT / "tests/container/supervisor_probe.py")
