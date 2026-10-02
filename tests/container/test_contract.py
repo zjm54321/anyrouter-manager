@@ -24,7 +24,8 @@ def browser_notice_wiring():
     spec = importlib.util.spec_from_file_location("browser_probe", ROOT / "tests/container/browser_probe.py")
     adapter = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(adapter)
-    for scenario in ("normal", "timeout", "fixture_failure", "wrong_count", "render_failure"):
+    for scenario in ("normal", "timeout", "fixture_failure", "wrong_count", "render_failure",
+                     "navigation_failure", "navigation_wrong_count"):
         page = SimpleNamespace(goto=AsyncMock(), evaluate=AsyncMock(return_value=2),
                                route=AsyncMock(), unroute=AsyncMock())
         context = SimpleNamespace(new_page=AsyncMock(return_value=page), route=AsyncMock(), close=AsyncMock())
@@ -53,8 +54,17 @@ def browser_notice_wiring():
             report["native_notice_backdrop_cases"] = 9 if scenario == "wrong_count" else 10
 
         invoke = AsyncMock(side_effect=fixture)
+
+        async def navigation_fixture(actual_page, report):
+            assert actual_page is page and report == {"native_notice_backdrop_cases": 10}
+            if scenario == "navigation_failure":
+                raise AssertionError("navigation_fixture_failed")
+            report["native_navigation_readiness_cases"] = 0 if scenario == "navigation_wrong_count" else 1
+
+        navigation = AsyncMock(side_effect=navigation_fixture)
         modules = {"browser_helper.core": SimpleNamespace(browser_launcher=launcher),
-                   "local_browser_smoke": SimpleNamespace(notice_backdrop_cases=invoke)}
+                   "local_browser_smoke": SimpleNamespace(notice_backdrop_cases=invoke,
+                                                          navigation_readiness_case=navigation)}
         with patch.dict("sys.modules", modules), patch.object(adapter.sys, "path", adapter.sys.path.copy()), \
                 patch.object(adapter.sys, "stdin", SimpleNamespace(buffer=io.BytesIO(b"{}\n"))), \
                 patch.object(adapter, "Path", side_effect=lambda name: ready if name == "ready" else finish), \
@@ -72,9 +82,11 @@ def browser_notice_wiring():
         context.route.assert_awaited_once()
         assert context.route.await_args.args[0] == "**/*"
         assert invoke.await_count == (0 if scenario == "timeout" else 1)
+        assert navigation.await_count == (0 if scenario in ("timeout", "fixture_failure", "render_failure") else 1)
         if scenario == "normal":
             assert json.loads(printed.getvalue()) == {
-                "fixture": "done", "notice_backdrop_cases": 10, "notice_backdrop": "passed"}
+                "fixture": "done", "notice_backdrop_cases": 10, "notice_backdrop": "passed",
+                "navigation_readiness_cases": 1}
             assert page.goto.await_args.args == ("about:blank",)
             assert page.evaluate.await_count == 2
             context.close.assert_awaited_once()
@@ -567,7 +579,9 @@ def main():
     assert 'from local_browser_smoke import notice_backdrop_cases' in browser_probe
     assert browser_probe.index('while not Path("finish").exists():') < browser_probe.index(
         'await notice_backdrop_cases(page, report, render)') < browser_probe.index('await context.close()')
-    assert 'assert report == {"native_notice_backdrop_cases": 10}' in browser_probe
+    assert browser_probe.index('await notice_backdrop_cases(page, report, render)') < browser_probe.index(
+        'await navigation_readiness_case(page, report)') < browser_probe.index('await context.close()')
+    assert 'assert report == {"native_notice_backdrop_cases": 10, "native_navigation_readiness_cases": 1}' in browser_probe
     browser_notice_wiring()
     checks += 1
     assert '/tmp/browser_probe.py' in probe and 'start_worker(helper, directory)' in probe

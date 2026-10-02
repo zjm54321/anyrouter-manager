@@ -84,6 +84,78 @@ async def notice_backdrop_cases(page, report, render):
     report.pop('phase', None)
 
 
+async def navigation_readiness_case(page, report):
+    """Real DOM readiness, not a wall-clock latency or upstream login test.
+
+    Hold a deferred script until commit is observed, then hold an image through
+    DOMContentLoaded. Only after goto resolves may the production form guards
+    inspect the empty fields. Everything is fulfilled locally on the same page.
+    """
+    url = core.ORIGIN + '/login?navigation-fixture=1'
+    script_url, image_url = core.ORIGIN + '/fixture-defer.js', core.ORIGIN + '/fixture-image.svg'
+    script_requested, image_requested = asyncio.Event(), asyncio.Event()
+    release_script, release_image = asyncio.Event(), asyncio.Event()
+    html = '''<!doctype html><html><head><script>
+        window.fixture={script:false,dom:false,load:false};
+        document.addEventListener('DOMContentLoaded',()=>window.fixture.dom=true);
+        window.addEventListener('load',()=>window.fixture.load=true);
+        </script><script defer src="/fixture-defer.js"></script></head>
+        <body><img src="/fixture-image.svg"><main></main></body></html>'''
+
+    async def document(route):
+        await route.fulfill(status=200, content_type='text/html', body=html)
+
+    async def deferred(route):
+        script_requested.set()
+        await release_script.wait()
+        await route.fulfill(status=200, content_type='application/javascript', body='''
+            window.fixture.script=true;
+            document.querySelector('main').innerHTML='<form><input id="username">' +
+                '<input id="password" type="password"><button type="submit">Continue</button></form>';
+        ''')
+
+    async def image(route):
+        image_requested.set()
+        await release_image.wait()
+        await route.fulfill(status=200, content_type='image/svg+xml',
+                            body='<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"/>')
+
+    installed, navigation = [], None
+    try:
+        # Short event-driven fixture cap; no extra launch or supervisor budget.
+        async with asyncio.timeout(3):
+            for target, handler in ((url, document), (script_url, deferred), (image_url, image)):
+                await page.route(target, handler)
+                installed.append((target, handler))
+            navigation = asyncio.create_task(page.goto(url, wait_until='domcontentloaded', timeout=2000))
+            await script_requested.wait()
+            await image_requested.wait()
+            await page.wait_for_url(url, wait_until='commit', timeout=2000)
+            assert not navigation.done()
+            assert await page.evaluate('window.fixture') == {'script': False, 'dom': False, 'load': False}
+            assert await page.locator('#username').count() == 0
+            release_script.set()
+            await navigation
+            assert await page.evaluate('window.fixture') == {'script': True, 'dom': True, 'load': False}
+            state = dict(deadline=asyncio.get_running_loop().time()+1, submitted=False,
+                         network_failed=False, http_block=False)
+            username, password, _ = await core.find_form(page, state)
+            assert await username.input_value() == await password.input_value() == ''
+            release_image.set()
+            await page.wait_for_load_state('load', timeout=2000)
+            assert await page.evaluate('window.fixture') == {'script': True, 'dom': True, 'load': True}
+    finally:
+        release_script.set()
+        release_image.set()
+        if navigation is not None:
+            if not navigation.done():
+                navigation.cancel()
+            await asyncio.gather(navigation, return_exceptions=True)
+        for target, handler in reversed(installed):
+            await page.unroute(target, handler)
+    report['native_navigation_readiness_cases'] = 1
+
+
 async def ui_policy_cases(page, report, render):
     # Actual browser HTML5 .form resolution, including explicit external owners.
     fields = "<input id='username'><input id='password' type='password'>"

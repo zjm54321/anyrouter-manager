@@ -531,7 +531,7 @@ async def login_work(credentials, launch, resources, state):
     page = await context.new_page()
     page.set_default_timeout(5000)
     state['phase'] = 'navigation'
-    response = await page.goto(ORIGIN + '/login', wait_until='domcontentloaded', timeout=20_000)
+    response = await page.goto(ORIGIN + '/login', wait_until='domcontentloaded', timeout=action_timeout(state, MAX_TIMEOUT_MS))
     state['http_block'] = response is not None and response.status in (403, 429, 503)
     captured = None
     login_error = None
