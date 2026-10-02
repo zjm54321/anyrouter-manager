@@ -1,4 +1,6 @@
 import asyncio
+import json
+import subprocess
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -19,6 +21,64 @@ class Group:
 
 class LoginPolicyTests(unittest.IsolatedAsyncioTestCase):
     execute = test_helper.LoginTests.execute
+
+    def test_notice_real_js_exact_titles_and_security_exclusions(self):
+        # Run the production predicate, not a mocked evaluate(True). Playwright
+        # already supplies Node; the Nix shell overrides its executable path.
+        from playwright._impl._driver import compute_driver_executable
+
+        fixtures = [({'title': title}, True) for title in
+                    ('公告', '通知', 'Notice', 'Announcement', 'notice', '系统公告')]
+        fixtures += [({'title': title}, False) for title in
+                     ('系统通知', '系统公告说明', '重要系统公告', '公告验证', 'Unknown', '')]
+        fixtures += [({'body': word}, False) for word in
+                     ('验证码', '验证', '协议', '条款', '同意', 'captcha', 'verify',
+                      'agreement', 'terms', 'consent')]
+        fixtures += [({'control': control}, False) for control in
+                     ('input', 'textarea', 'select', 'form', 'iframe',
+                      '[contenteditable="true"]', '.nc-container', '#nocaptcha',
+                      '.cf-turnstile', '.g-recaptcha')]
+        fixtures += [({'title_count': count}, False) for count in (0, 2)]
+        fixtures += [({'close_count': count}, False) for count in (0, 2)]
+        fixtures += [({'close_form': True}, False), ({'close_type': 'submit'}, False)]
+        fixtures += [({'body': '登录后可以查看服务通知 / Registration and login information'}, True)]
+        script = r"""
+const {predicate, fixtures} = JSON.parse(require('node:fs').readFileSync(0, 'utf8'));
+const eligible = eval('(' + predicate + ')');
+const results = fixtures.map(f => {
+    const title = f.title ?? '系统公告';
+    const d = {
+        innerText: title + '\n' + (f.body ?? ''),
+        querySelectorAll(selector) {
+            if (selector === '.semi-modal-title')
+                return Array.from({length: f.title_count ?? 1}, () => ({innerText: title}));
+            if (selector === 'button.semi-modal-close:has(.semi-icon-close)')
+                return Array.from({length: f.close_count ?? 1}, () => ({
+                    form: f.close_form ? {} : null, type: f.close_type ?? 'button'
+                }));
+            throw new Error('unexpected fixture selector');
+        },
+        querySelector(selector) {
+            return selector.split(',').includes(f.control) ? {} : null;
+        }
+    };
+    return eligible(d);
+});
+process.stdout.write(JSON.stringify(results));
+"""
+        node, _ = compute_driver_executable()
+        process = subprocess.run(
+            [node, '-e', script],
+            input=json.dumps({'predicate': core.NOTICE_ELIGIBLE_JS,
+                              'fixtures': [fixture for fixture, _ in fixtures]}),
+            text=True, capture_output=True, check=True, timeout=5,
+        )
+        self.assertEqual(process.stderr, '')
+        results = json.loads(process.stdout)
+        self.assertEqual(len(results), len(fixtures))
+        for (fixture, expected), actual in zip(fixtures, results):
+            with self.subTest(fixture=fixture):
+                self.assertIs(actual, expected)
 
     async def test_auto_signin_queries_and_write_methods_never_fetch_or_poison_login(self):
         page = FakePage(response())

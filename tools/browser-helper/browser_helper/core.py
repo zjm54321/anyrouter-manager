@@ -380,7 +380,7 @@ async def owned_submit(page, username, password):
 
 NOTICE_ELIGIBLE_JS = r"""d => {
     const titles=d.querySelectorAll('.semi-modal-title');
-    if (titles.length!==1 || !/^(公告|通知|Notice|Announcement)$/i.test(titles[0].innerText.trim())) return false;
+    if (titles.length!==1 || !/^(公告|通知|系统公告|Notice|Announcement)$/i.test(titles[0].innerText.trim())) return false;
     // Informational notices may mention login/registration. Challenge and
     // agreement content still forbids dismissal; title remains exact above.
     if (/验证码|验证|协议|条款|同意|captcha|verify|agreement|terms|consent/i.test(d.innerText)) return false;
