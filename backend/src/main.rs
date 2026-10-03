@@ -4,6 +4,7 @@ mod config;
 mod diagnostics;
 mod error;
 mod gateway;
+mod gateway_settings;
 mod helper;
 mod hybrid;
 mod log_api;
@@ -12,6 +13,7 @@ mod logging;
 mod model;
 mod model_filter;
 mod request_log;
+mod responses_compat;
 mod store;
 mod supervisor;
 mod system_log;
@@ -50,6 +52,8 @@ async fn run() -> Result<(), &'static str> {
         return Err("Usage: backend [--config PATH]");
     }
     let config = config::Config::load(&path)?;
+    let gateway_settings =
+        gateway_settings::SharedGatewaySettings::open(config.gateway_settings_path()).await?;
     let preferences = log_settings::SharedLogSettings::open(config.log_settings_path()).await?;
     let system =
         system_log::SystemLogSink::open(config.system_log_path(), preferences.clone()).await?;
@@ -91,6 +95,7 @@ async fn run() -> Result<(), &'static str> {
         Some(logs),
         Some(preferences),
         Some(system),
+        gateway_settings,
     );
     *app.checkin.lock().await = checkin::load(&app.config.checkin_path())?;
     {

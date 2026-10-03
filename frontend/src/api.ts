@@ -132,6 +132,7 @@ export interface RequestLogItem {
   http_status: number | null;
   error_body: string | null;
   truncated: boolean;
+  forwarding_mode?: "pass" | "adapt" | null;
 }
 
 export interface RequestLogsResponse {
@@ -419,6 +420,28 @@ export async function fetchRequestLogs(
     }
     return { items: [], dropped_count: 0 };
   }
+}
+
+export type GatewayResponsesMode = "pass" | "adapt" | "auto";
+
+export interface GatewaySettings {
+  responses_mode: GatewayResponsesMode;
+}
+
+export async function fetchGatewaySettings(signal?: AbortSignal): Promise<GatewaySettings> {
+  return request<GatewaySettings>("/api/gateway-settings", { signal });
+}
+
+export async function updateGatewaySettings(
+  settings: GatewaySettings,
+  signal?: AbortSignal
+): Promise<GatewaySettings> {
+  return request<GatewaySettings>("/api/gateway-settings", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ responses_mode: settings.responses_mode }),
+    signal,
+  });
 }
 
 export async function fetchLogSettings(signal?: AbortSignal): Promise<LogSettings> {

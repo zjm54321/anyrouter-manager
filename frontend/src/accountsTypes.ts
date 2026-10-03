@@ -96,6 +96,7 @@ export interface RequestLogEntry {
   httpStatus: number | null; // null = 未收到响应（不伪造 200）
   errorBody: string | null; // upstream error raw text, non-2xx only
   truncated?: boolean;
+  forwardingMode?: "pass" | "adapt" | null;
 }
 
 export function mapAccountDtoToManaged(
@@ -162,6 +163,7 @@ export function mapLogItemToEntry(item: RequestLogItem): RequestLogEntry {
     httpStatus: item.http_status,
     errorBody: item.error_body,
     truncated: item.truncated,
+    forwardingMode: item.forwarding_mode ?? null,
   };
 }
 

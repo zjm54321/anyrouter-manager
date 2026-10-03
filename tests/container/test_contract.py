@@ -357,9 +357,17 @@ def main():
         "log_settings::tests::update_commit_hot_watch_failure_keeps_old_and_reopen": "log_settings.rs",
         "helper::tests::session_payload_prunes_expired_and_canonicalizes_session_expiry": "helper.rs",
         "helper::tests::session_payload_expired_is_not_malformed_but_unsafe_fields_still_are": "helper.rs",
+        "config::tests::gateway_settings_reject_aliases_and_configuration_destination": "config.rs",
+        "gateway_settings::tests::private_defaults_reopen_and_failed_update_keep_snapshot": "gateway_settings.rs",
+        "gateway_settings::tests::corrupt_versions_unknown_fields_and_symlinks_fail_closed": "gateway_settings.rs",
+        "responses_compat::tests::preserves_raw_values_and_only_inserts_missing_root_key": "responses_compat.rs",
+        "responses_compat::tests::rejects_ambiguous_encoding_duplicates_integrity_and_bounds": "responses_compat.rs",
+        "responses_compat::tests::auto_classifies_only_single_surviving_leading_product": "responses_compat.rs",
+        "request_log::tests::forwarding_mode_is_optional_for_old_logs_and_strict_when_present": "request_log.rs",
+        "tests::gateway_tests::buffered_json_deadlines_are_total_and_cancel_safe": "gateway_tests.rs",
     }
     selected = re.findall(r"^    ([a-zA-Z_][\w:]*)[ \t]*\\?$", rust, re.M)
-    assert len(selected) == len(expected) == 18 and set(selected) == set(expected)
+    assert len(selected) == len(expected) == 26 and set(selected) == set(expected)
     assert f"# Execute {len(expected)} reviewed pure tests;" in docker
     for name, source in expected.items():
         assert name in rust

@@ -715,9 +715,20 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
   color: var(--primary);
   border-color: var(--warn);
 }
-.badge.error {
+.badge.error,
+.badge-error {
   color: var(--primary);
   border-color: var(--error);
+}
+.badge-neutral {
+  background: var(--surface-subtle);
+  border-color: var(--border);
+  color: var(--secondary);
+}
+.badge-accent {
+  background: rgba(13, 148, 136, 0.12);
+  border-color: rgba(13, 148, 136, 0.35);
+  color: var(--teal);
 }
 .error-text {
   color: var(--error);
@@ -1144,6 +1155,51 @@ div.account-card.routed-card {
 .theme-card-title {
   font-weight: 600;
   font-size: 14px;
+}
+
+/* Gateway Responses Mode Selector */
+.gateway-mode-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 10px;
+}
+.gateway-mode-card {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  border: 1px solid var(--border);
+  padding: 12px 14px;
+  border-radius: 8px;
+  cursor: pointer;
+  background: var(--surface);
+  transition: border-color 140ms ease, box-shadow 140ms ease;
+}
+.gateway-mode-card:hover {
+  border-color: var(--accent);
+}
+.gateway-mode-card.active {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+  background: var(--surface-subtle);
+}
+.gateway-mode-card input[type="radio"] {
+  margin-top: 3px;
+  accent-color: var(--accent);
+}
+.gateway-mode-card-body {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.gateway-mode-card-title {
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--primary);
+}
+.gateway-mode-card-desc {
+  line-height: 1.4;
+  font-size: 12px;
+  color: var(--secondary);
 }
 
 /* Locked Layout */

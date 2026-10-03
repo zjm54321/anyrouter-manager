@@ -50,6 +50,7 @@ pub struct App {
     pub logs: Option<crate::request_log::LogSink>,
     pub system_logs: Option<crate::system_log::SystemLogSink>,
     pub log_settings: Option<crate::log_settings::SharedLogSettings>,
+    pub gateway_settings: crate::gateway_settings::SharedGatewaySettings,
     pub login: Arc<dyn LoginProvider>,
     pub stopping: AtomicBool,
     pub isolation_ready: AtomicBool,
@@ -75,7 +76,19 @@ impl App {
         login: Arc<dyn LoginProvider>,
         logs: Option<crate::request_log::LogSink>,
     ) -> Arc<Self> {
-        Self::new_with_system_logs(config, portfolio, upstream, login, logs, None, None)
+        let gateway_settings = crate::gateway_settings::SharedGatewaySettings::test_default(
+            config.gateway_settings_path(),
+        );
+        Self::new_with_system_logs(
+            config,
+            portfolio,
+            upstream,
+            login,
+            logs,
+            None,
+            None,
+            gateway_settings,
+        )
     }
 
     pub fn new_with_system_logs(
@@ -86,6 +99,7 @@ impl App {
         logs: Option<crate::request_log::LogSink>,
         log_settings: Option<crate::log_settings::SharedLogSettings>,
         system_logs: Option<crate::system_log::SystemLogSink>,
+        gateway_settings: crate::gateway_settings::SharedGatewaySettings,
     ) -> Arc<Self> {
         let root = RootAuth::new(&config.root_key);
         config.root_key.clear();
@@ -111,6 +125,7 @@ impl App {
             logs,
             log_settings,
             system_logs,
+            gateway_settings,
             login,
             stopping: AtomicBool::new(false),
             isolation_ready: AtomicBool::new(false),
@@ -318,6 +333,10 @@ pub fn router(app: Arc<App>) -> Router {
             get(crate::log_api::get_settings).put(crate::log_api::put_settings),
         )
         .route("/api/system-logs", get(crate::log_api::get_system))
+        .route(
+            "/api/gateway-settings",
+            get(crate::gateway_settings::get).put(crate::gateway_settings::put),
+        )
         .route("/api/system-logs/clear", post(crate::log_api::clear_system))
         .route("/api/checkin", get(crate::checkin::get_status))
         .route(

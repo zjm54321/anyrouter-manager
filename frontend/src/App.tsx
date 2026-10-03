@@ -94,6 +94,24 @@ export function App() {
     return () => window.removeEventListener("hashchange", handleHashChange);
   }, []);
 
+  // Fetch gateway settings when settings page is active
+  useEffect(() => {
+    if (
+      currentPage === "settings" &&
+      session === "open" &&
+      manager.gatewaySettings === null &&
+      manager.gatewaySettingsError === null
+    ) {
+      void manager.loadGatewaySettings();
+    }
+  }, [
+    currentPage,
+    session,
+    manager.gatewaySettings,
+    manager.gatewaySettingsError,
+    manager.loadGatewaySettings,
+  ]);
+
   const navigateTo = (page: AppPage) => {
     window.location.hash = `#${page}`;
     setCurrentPage(page);
@@ -794,6 +812,12 @@ export function App() {
               logSettings={manager.logSettings}
               onSaveLogSettings={async settings => {
                 await manager.saveLogSettings(settings);
+              }}
+              gatewaySettings={manager.gatewaySettings}
+              gatewaySettingsError={manager.gatewaySettingsError}
+              onSaveGatewaySettings={settings => manager.saveGatewaySettings(settings)}
+              onRetryGatewaySettings={() => {
+                void manager.loadGatewaySettings();
               }}
               onClearSystemLogs={() => manager.clearSystemLogs()}
               onClearRequestLogs={() => manager.clearRequestLogs()}

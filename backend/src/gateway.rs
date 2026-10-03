@@ -17,6 +17,10 @@ use std::{
     task::{Context, Poll},
 };
 
+// Total upload collection budget for the two bounded JSON paths only. Pass
+// uploads, upstream inference and response/SSE streaming do not use this limit.
+pub(crate) const BODY_COLLECTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 struct LoggedStream {
     inner: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
     pending: Option<(LogEntry, ErrorBodyCapture)>,
@@ -68,11 +72,12 @@ fn enqueue(sink: &Option<LogSink>, generation: u64, entry: LogEntry) {
 pub async fn proxy(State(app): State<Arc<App>>, request: Request) -> Result<Response, ApiError> {
     require_root(&app, request.headers())?;
     let generation = app.logs.as_ref().map_or(0, LogSink::generation);
-    let (active, mut entry) = {
+    let (active, settings, mut entry) = {
         let accounts = app.accounts.lock().await;
         let route = accounts.portfolio.route();
         (
             accounts.active.clone(),
+            app.gateway_settings.snapshot(),
             LogEntry::new(
                 route.map(|a| a.id.clone()),
                 route.map(|a| a.username.clone()),
@@ -91,7 +96,44 @@ pub async fn proxy(State(app): State<Arc<App>>, request: Request) -> Result<Resp
         request.method() == axum::http::Method::GET && request.uri().path() == "/v1/models";
     let (parts, body) = request.into_parts();
     let mut headers = parts.headers;
+    let original_headers = headers.clone();
     sanitize(&mut headers, true);
+    let adapt = crate::responses_compat::selected(
+        settings.responses_mode,
+        &parts.method,
+        parts.uri.path(),
+        &headers,
+    );
+    let (body, forwarding_mode) = if adapt {
+        match adapted_body(body, &headers, &original_headers).await {
+            Ok((bytes, mode)) => {
+                if mode == crate::responses_compat::ForwardingMode::Adapt {
+                    headers.insert(header::CONTENT_LENGTH, bytes.len().into());
+                }
+                (reqwest::Body::from(bytes), mode)
+            }
+            Err(error) => {
+                enqueue(&app.logs, generation, entry);
+                return Err(ApiError::new(
+                    match error {
+                        crate::responses_compat::CompatError::TooLarge => {
+                            StatusCode::PAYLOAD_TOO_LARGE
+                        }
+                        crate::responses_compat::CompatError::Timeout => {
+                            StatusCode::REQUEST_TIMEOUT
+                        }
+                        _ => StatusCode::BAD_REQUEST,
+                    },
+                    error.code(),
+                ));
+            }
+        }
+    } else {
+        (
+            reqwest::Body::wrap_stream(body.into_data_stream()),
+            crate::responses_compat::ForwardingMode::Pass,
+        )
+    };
     if models {
         headers.insert(
             header::ACCEPT_ENCODING,
@@ -110,12 +152,13 @@ pub async fn proxy(State(app): State<Arc<App>>, request: Request) -> Result<Resp
         .parse()
         .map_err(|_| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "account_not_configured"))?;
     headers.insert(header::AUTHORIZATION, authorization);
+    entry.forwarding_mode = Some(forwarding_mode);
     let upstream = app
         .upstream
         .client
         .request(parts.method, target)
         .headers(headers)
-        .body(reqwest::Body::wrap_stream(body.into_data_stream()))
+        .body(body)
         .send()
         .await;
     let upstream = match upstream {
@@ -210,6 +253,40 @@ pub async fn proxy(State(app): State<Arc<App>>, request: Request) -> Result<Resp
     *response.status_mut() = status;
     *response.headers_mut() = headers;
     Ok(response)
+}
+
+async fn adapted_body(
+    mut body: Body,
+    headers: &HeaderMap,
+    original_headers: &HeaderMap,
+) -> Result<(Vec<u8>, crate::responses_compat::ForwardingMode), crate::responses_compat::CompatError>
+{
+    use crate::responses_compat::{self, CompatError, MAX_BYTES};
+    use axum::body::HttpBody;
+    responses_compat::validate_headers(headers)?;
+    responses_compat::validate_headers(original_headers)?;
+    let mut protected = responses_compat::has_integrity_or_trailers(original_headers);
+    let mut bytes = Vec::new();
+    tokio::time::timeout(BODY_COLLECTION_TIMEOUT, async {
+        while let Some(frame) =
+            futures_util::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await
+        {
+            let frame = frame.map_err(|_| CompatError::Invalid)?;
+            if frame.is_trailers() {
+                protected = true;
+            }
+            if let Some(data) = frame.data_ref() {
+                if data.len() > MAX_BYTES - bytes.len() {
+                    return Err(CompatError::TooLarge);
+                }
+                bytes.extend_from_slice(data);
+            }
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|_| CompatError::Timeout)??;
+    responses_compat::transform(&bytes, protected)
 }
 
 pub(crate) fn target(base: &str, uri: &Uri) -> Result<reqwest::Url, ApiError> {

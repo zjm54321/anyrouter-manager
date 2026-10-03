@@ -59,6 +59,9 @@ impl Default for Config {
 }
 
 impl Config {
+    pub fn gateway_settings_path(&self) -> PathBuf {
+        self.state_path.with_file_name("gateway_settings.json")
+    }
     pub fn system_log_path(&self) -> PathBuf {
         self.system_log_path
             .clone()
@@ -90,6 +93,7 @@ impl Config {
             config.request_log_path(),
             config.system_log_path(),
             config.log_settings_path(),
+            config.gateway_settings_path(),
         ] {
             if resolved_destination(&state)? == configuration {
                 return Err("State must not overwrite configuration.");
@@ -106,6 +110,7 @@ impl Config {
             &self.request_log_path(),
             &self.system_log_path(),
             &self.log_settings_path(),
+            &self.gateway_settings_path(),
         ] {
             if !destinations.insert(resolved_destination(path)?) {
                 return Err("All state and logging paths must be separate.");
@@ -257,6 +262,35 @@ impl RootAuth {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn gateway_settings_reject_aliases_and_configuration_destination() {
+        use super::*;
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            root_key: "Fake-Local-Root-51c7e8aa-2345-SufficientEntropy".into(),
+            state_path: dir.path().join("account.json"),
+            ..Default::default()
+        };
+        let path = config.gateway_settings_path();
+        config.validate().unwrap();
+        config.request_log_path = Some(path.clone());
+        assert!(config.validate().is_err());
+        config.request_log_path = None;
+        std::fs::write(&path, b"{}").unwrap();
+        let alias = dir.path().join("alias.json");
+        std::os::unix::fs::symlink(&path, &alias).unwrap();
+        config.system_log_path = Some(alias);
+        assert!(config.validate().is_err());
+        std::fs::write(
+            &path,
+            format!(
+                "root_key='Fake-Local-Root-51c7e8aa-2345-SufficientEntropy'\nstate_path={:?}",
+                config.state_path
+            ),
+        )
+        .unwrap();
+        assert!(Config::load(&path).is_err());
+    }
     #[test]
     fn system_paths_reject_all_aliases_including_symlinks() {
         use super::*;

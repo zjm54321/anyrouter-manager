@@ -272,6 +272,10 @@ async fn fixture() -> (tempfile::TempDir, Arc<App>) {
         client: reqwest::Client::new(),
         base: "http://127.0.0.1:1".into(),
     };
+    let gateway_settings =
+        crate::gateway_settings::SharedGatewaySettings::open(config.gateway_settings_path())
+            .await
+            .unwrap();
     (
         dir,
         App::new_with_system_logs(
@@ -282,6 +286,7 @@ async fn fixture() -> (tempfile::TempDir, Arc<App>) {
             Some(request),
             Some(settings),
             Some(system),
+            gateway_settings,
         ),
     )
 }

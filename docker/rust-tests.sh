@@ -23,7 +23,15 @@ for name in \
     log_settings::tests::strict_defaults_thresholds_and_fixed_errors \
     log_settings::tests::update_commit_hot_watch_failure_keeps_old_and_reopen \
     helper::tests::session_payload_prunes_expired_and_canonicalizes_session_expiry \
-    helper::tests::session_payload_expired_is_not_malformed_but_unsafe_fields_still_are
+    helper::tests::session_payload_expired_is_not_malformed_but_unsafe_fields_still_are \
+    config::tests::gateway_settings_reject_aliases_and_configuration_destination \
+    gateway_settings::tests::private_defaults_reopen_and_failed_update_keep_snapshot \
+    gateway_settings::tests::corrupt_versions_unknown_fields_and_symlinks_fail_closed \
+    responses_compat::tests::preserves_raw_values_and_only_inserts_missing_root_key \
+    responses_compat::tests::rejects_ambiguous_encoding_duplicates_integrity_and_bounds \
+    responses_compat::tests::auto_classifies_only_single_surviving_leading_product \
+    request_log::tests::forwarding_mode_is_optional_for_old_logs_and_strict_when_present \
+    tests::gateway_tests::buffered_json_deadlines_are_total_and_cancel_safe
 do
     # Exact matching and an asserted count prevent renamed tests passing as zero tests.
     cargo test --locked --bin anyrouter-manager-backend "$name" -- --exact > /tmp/rust-test-result.txt

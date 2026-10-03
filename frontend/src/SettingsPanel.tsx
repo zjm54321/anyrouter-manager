@@ -13,7 +13,7 @@ import {
   Trash2,
 } from "lucide-react";
 import type { GlobalCheckinConfig } from "./accountsTypes";
-import type { LogLevel, LogSettings } from "./api";
+import type { GatewayResponsesMode, GatewaySettings, LogLevel, LogSettings } from "./api";
 import { GlobalCheckinCard } from "./GlobalCheckinCard";
 
 interface SettingsPanelProps {
@@ -26,6 +26,10 @@ interface SettingsPanelProps {
   }) => Promise<void>;
   logSettings?: LogSettings | null;
   onSaveLogSettings?: (settings: LogSettings) => Promise<void>;
+  gatewaySettings?: GatewaySettings | null;
+  gatewaySettingsError?: string | null;
+  onSaveGatewaySettings?: (settings: GatewaySettings) => Promise<GatewaySettings>;
+  onRetryGatewaySettings?: () => Promise<void> | void;
   onClearSystemLogs?: () => Promise<void>;
   onClearRequestLogs?: () => Promise<void>;
 }
@@ -36,6 +40,10 @@ export function SettingsPanel({
   onSaveGlobalCheckin,
   logSettings,
   onSaveLogSettings,
+  gatewaySettings,
+  gatewaySettingsError,
+  onSaveGatewaySettings,
+  onRetryGatewaySettings,
   onClearSystemLogs,
   onClearRequestLogs,
 }: SettingsPanelProps) {
@@ -94,6 +102,48 @@ export function SettingsPanel({
         // failed
       }
       document.body.removeChild(textArea);
+    }
+  }
+
+  // Gateway Responses Mode state
+  const [selectedMode, setSelectedMode] = useState<GatewayResponsesMode | null>(
+    gatewaySettings?.responses_mode ?? null
+  );
+  const [gatewaySaving, setGatewaySaving] = useState(false);
+  const [gatewayFeedback, setGatewayFeedback] = useState<{
+    type: "success" | "error";
+    message: string;
+  } | null>(null);
+
+  useEffect(() => {
+    if (gatewaySettings) {
+      setSelectedMode(gatewaySettings.responses_mode);
+    }
+  }, [gatewaySettings]);
+
+  async function handleSaveGatewaySettings(e: React.FormEvent) {
+    e.preventDefault();
+    if (!onSaveGatewaySettings || !selectedMode) return;
+    setGatewaySaving(true);
+    setGatewayFeedback(null);
+    try {
+      const confirmed = await onSaveGatewaySettings({ responses_mode: selectedMode });
+      if (confirmed && confirmed.responses_mode === selectedMode) {
+        setGatewayFeedback({ type: "success", message: "网关设置已保存" });
+      } else {
+        throw new Error("服务端确认的设置格式无效或已被更改");
+      }
+    } catch (err) {
+      setGatewayFeedback({
+        type: "error",
+        message: err instanceof Error ? `保存失败：${err.message}` : "保存网关设置失败",
+      });
+      // Retain last confirmed server mode / not optimistic success
+      if (gatewaySettings) {
+        setSelectedMode(gatewaySettings.responses_mode);
+      }
+    } finally {
+      setGatewaySaving(false);
     }
   }
 
@@ -199,6 +249,125 @@ export function SettingsPanel({
           </div>
           {copied && (
             <span className="feedback" role="status">已复制网关地址</span>
+          )}
+        </div>
+
+        <div className="divider" style={{ margin: "16px 0 12px 0" }} />
+
+        {/* Responses 转发模式 */}
+        <div className="gateway-mode-section stack compact" aria-labelledby="gateway-mode-title">
+          <div className="section-heading compact">
+            <div>
+              <h4 id="gateway-mode-title" className="text-sm font-semibold">Responses 转发模式</h4>
+              <p className="secondary text-xs">
+                仅针对 POST /v1/responses 接口生效；其他通用路由原样透传。
+              </p>
+            </div>
+          </div>
+
+          {gatewaySettingsError && (
+            <div className="alert alert-error" role="alert" style={{ fontSize: "13px", padding: "10px 14px" }}>
+              <div className="cluster" style={{ justifyContent: "space-between", width: "100%" }}>
+                <span>{gatewaySettingsError}</span>
+                {onRetryGatewaySettings && (
+                  <button
+                    type="button"
+                    className="btn btn-secondary btn-sm"
+                    onClick={() => onRetryGatewaySettings()}
+                  >
+                    重试
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
+
+          {!gatewaySettingsError && gatewaySettings === null && (
+            <div className="secondary text-sm p-3">正在获取网关转发模式设置…</div>
+          )}
+
+          {gatewaySettings && (
+            <form onSubmit={handleSaveGatewaySettings} className="stack compact">
+              <div className="gateway-mode-grid" role="radiogroup" aria-labelledby="gateway-mode-title">
+                <label className={`gateway-mode-card ${selectedMode === "pass" ? "active" : ""}`}>
+                  <input
+                    type="radio"
+                    name="responses_mode"
+                    value="pass"
+                    checked={selectedMode === "pass"}
+                    onChange={() => setSelectedMode("pass")}
+                    disabled={busy || gatewaySaving}
+                  />
+                  <div className="gateway-mode-card-body">
+                    <span className="gateway-mode-card-title">全部透传（默认）</span>
+                    <span className="gateway-mode-card-desc secondary text-xs">
+                      不修改请求体（Body）。网关认证头正常处理，通用路径原样转发。
+                    </span>
+                  </div>
+                </label>
+
+                <label className={`gateway-mode-card ${selectedMode === "adapt" ? "active" : ""}`}>
+                  <input
+                    type="radio"
+                    name="responses_mode"
+                    value="adapt"
+                    checked={selectedMode === "adapt"}
+                    onChange={() => setSelectedMode("adapt")}
+                    disabled={busy || gatewaySaving}
+                  />
+                  <div className="gateway-mode-card-body">
+                    <span className="gateway-mode-card-title">兼容适配（实验性）</span>
+                    <span className="gateway-mode-card-desc secondary text-xs">
+                      仅针对缺少 prompt_cache_key 的请求补齐缓存标识，其余入参格式原样保留。
+                    </span>
+                  </div>
+                </label>
+
+                <label className={`gateway-mode-card ${selectedMode === "auto" ? "active" : ""}`}>
+                  <input
+                    type="radio"
+                    name="responses_mode"
+                    value="auto"
+                    checked={selectedMode === "auto"}
+                    onChange={() => setSelectedMode("auto")}
+                    disabled={busy || gatewaySaving}
+                  />
+                  <div className="gateway-mode-card-body">
+                    <span className="gateway-mode-card-title">自动识别（实验性）</span>
+                    <span className="gateway-mode-card-desc secondary text-xs">
+                      按客户端特征识别：已知 OpenCode / Codex 客户端直接透传，其余缺失时按需补充。
+                    </span>
+                  </div>
+                </label>
+              </div>
+
+              <div className="notice-box text-xs secondary" style={{ margin: "4px 0" }}>
+                <span>实验性：仅补充缺失的缓存标识；通用 UUID 与更多客户端场景的上游兼容性尚未验证。</span>
+              </div>
+
+              <div className="cluster" style={{ justifyContent: "flex-end", gap: "10px", marginTop: "4px" }}>
+                {gatewayFeedback && (
+                  <span
+                    className={`text-xs ${gatewayFeedback.type === "success" ? "text-teal" : "error-text"}`}
+                    role="status"
+                  >
+                    {gatewayFeedback.message}
+                  </span>
+                )}
+                <button
+                  type="submit"
+                  className="btn btn-primary btn-sm"
+                  disabled={
+                    busy ||
+                    gatewaySaving ||
+                    selectedMode === null ||
+                    selectedMode === gatewaySettings.responses_mode
+                  }
+                >
+                  {gatewaySaving ? "保存中…" : "保存设置"}
+                </button>
+              </div>
+            </form>
           )}
         </div>
       </section>

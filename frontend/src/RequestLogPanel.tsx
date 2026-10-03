@@ -57,6 +57,28 @@ function LevelBadge({ level }: { level: LogLevel }) {
   return <span className="badge font-mono text-xs" style={{ background: "rgba(100, 116, 139, 0.2)", color: "#64748b" }}>TRACE</span>;
 }
 
+export function ForwardingModeBadge({ mode }: { mode?: "pass" | "adapt" | null }) {
+  if (mode === "pass") {
+    return (
+      <span className="badge badge-neutral" title="透传模式（未修改请求体）">
+        透传
+      </span>
+    );
+  }
+  if (mode === "adapt") {
+    return (
+      <span className="badge badge-accent" title="适配模式（已补全缺失的 prompt_cache_key）">
+        反代
+      </span>
+    );
+  }
+  return (
+    <span className="secondary small font-mono" title="未记录转发模式">
+      —
+    </span>
+  );
+}
+
 export function RequestLogPanel({
   logs,
   loading = false,
@@ -214,7 +236,8 @@ export function RequestLogPanel({
                   <tr>
                     <th scope="col" style={{ width: "180px" }}>时间</th>
                     <th scope="col">所用账号</th>
-                    <th scope="col" style={{ width: "120px" }}>状态码</th>
+                    <th scope="col" style={{ width: "90px" }}>转发模式</th>
+                    <th scope="col" style={{ width: "110px" }}>状态码</th>
                     <th scope="col" style={{ width: "140px" }}>错误详情</th>
                   </tr>
                 </thead>
@@ -227,6 +250,9 @@ export function RequestLogPanel({
                         <td className="numeric small font-mono">{formatLogTime(log.timestamp)}</td>
                         <td>
                           <strong>{log.accountName || "未指定"}</strong>
+                        </td>
+                        <td>
+                          <ForwardingModeBadge mode={log.forwardingMode} />
                         </td>
                         <td>
                           <StatusPill status={log.httpStatus} />

@@ -47,6 +47,535 @@ struct Harness {
     task: tokio::task::JoinHandle<()>,
     directory: tempfile::TempDir,
 }
+
+#[tokio::test]
+async fn buffered_json_deadlines_are_total_and_cancel_safe() {
+    use crate::gateway_settings::{GatewayMode, GatewaySettings, SharedGatewaySettings};
+    // In-process endpoints only: no upstream listener or request is needed.
+    let directory = tempfile::tempdir().unwrap();
+    let config = Config {
+        root_key: ROOT.into(),
+        state_path: directory.path().join("private/account.json"),
+        ..Config::default()
+    };
+    let logs = LogSink::open(config.request_log_path()).await.unwrap();
+    let settings = SharedGatewaySettings::open(config.gateway_settings_path())
+        .await
+        .unwrap();
+    let app = App::new_with_system_logs(
+        config,
+        model::Portfolio::from_active(active()),
+        Upstream::mock("http://127.0.0.1:1".into()),
+        Arc::new(FakeLogin {
+            fail: AtomicBool::new(false),
+        }),
+        Some(logs.clone()),
+        None,
+        None,
+        settings,
+    );
+    app.gateway_settings
+        .update(GatewaySettings {
+            responses_mode: GatewayMode::Adapt,
+        })
+        .await
+        .unwrap();
+    let saved = std::fs::read(app.config.gateway_settings_path()).unwrap();
+    let snapshot = app.gateway_settings.snapshot();
+    let router = app::router(app.clone());
+    let login = Request::builder()
+        .method("POST")
+        .uri("/api/admin/session")
+        .header("host", "127.0.0.1:8080")
+        .header("origin", "http://localhost:5173")
+        .header("authorization", format!("Bearer {ROOT}"))
+        .body(Body::empty())
+        .unwrap();
+    let response = router.clone().oneshot(login).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let cookie = response.headers()[header::SET_COOKIE]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    tokio::time::pause();
+    for (method, path, code) in [
+        ("POST", "/v1/responses", "responses_body_timeout"),
+        ("PUT", "/api/gateway-settings", "gateway_settings_timeout"),
+    ] {
+        for scenario in ["pending", "trickle", "cancel"] {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            let (dropped, mut drop_notice) = tokio::sync::oneshot::channel();
+            let stream = futures_util::stream::unfold(
+                (rx, StreamDisconnect(Some(dropped))),
+                |(mut rx, guard)| async move {
+                    rx.recv()
+                        .await
+                        .map(|bytes| (Ok::<_, std::io::Error>(bytes), (rx, guard)))
+                },
+            );
+            let request = Request::builder()
+                .method(method)
+                .uri(path)
+                .header("host", "127.0.0.1:8080")
+                .header("origin", "http://localhost:5173")
+                .header("authorization", format!("Bearer {ROOT}"))
+                .header("cookie", &cookie)
+                .header("content-type", "application/json")
+                .body(Body::from_stream(stream))
+                .unwrap();
+            tx.send(Bytes::from_static(b"{")).unwrap();
+            let mut pending = Box::pin(router.clone().oneshot(request));
+            assert!(futures_util::poll!(pending.as_mut()).is_pending());
+            if scenario != "cancel" {
+                for _ in 0..2 {
+                    tokio::time::advance(Duration::from_secs(10)).await;
+                    if scenario == "trickle" {
+                        tx.send(Bytes::from_static(b" ")).unwrap();
+                    }
+                    assert!(futures_util::poll!(pending.as_mut()).is_pending());
+                }
+                // Even a chunk at t=20 cannot renew the original 30s deadline.
+                tokio::time::advance(Duration::from_secs(11)).await;
+                let response = match futures_util::poll!(pending.as_mut()) {
+                    std::task::Poll::Ready(result) => result.unwrap(),
+                    std::task::Poll::Pending => panic!("total collection deadline was renewed"),
+                };
+                assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+                assert_eq!(json_body(response).await["error"]["code"], code);
+            }
+            drop(pending);
+            assert_eq!(drop_notice.try_recv(), Ok(()));
+            assert!(tx.is_closed());
+            assert!(Arc::ptr_eq(&snapshot, &app.gateway_settings.snapshot()));
+            assert_eq!(
+                std::fs::read(app.config.gateway_settings_path()).unwrap(),
+                saved
+            );
+        }
+    }
+    tokio::time::resume();
+    logs.flush().await.unwrap();
+    let entries = logs.page(None).unwrap().items;
+    assert_eq!(entries.len(), 2); // Adapt timeouts only; cancellation has no attempted send.
+    assert!(
+        entries.iter().all(|e| e.forwarding_mode.is_none()
+            && e.http_status.is_none()
+            && e.error_body.is_none())
+    );
+    app.shutdown_logs().await;
+}
+
+#[tokio::test]
+async fn gateway_preferences_require_session_csrf_strict_bounded_body_and_persistence() {
+    let h = Harness::new(StatusCode::OK, b"{}").await;
+    let denied = h.send("GET", "/api/gateway-settings", &[], b"").await;
+    assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(denied.headers()["cache-control"], "no-store");
+    let cookie = h.session().await;
+    let headers = [
+        ("cookie", cookie.as_str()),
+        ("origin", "http://localhost:5173"),
+    ];
+    assert_eq!(
+        json_body(h.send("GET", "/api/gateway-settings", &headers, b"").await).await,
+        json!({"responses_mode":"pass"})
+    );
+    assert_eq!(
+        h.send(
+            "PUT",
+            "/api/gateway-settings",
+            &[("cookie", &cookie)],
+            br#"{"responses_mode":"adapt"}"#
+        )
+        .await
+        .status(),
+        StatusCode::FORBIDDEN
+    );
+    for body in [
+        br#"{"responses_mode":"invalid"}"#.as_slice(),
+        br#"{"responses_mode":"adapt","extra":"private-sentinel"}"#,
+        br#"{"responses_mode":"pass","responses_mode":"adapt"}"#,
+    ] {
+        let response = h.send("PUT", "/api/gateway-settings", &headers, body).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            json_body(response).await["error"]["code"],
+            "gateway_settings_invalid"
+        );
+    }
+    assert_eq!(
+        h.send("PUT", "/api/gateway-settings", &headers, &vec![b' '; 1025])
+            .await
+            .status(),
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+    assert_eq!(
+        json_body(
+            h.send(
+                "PUT",
+                "/api/gateway-settings",
+                &headers,
+                br#"{"responses_mode":"auto"}"#
+            )
+            .await
+        )
+        .await,
+        json!({"responses_mode":"auto"})
+    );
+    std::fs::set_permissions(
+        h.app.config.gateway_settings_path(),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    assert_eq!(
+        h.send(
+            "PUT",
+            "/api/gateway-settings",
+            &headers,
+            br#"{"responses_mode":"adapt"}"#
+        )
+        .await
+        .status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        h.app.gateway_settings.snapshot().responses_mode,
+        crate::gateway_settings::GatewayMode::Auto
+    );
+    assert!(h.state.received.lock().unwrap().is_empty());
+    h.app.shutdown_logs().await;
+}
+
+#[tokio::test]
+async fn responses_modes_preserve_pass_bytes_insert_only_missing_key_and_reject_before_send() {
+    use crate::{
+        gateway_settings::{GatewayMode, GatewaySettings},
+        responses_compat::ForwardingMode,
+    };
+    let h = Harness::new(StatusCode::OK, b"unchanged-response").await;
+    let json_headers = [("content-type", "application/json")];
+    let body = br#" {"input":[{"role":"user","content":"arbitrary"}],"tools":[],"n":1e9999,"stream":false} "#;
+    let response = h
+        .send("POST", "/v1/responses?q=%2F", &[], b"not JSON")
+        .await;
+    assert_eq!(
+        to_bytes(response.into_body(), 1024).await.unwrap(),
+        "unchanged-response"
+    );
+    assert_eq!(h.state.received.lock().unwrap()[0].2, b"not JSON");
+    h.app
+        .gateway_settings
+        .update(GatewaySettings {
+            responses_mode: GatewayMode::Adapt,
+        })
+        .await
+        .unwrap();
+    let response = h
+        .send("POST", "/v1/responses?q=%2F", &json_headers, body)
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    {
+        let received = h.state.received.lock().unwrap();
+        let (uri, headers, sent) = &received[1];
+        assert_eq!(uri, "/v1/responses?q=%2F");
+        assert_eq!(headers[header::CONTENT_LENGTH], sent.len().to_string());
+        assert!(!headers.contains_key("x-session-id"));
+        assert!(!headers.contains_key("x-session-affinity"));
+        let value: Value = serde_json::from_slice(sent).unwrap();
+        let key = value["prompt_cache_key"].as_str().unwrap();
+        assert_eq!(
+            String::from_utf8(sent.clone())
+                .unwrap()
+                .replace(&format!(",\"prompt_cache_key\":\"{key}\""), "")
+                .as_bytes(),
+            body
+        );
+    }
+    let existing = br#"{"prompt_cache_key":null,"input":[]}"#;
+    assert_eq!(
+        h.send(
+            "POST",
+            "/v1/responses",
+            &[
+                ("content-type", "application/json"),
+                ("signature", "synthetic")
+            ],
+            existing
+        )
+        .await
+        .status(),
+        StatusCode::OK
+    );
+    assert_eq!(h.state.received.lock().unwrap()[2].2, existing);
+    for (extra, invalid, expected) in [
+        (
+            json_headers.as_slice(),
+            br#"{"a":{"x":1,"x":2}}"#.as_slice(),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            &[
+                ("content-type", "application/json"),
+                ("content-encoding", "gzip"),
+            ],
+            b"{}",
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            &[
+                ("content-type", "application/json"),
+                ("signature-input", "synthetic"),
+            ],
+            b"{}",
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            &[
+                ("content-type", "application/json"),
+                ("trailer", "synthetic"),
+            ],
+            b"{}",
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        assert_eq!(
+            h.send("POST", "/v1/responses", extra, invalid)
+                .await
+                .status(),
+            expected
+        );
+    }
+    assert_eq!(
+        h.send(
+            "POST",
+            "/v1/responses",
+            &json_headers,
+            &vec![b' '; crate::responses_compat::MAX_BYTES + 1]
+        )
+        .await
+        .status(),
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+    assert_eq!(h.state.received.lock().unwrap().len(), 3);
+    for name in ["signature", "digest"] {
+        let response = h
+            .send(
+                "POST",
+                "/v1/responses",
+                &[
+                    ("content-type", "application/json"),
+                    ("connection", name),
+                    (name, "synthetic"),
+                ],
+                b"{}",
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            json_body(response).await["error"]["code"],
+            "responses_integrity_unsupported"
+        );
+    }
+    // Hyper decodes an actual chunked trailer into a body Frame, without a
+    // Trailer header. Only seeing that frame can trigger the integrity error.
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let router = h.router.clone();
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
+        socket.write_all(format!("POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1:8080\r\nAuthorization: Bearer {ROOT}\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n2\r\n{{}}\r\n0\r\nx-fixture: synthetic\r\n\r\n").as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        let read =
+            tokio::time::timeout(Duration::from_secs(2), socket.read_to_end(&mut response)).await;
+        server.abort();
+        let _ = server.await;
+        read.unwrap().unwrap();
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 400"));
+        assert!(response.contains("responses_integrity_unsupported"));
+    }
+    assert_eq!(h.state.received.lock().unwrap().len(), 3);
+    let entries = h.entries().await;
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|e| e.forwarding_mode == Some(ForwardingMode::Adapt))
+            .count(),
+        1
+    );
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|e| e.forwarding_mode == Some(ForwardingMode::Pass))
+            .count(),
+        2
+    );
+    assert!(
+        entries
+            .iter()
+            .filter(|e| e.forwarding_mode.is_none())
+            .all(|e| e.http_status.is_none())
+    );
+    h.app
+        .gateway_settings
+        .update(GatewaySettings {
+            responses_mode: GatewayMode::Auto,
+        })
+        .await
+        .unwrap();
+    for (ua, expected) in [
+        ("opencode/1.18.33", body.to_vec()),
+        ("codex_cli_rs/0.1", body.to_vec()),
+    ] {
+        assert_eq!(
+            h.send(
+                "POST",
+                "/v1/responses",
+                &[("content-type", "application/json"), ("user-agent", ua)],
+                body
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        let received = h.state.received.lock().unwrap();
+        assert_eq!(received.last().unwrap().2, expected);
+        assert_eq!(received.last().unwrap().1[header::USER_AGENT], ua);
+    }
+    assert_eq!(
+        h.send("POST", "/v1/responses", &json_headers, body)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert!(
+        serde_json::from_slice::<Value>(&h.state.received.lock().unwrap().last().unwrap().2)
+            .unwrap()
+            .get("prompt_cache_key")
+            .is_some()
+    );
+    assert_eq!(
+        h.send("POST", "/v1/chat/completions", &[], b"opaque-other-path")
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        h.state.received.lock().unwrap().last().unwrap().2,
+        b"opaque-other-path"
+    );
+    h.app.shutdown_logs().await;
+}
+
+#[tokio::test]
+async fn responses_transport_failure_logs_attempted_mode_without_upstream_status_or_retry() {
+    let mut h = Harness::new(StatusCode::OK, b"{}").await;
+    h.app
+        .gateway_settings
+        .update(crate::gateway_settings::GatewaySettings {
+            responses_mode: crate::gateway_settings::GatewayMode::Adapt,
+        })
+        .await
+        .unwrap();
+    h.router = app::router(h.app.clone());
+    h.task.abort();
+    let _ = (&mut h.task).await;
+    assert_eq!(
+        h.send(
+            "POST",
+            "/v1/responses",
+            &[("content-type", "application/json")],
+            b"{}"
+        )
+        .await
+        .status(),
+        StatusCode::BAD_GATEWAY
+    );
+    assert!(h.state.received.lock().unwrap().is_empty());
+    let entries = h.entries().await;
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0].forwarding_mode,
+        Some(crate::responses_compat::ForwardingMode::Adapt)
+    );
+    assert_eq!(entries[0].http_status, None);
+    assert_eq!(entries[0].error_body, None);
+    h.app.shutdown_logs().await;
+}
+
+#[tokio::test]
+async fn responses_admission_snapshots_settings_and_account_and_sends_once() {
+    use crate::gateway_settings::{GatewayMode, GatewaySettings};
+    let h = Harness::new(StatusCode::OK, b"data: OK\n\n").await;
+    h.state.hold.store(true, Ordering::SeqCst);
+    h.app
+        .gateway_settings
+        .update(GatewaySettings {
+            responses_mode: GatewayMode::Adapt,
+        })
+        .await
+        .unwrap();
+    // Hold the request body until after admission, then change both hot states.
+    let admitted = Arc::new(tokio::sync::Notify::new());
+    let resume = Arc::new(tokio::sync::Notify::new());
+    let a = admitted.clone();
+    let r = resume.clone();
+    let stream = futures_util::stream::once(async move {
+        a.notify_one();
+        r.notified().await;
+        Ok::<_, std::io::Error>(Bytes::from_static(b"{\"input\":[]}"))
+    });
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/responses")
+        .header("host", "127.0.0.1:8080")
+        .header("authorization", format!("Bearer {ROOT}"))
+        .header("content-type", "application/json")
+        .body(Body::from_stream(stream))
+        .unwrap();
+    let router = h.router.clone();
+    let pending = tokio::spawn(async move { router.oneshot(request).await.unwrap() });
+    admitted.notified().await;
+    h.app
+        .gateway_settings
+        .update(GatewaySettings::default())
+        .await
+        .unwrap();
+    {
+        let mut accounts = h.app.accounts.lock().await;
+        let mut next = (*accounts.active.as_ref().unwrap().as_ref()).clone();
+        next.key = KEY_B.into();
+        accounts.active = Some(Arc::new(next));
+    }
+    resume.notify_one();
+    let response = pending.await.unwrap();
+    let mut stream = response.into_body().into_data_stream();
+    assert_eq!(stream.next().await.unwrap().unwrap(), "data: OK\n\n");
+    drop(stream);
+    let received = h.state.received.lock().unwrap();
+    assert_eq!(received.len(), 1);
+    assert_eq!(
+        received[0].1[header::AUTHORIZATION],
+        format!("Bearer {KEY}")
+    );
+    assert!(
+        serde_json::from_slice::<Value>(&received[0].2)
+            .unwrap()
+            .get("prompt_cache_key")
+            .is_some()
+    );
+    drop(received);
+    assert_eq!(
+        h.entries().await[0].forwarding_mode,
+        Some(crate::responses_compat::ForwardingMode::Adapt)
+    );
+    h.app.shutdown_logs().await;
+}
 impl Drop for Harness {
     fn drop(&mut self) {
         self.task.abort();
@@ -61,6 +590,9 @@ impl Harness {
             ..Config::default()
         };
         let sink = LogSink::open(config.request_log_path()).await.unwrap();
+        crate::gateway_settings::SharedGatewaySettings::open(config.gateway_settings_path())
+            .await
+            .unwrap();
         let state = Arc::new(GatewayMock {
             status: Mutex::new(status),
             bytes: Mutex::new(bytes.into()),

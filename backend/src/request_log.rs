@@ -35,6 +35,8 @@ pub struct LogEntry {
     #[serde(deserialize_with = "required_option")]
     pub error_body: Option<String>,
     pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forwarding_mode: Option<crate::responses_compat::ForwardingMode>,
 }
 fn required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
 where
@@ -54,6 +56,7 @@ impl LogEntry {
             http_status: None,
             error_body: None,
             truncated: false,
+            forwarding_mode: None,
         }
     }
     pub fn set_response(&mut self, status: Option<u16>, capture: ErrorBodyCapture) {
@@ -565,6 +568,25 @@ impl LogSink {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn forwarding_mode_is_optional_for_old_logs_and_strict_when_present() {
+        let entry = LogEntry::new(None, None);
+        let mut value = serde_json::to_value(&entry).unwrap();
+        assert!(value.get("forwarding_mode").is_none());
+        assert_eq!(
+            serde_json::from_value::<LogEntry>(value.clone()).unwrap(),
+            entry
+        );
+        value["forwarding_mode"] = serde_json::json!("adapt");
+        assert_eq!(
+            serde_json::from_value::<LogEntry>(value.clone())
+                .unwrap()
+                .forwarding_mode,
+            Some(crate::responses_compat::ForwardingMode::Adapt)
+        );
+        value["forwarding_mode"] = serde_json::json!("auto");
+        assert!(serde_json::from_value::<LogEntry>(value).is_err());
+    }
     use super::*;
     fn fixed() -> chrono::DateTime<chrono::Utc> {
         chrono::DateTime::parse_from_rfc3339("2026-10-01T12:00:00Z")

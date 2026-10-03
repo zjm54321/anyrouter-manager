@@ -76,6 +76,23 @@ describe("RequestLogPanel", () => {
     expect(screen.queryByText("200")).not.toBeInTheDocument();
   });
 
+  it("renders forwarding_mode: pass as [透传], adapt as [反代], unrecorded as —", () => {
+    const logs = [
+      makeLog({ id: "log-pass", forwardingMode: "pass" }),
+      makeLog({ id: "log-adapt", forwardingMode: "adapt" }),
+      makeLog({ id: "log-unrecorded", forwardingMode: null }),
+    ];
+    render(<RequestLogPanel logs={logs} />);
+
+    expect(screen.getByText("透传")).toBeInTheDocument();
+    expect(screen.getByText("反代")).toBeInTheDocument();
+    // Unrecorded mode must render "—" and not assume "透传"
+    const dashes = screen.getAllByText("—");
+    expect(dashes.length).toBeGreaterThan(0);
+    // Neither "auto" nor incorrect fallback should appear
+    expect(screen.queryByText("auto")).not.toBeInTheDocument();
+  });
+
   it("error entries expand raw upstream body via React text nodes (no dangerouslySetInnerHTML)", () => {
     render(<RequestLogPanel logs={[baseLogs[1]]} />);
 

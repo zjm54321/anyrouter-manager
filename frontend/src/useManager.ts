@@ -10,6 +10,7 @@ import {
   fetchAccountCheckin,
   fetchAccounts,
   fetchGlobalCheckin,
+  fetchGatewaySettings,
   fetchLogSettings,
   fetchRequestLogs,
   fetchSystemLogs as apiFetchSystemLogs,
@@ -20,12 +21,14 @@ import {
   runAccountCheckin as apiRunAccountCheckin,
   saveAccount,
   selectAccountKey as apiSelectAccountKey,
+  updateGatewaySettings,
   updateGlobalCheckinSettings,
   updateLogSettings,
 } from "./api";
 import type {
   AccountCheckinResponse,
   AccountsResponse,
+  GatewaySettings,
   GlobalCheckinResponse,
   LogSettings,
   OperationDTO,
@@ -120,6 +123,8 @@ export function useManager() {
 
   // System logs & settings state
   const [logSettings, setLogSettings] = useState<LogSettings | null>(null);
+  const [gatewaySettings, setGatewaySettings] = useState<GatewaySettings | null>(null);
+  const [gatewaySettingsError, setGatewaySettingsError] = useState<string | null>(null);
   const [systemLogs, setSystemLogs] = useState<SystemLogsResponse | null>(null);
   const [systemLogsLoading, setSystemLogsLoading] = useState(false);
   const [systemLogsError, setSystemLogsError] = useState<string | null>(null);
@@ -138,6 +143,8 @@ export function useManager() {
   const logsSequence = useRef(0);
   const systemLogsSequence = useRef(0);
   const logSettingsSequence = useRef(0);
+  const gatewaySettingsSequence = useRef(0);
+  const gatewaySettingsSavingRef = useRef(false);
   const controllers = useRef(new Set<AbortController>());
   const sessionRef = useRef<"loading" | "locked" | "open">("loading");
   sessionRef.current = session;
@@ -154,6 +161,7 @@ export function useManager() {
     quotaPaused.current.clear();
     quotaRound.current = { startedAt: 0, seen: new Set() };
     quotaReconciling.current = false;
+    gatewaySettingsSavingRef.current = false;
     controllers.current.forEach(controller => controller.abort());
     controllers.current.clear();
   }, []);
@@ -182,6 +190,8 @@ export function useManager() {
     setRefreshingAccountId(null);
     setAccountRefreshError({});
     setLogSettings(null);
+    setGatewaySettings(null);
+    setGatewaySettingsError(null);
     setSystemLogs(null);
     setSystemLogsError(null);
     setSystemLogsLoading(false);
@@ -489,6 +499,124 @@ export function useManager() {
       } finally {
         controllers.current.delete(task);
         if (epoch === generation.current) setSending(false);
+      }
+    },
+    [createController, lock]
+  );
+
+  // Load gateway settings
+  const loadGatewaySettings = useCallback(async () => {
+    if (sessionRef.current !== "open") return;
+    // Skip load if a save is in-flight to prevent racing GET from superseding mutation
+    if (gatewaySettingsSavingRef.current) return;
+    const epoch = generation.current;
+    const sequence = ++gatewaySettingsSequence.current;
+    const task = createController();
+    try {
+      const data = await fetchGatewaySettings(task.signal);
+      if (
+        epoch !== generation.current ||
+        sequence !== gatewaySettingsSequence.current ||
+        sessionRef.current !== "open" ||
+        gatewaySettingsSavingRef.current
+      ) {
+        return;
+      }
+      if (
+        data &&
+        (data.responses_mode === "pass" ||
+          data.responses_mode === "adapt" ||
+          data.responses_mode === "auto")
+      ) {
+        setGatewaySettings(data);
+        setGatewaySettingsError(null);
+      } else {
+        setGatewaySettings(null);
+        setGatewaySettingsError("服务端返回的网关设置格式无效");
+      }
+    } catch (error) {
+      if (
+        epoch !== generation.current ||
+        task.signal.aborted ||
+        sequence !== gatewaySettingsSequence.current ||
+        gatewaySettingsSavingRef.current
+      ) {
+        return;
+      }
+      if (error instanceof ApiError && error.status === 401) {
+        if (epoch === generation.current && sessionRef.current === "open") {
+          lock();
+        }
+        return;
+      }
+      setGatewaySettings(null);
+      if (error instanceof ApiError && error.status === 404) {
+        setGatewaySettingsError("网关设置功能不可用（服务端未启用）");
+      } else {
+        setGatewaySettingsError(error instanceof Error ? error.message : "网关设置暂时不可用");
+      }
+    } finally {
+      controllers.current.delete(task);
+    }
+  }, [createController, lock]);
+
+  // Save gateway settings
+  const saveGatewaySettings = useCallback(
+    async (settings: GatewaySettings): Promise<GatewaySettings> => {
+      if (sessionRef.current !== "open") {
+        throw new Error("会话已锁定或未登录");
+      }
+      if (sendingRef.current || gatewaySettingsSavingRef.current) {
+        throw new Error("已有操作正在处理中");
+      }
+      const epoch = generation.current;
+      const sequence = ++gatewaySettingsSequence.current;
+      const task = createController();
+      setSending(true);
+      gatewaySettingsSavingRef.current = true;
+      try {
+        const data = await updateGatewaySettings(settings, task.signal);
+        if (
+          epoch !== generation.current ||
+          sequence !== gatewaySettingsSequence.current ||
+          sessionRef.current !== "open"
+        ) {
+          throw new Error("保存操作已被取消或被新会话覆盖");
+        }
+        if (
+          !data ||
+          (data.responses_mode !== "pass" &&
+            data.responses_mode !== "adapt" &&
+            data.responses_mode !== "auto")
+        ) {
+          throw new Error("服务端返回的网关设置格式无效");
+        }
+        if (data.responses_mode !== settings.responses_mode) {
+          throw new Error("服务端确认的转发模式与请求不一致");
+        }
+        setGatewaySettings(data);
+        setGatewaySettingsError(null);
+        return data;
+      } catch (error) {
+        if (
+          epoch !== generation.current ||
+          task.signal.aborted ||
+          sequence !== gatewaySettingsSequence.current
+        ) {
+          throw error instanceof Error ? error : new Error("保存操作已取消");
+        }
+        if (error instanceof ApiError && error.status === 401) {
+          if (epoch === generation.current && sessionRef.current === "open") {
+            lock();
+          }
+        }
+        throw error;
+      } finally {
+        controllers.current.delete(task);
+        if (epoch === generation.current) {
+          setSending(false);
+          gatewaySettingsSavingRef.current = false;
+        }
       }
     },
     [createController, lock]
@@ -1122,6 +1250,8 @@ export function useManager() {
     setQuotaAutoRefreshEnabled,
     setQuotaRefreshIntervalMinutes,
     logSettings,
+    gatewaySettings,
+    gatewaySettingsError,
     systemLogs,
     systemLogsLoading,
     systemLogsError,
@@ -1131,6 +1261,8 @@ export function useManager() {
     loadLogs,
     loadLogSettings,
     saveLogSettings,
+    loadGatewaySettings,
+    saveGatewaySettings,
     loadSystemLogs,
     clearSystemLogs: clearSystemLogsAction,
     clearRequestLogs: clearRequestLogsAction,
