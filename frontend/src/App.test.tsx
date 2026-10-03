@@ -139,7 +139,9 @@ async function open(
   });
 
   window.location.hash = "#accounts";
-  render(<App />);
+  await act(async () => {
+    render(<App />);
+  });
   await screen.findByRole("heading", { name: /已绑定账号列表/ });
 }
 
