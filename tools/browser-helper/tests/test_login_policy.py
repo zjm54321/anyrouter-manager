@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, patch
 
 from browser_helper import core
 import test_helper
-from test_helper import FakePage, Locator, response
+from test_helper import FakePage, Locator, mock_clock, response
 
 
 class Group:
@@ -84,6 +84,7 @@ process.stdout.write(JSON.stringify(results));
             with self.subTest(fixture=fixture):
                 self.assertIs(actual, expected)
 
+    @mock_clock
     async def test_auto_signin_queries_and_write_methods_never_fetch_or_poison_login(self):
         page = FakePage(response())
         original = page.locator(core.SUBMIT_SELECTORS[0]).click.side_effect
@@ -100,10 +101,11 @@ process.stdout.write(JSON.stringify(results));
                     route.fulfill.assert_not_awaited()
         page.locator(core.SUBMIT_SELECTORS[0]).click.side_effect = click
         result = await self.execute(page, timeout_ms=1000)
-        self.assertTrue(result['ok'])
+        self.assertTrue(result['ok'], result.get('error'))
         self.assertEqual(result['api_user'], '42')
         page.locator(core.SUBMIT_SELECTORS[0]).click.assert_awaited_once()
 
+    @mock_clock
     async def test_login_query_is_preserved_not_stripped(self):
         url = core.ORIGIN+'/api/user/login?turnstile=private-query-sentinel&x=%2F'
         page = FakePage(response())
@@ -111,7 +113,7 @@ process.stdout.write(JSON.stringify(results));
         page.login_event.request.redirected_from = None
         self.assertEqual(core.request_kind(page.login_event.request), 'login')
         result = await self.execute(page)
-        self.assertTrue(result['ok'])
+        self.assertTrue(result['ok'], result.get('error'))
         route, reply = page.login_route, page.login_fetched
         self.assertIs(route.request, page.login_event.request)
         self.assertEqual(route.request.url, url)
@@ -177,6 +179,7 @@ process.stdout.write(JSON.stringify(results));
         self.assertFalse(await core.dismiss_notice_once(page, state))
         close.click.assert_awaited_once()
 
+    @mock_clock
     async def test_failed_trial_never_submits_credentials(self):
         page = FakePage(response())
         click = AsyncMock(side_effect=TimeoutError('private-error-sentinel'))

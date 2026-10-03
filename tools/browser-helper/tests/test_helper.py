@@ -2,6 +2,7 @@ import asyncio
 import io
 import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from functools import wraps
 import json
 import os
 from pathlib import Path
@@ -18,6 +19,27 @@ from browser_helper.__main__ import read_request, write_all
 ROOT = Path(__file__).resolve().parents[1]
 SECRET = 'never-print-password'
 COOKIE_SECRET = 'never-log-cookie'
+
+
+def mock_clock(test):
+    # Explicit mock-only tests own one clock, including callbacks after execute.
+    # Keep wait_for timers/task scheduling real; never use for I/O or watchdogs.
+    @wraps(test)
+    async def run(*args, **kwargs):
+        loop = asyncio.get_running_loop()
+        now = 1000.0
+        original_sleep = asyncio.sleep
+
+        async def sleep(delay, result=None):
+            nonlocal now
+            if delay > 0:
+                now += delay
+            return await original_sleep(0, result)
+
+        with patch.object(loop, 'time', lambda: now), patch.object(asyncio, 'sleep', sleep):
+            return await test(*args, **kwargs)
+
+    return run
 
 
 def cookie(**overrides):
@@ -220,27 +242,12 @@ class LoginTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(core, 'browser_launcher', return_value=self.launch):
             return await core.run_login(core.LoginInput('mock-user', SECRET, timeout_ms), self.state)
 
-    async def execute_virtual(self, page, cookies=None, timeout_ms=160):
-        # Only selected mock-only cookie/profile fixtures use this clock.
-        # Keep wait_for timers and task scheduling real; exclude wall-clock stalls.
-        loop = asyncio.get_running_loop()
-        now = 1000.0
-        original_sleep = asyncio.sleep
-
-        async def sleep(delay, result=None):
-            nonlocal now
-            if delay > 0:
-                now += delay
-            return await original_sleep(0, result)
-
-        with patch.object(loop, 'time', lambda: now), patch.object(asyncio, 'sleep', sleep):
-            return await self.execute(page, cookies, timeout_ms)
-
+    @mock_clock
     async def test_success_requires_console_response_same_context(self):
         page = FakePage(response())
         result = await self.execute(page)
+        self.assertTrue(result['ok'], result.get('error'))
         self.assertEqual(result['api_user'], '42')
-        self.assertTrue(result['ok'])
         self.launch.assert_awaited_once_with(headless=True)
         self.browser.new_context.assert_awaited_once_with(service_workers='block')
         self.context.cookies.assert_awaited_once_with()
@@ -252,17 +259,19 @@ class LoginTests(unittest.IsolatedAsyncioTestCase):
         page.login_fetched.body.assert_awaited_once()
         page.login_fetched.dispose.assert_awaited_once()
 
+    @mock_clock
     async def test_retained_login_body_rejects_malformed_or_oversized(self):
         for body in (b'private-body-sentinel', b'{"success":true}' + b' ' * core.MAX_PROFILE_BYTES):
             page = FakePage(response())
             page.login_body = body
-            result = await self.execute_virtual(page)
+            result = await self.execute(page)
             self.assertEqual(result, {'ok': False, 'error': 'login_failed'})
             self.context.cookies.assert_not_awaited()
             page.login_event.json.assert_not_awaited()
             page.login_fetched.dispose.assert_awaited_once()
             self.assertNotIn('private-body-sentinel', json.dumps(self.state))
 
+    @mock_clock
     async def test_login_event_requires_owned_request_url_status_and_no_redirect(self):
         for mismatch in ('request', 'status', 'url', 'redirect'):
             page = FakePage(response())
@@ -283,11 +292,12 @@ class LoginTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(0)
                 event.json.assert_not_awaited()
             page.login_fulfill.side_effect = fulfill
-            self.assertFalse((await self.execute_virtual(page))['ok'])
+            self.assertFalse((await self.execute(page))['ok'])
             self.context.cookies.assert_not_awaited()
             self.assertIsNone(self.state.get('login_success'))
             self.context.close.assert_awaited_once()
 
+    @mock_clock
     async def test_login_fulfill_failure_or_cancellation_after_event_cannot_authenticate(self):
         for cancel in (False, True):
             page = FakePage(response())
@@ -311,7 +321,7 @@ class LoginTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(0)
             page.locator(core.SUBMIT_SELECTORS[0]).click.side_effect = click
             try:
-                self.assertFalse((await self.execute_virtual(page))['ok'])
+                self.assertFalse((await self.execute(page))['ok'])
             finally:
                 route_task.cancel()
                 await asyncio.gather(route_task, return_exceptions=True)
@@ -361,10 +371,11 @@ class LoginTests(unittest.IsolatedAsyncioTestCase):
         page.evaluate.side_effect = evaluate
         return page
 
+    @mock_clock
     async def test_proactive_self_without_spa_one_context_no_reload(self):
         page = self.proactive_page()
-        result = await self.execute_virtual(page)
-        self.assertTrue(result['ok'])
+        result = await self.execute(page)
+        self.assertTrue(result['ok'], result.get('error'))
         self.assertEqual(result['api_user'], '42')
         self.assertTrue(result['cookies'][0]['http_only'])
         self.assertEqual(len(page.proof_routes), 1)
@@ -375,6 +386,7 @@ class LoginTests(unittest.IsolatedAsyncioTestCase):
         self.browser.close.assert_awaited_once()
         self.assertEqual(page.listeners, {})
 
+    @mock_clock
     async def test_proactive_marker_cannot_authorize_other_requests(self):
         async def before(page, arg, owned):
             for changes in ({'url': arg['url'] + '?extra=1'}, {'method': 'POST'},
@@ -391,23 +403,26 @@ class LoginTests(unittest.IsolatedAsyncioTestCase):
             await self.context.route.await_args.args[1](route)
             route.abort.assert_awaited_once()
             route.continue_.assert_not_awaited()
-        self.assertTrue((await self.execute_virtual(self.proactive_page(before=before, after=after)))['ok'])
+        result = await self.execute(self.proactive_page(before=before, after=after))
+        self.assertTrue(result['ok'], result.get('error'))
 
+    @mock_clock
     async def test_proactive_self_rejection_never_exports_cookies(self):
         for reply in (dict(status=200, type='application/json', body=body) for body in (
                 '{"success":true,"data":{"id":43}}', '{"success":false}',
                 '{"success":true,"data":{"id":"42"}}', 'malformed-private-body',
                 ' ' * (core.MAX_PROFILE_BYTES + 1))):
             page = self.proactive_page(reply)
-            result = await self.execute_virtual(page)
+            result = await self.execute(page)
             self.assertEqual(result, {'ok': False, 'error': 'user_self_unverified'})
             self.assertEqual(len(page.proof_routes), 1)
             self.context.cookies.assert_not_awaited()
         for reply in (dict(error='oversize'), dict(error='network'),
                       dict(status=302, type='application/json', body='{"success":true,"id":42}')):
-            self.assertFalse((await self.execute_virtual(self.proactive_page(reply)))['ok'])
+            self.assertFalse((await self.execute(self.proactive_page(reply)))['ok'])
             self.context.cookies.assert_not_awaited()
 
+    @mock_clock
     async def test_proactive_self_rechecks_console_and_identity(self):
         for change in ('url', 'identity', 'challenge'):
             async def after(page, arg, route):
@@ -418,9 +433,10 @@ class LoginTests(unittest.IsolatedAsyncioTestCase):
                 else:
                     page.challenge = True
             page = self.proactive_page(after=after)
-            self.assertFalse((await self.execute_virtual(page))['ok'])
+            self.assertFalse((await self.execute(page))['ok'])
             self.context.cookies.assert_not_awaited()
 
+    @mock_clock
     async def test_proactive_self_no_retry_on_transient_or_cancellation(self):
         for mode in ('transient', 'cancel'):
             async def after(page, arg, route):
@@ -430,13 +446,14 @@ class LoginTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.sleep(arg['timeout'] / 1000)
                 await asyncio.Future()
             page = self.proactive_page(after=after)
-            self.assertFalse((await self.execute_virtual(page))['ok'])
+            self.assertFalse((await self.execute(page))['ok'])
             self.assertEqual(len(page.proof_routes), 1)
             self.context.cookies.assert_not_awaited()
             self.context.close.assert_awaited_once()
             self.browser.close.assert_awaited_once()
             self.assertEqual(page.listeners, {})
 
+    @mock_clock
     async def test_proactive_self_gates_and_existing_spa_no_duplicate(self):
         for mode in ('unaccepted', 'unstable', 'unsafe', 'existing'):
             page = self.proactive_page()
@@ -461,12 +478,13 @@ class LoginTests(unittest.IsolatedAsyncioTestCase):
                 page.accepted_login = accepted
             else:
                 page.profile = response()
-            result = await self.execute_virtual(page)
+            result = await self.execute(page)
             self.assertEqual(result['ok'], mode == 'existing')
             self.assertEqual(page.proof_routes, [])
             if mode != 'existing':
                 self.context.cookies.assert_not_awaited()
 
+    @mock_clock
     async def test_failed_profiles_never_read_cookies(self):
         for profile in (None, response({'success': False, 'data': {'id': 42}}),
                         response(status=401), response({'success': True, 'data': {'id': True}}),
@@ -484,15 +502,18 @@ class LoginTests(unittest.IsolatedAsyncioTestCase):
         profile.json.side_effect = ValueError(SECRET)
         self.assertIsNone(await core.verified_response(profile))
 
+    @mock_clock
     async def test_console_url_without_profile_never_succeeds(self):
         result = await self.execute(FakePage())
         self.assertFalse(result['ok'])
         self.context.cookies.assert_not_awaited()
 
+    @mock_clock
     async def test_empty_cookie_is_failure(self):
         result = await self.execute(FakePage(response()), [])
         self.assertEqual(result, {'ok': False, 'error': 'user_self_unverified'})
 
+    @mock_clock
     async def test_challenge_no_form_fill(self):
         page = FakePage(challenge=True)
         result = await self.execute(page)
@@ -500,6 +521,7 @@ class LoginTests(unittest.IsolatedAsyncioTestCase):
         self.context.cookies.assert_not_awaited()
         self.assertFalse(page.inputs)
 
+    @mock_clock
     async def test_changed_dom_form_unavailable(self):
         with patch.object(core, 'FORM_WAIT_SECONDS', 0.01):
             result = await self.execute(FakePage(form=False))
@@ -536,6 +558,7 @@ class LoginTests(unittest.IsolatedAsyncioTestCase):
             await core.close_resources({'context': context, 'browser': browser})
         browser.close.assert_awaited_once()
 
+    @mock_clock
     async def test_off_origin_routes_abort(self):
         await self.execute(FakePage(response()))
         guard = self.context.route.await_args.args[1]
@@ -545,13 +568,14 @@ class LoginTests(unittest.IsolatedAsyncioTestCase):
             route.abort.assert_awaited_once()
             route.continue_.assert_not_awaited()
 
+    @mock_clock
     async def test_redirects_never_fulfilled_or_followed(self):
         for status in (301, 302, 303, 307, 308):
             for body in (None, b'username=mock-user&password=secret'):
                 page = FakePage(response())
                 page.login_event.status = status
                 page.login_event.request.post_data_buffer = body
-                self.assertFalse((await self.execute_virtual(page))['ok'])
+                self.assertFalse((await self.execute(page))['ok'])
                 route = page.login_route
                 self.assertEqual(route.fetch.await_args.kwargs['max_redirects'], 0)
                 route.abort.assert_awaited_once()
@@ -560,6 +584,7 @@ class LoginTests(unittest.IsolatedAsyncioTestCase):
                 page.login_fetched.dispose.assert_awaited_once()
                 self.context.cookies.assert_not_awaited()
 
+    @mock_clock
     async def test_safe_requests_fetch_no_redirects_and_fulfill(self):
         await self.execute(FakePage(response()))
         guard = self.context.route.await_args.args[1]
@@ -628,15 +653,17 @@ class LoginTests(unittest.IsolatedAsyncioTestCase):
             for thread in threads:
                 thread.join(timeout=2)
 
+    @mock_clock
     async def test_api_path_cookie_preserved(self):
-        result = await self.execute_virtual(FakePage(response()), [dict(cookie(), path='/api')])
-        self.assertTrue(result['ok'])
+        result = await self.execute(FakePage(response()), [dict(cookie(), path='/api')])
+        self.assertTrue(result['ok'], result.get('error'))
         self.assertEqual(result['api_user'], '42')
         self.assertEqual(result['cookies'][0]['path'], '/api')
         self.context.cookies.assert_awaited_once_with()
         self.context.close.assert_awaited_once()
         self.browser.close.assert_awaited_once()
 
+    @mock_clock
     async def test_login_bad_path_before_password_or_click(self):
         for stage in ('entry', 'username', 'password'):
             page = FakePage(response())
@@ -657,6 +684,7 @@ class LoginTests(unittest.IsolatedAsyncioTestCase):
                 page.locator(core.PASSWORD_SELECTORS[0]).fill.assert_not_awaited()
             page.locator(core.SUBMIT_SELECTORS[0]).click.assert_not_awaited()
 
+    @mock_clock
     async def test_early_self_on_login_is_retained_then_console(self):
         page = FakePage()
         async def early_self(**kwargs):
@@ -665,10 +693,11 @@ class LoginTests(unittest.IsolatedAsyncioTestCase):
             page.listeners['response'](response())
             await asyncio.sleep(0)
         page.locator(core.SUBMIT_SELECTORS[0]).click.side_effect = early_self
-        result = await self.execute_virtual(page)
-        self.assertTrue(result['ok'])
+        result = await self.execute(page)
+        self.assertTrue(result['ok'], result.get('error'))
         self.assertEqual(page.goto_urls, [core.ORIGIN + '/login', core.ORIGIN + '/console'])
 
+    @mock_clock
     async def test_pre_submission_profile_is_not_accepted(self):
         page = FakePage()
         early_profile = response()
@@ -676,7 +705,7 @@ class LoginTests(unittest.IsolatedAsyncioTestCase):
             page.listeners['response'](early_profile)
             await asyncio.sleep(0)
         page.locator(core.USERNAME_SELECTORS[0]).fill.side_effect = emit_before_fill
-        result = await self.execute_virtual(page)
+        result = await self.execute(page)
         self.assertEqual(result, {'ok': False, 'error': 'user_self_unverified'})
         self.context.cookies.assert_not_awaited()
         early_profile.json.assert_not_awaited()
@@ -723,6 +752,7 @@ class LoginTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result['ok'])
         self.assertEqual(page.goto_urls, [core.ORIGIN + '/login', core.ORIGIN + '/console'])
 
+    @mock_clock
     async def test_passive_transient_challenge_and_http_block(self):
         page = FakePage(response(), challenge=True)
         checks = 0
@@ -739,9 +769,10 @@ class LoginTests(unittest.IsolatedAsyncioTestCase):
             return SimpleNamespace(status=503)
         page.goto = goto
         result = await self.execute(page, timeout_ms=1000)
-        self.assertTrue(result['ok'])
+        self.assertTrue(result['ok'], result.get('error'))
         self.assertGreater(checks, 2)
 
+    @mock_clock
     async def test_console_transient_challenge_waits_then_returns_profile(self):
         page = FakePage(response())
         console_checks = 0
@@ -755,13 +786,15 @@ class LoginTests(unittest.IsolatedAsyncioTestCase):
             return False
         page.evaluate.side_effect = transient
         result = await self.execute(page, timeout_ms=1000)
-        self.assertTrue(result['ok'])
+        self.assertTrue(result['ok'], result.get('error'))
         self.assertGreater(console_checks, 2)
 
+    @mock_clock
     async def test_unknown_html_at_overall_deadline_is_form_unavailable(self):
         result = await self.execute(FakePage(form=False), timeout_ms=100)
         self.assertEqual(result, {'ok': False, 'error': 'login_form_unavailable'})
 
+    @mock_clock
     async def test_http_block_waits_until_deadline(self):
         page = FakePage(form=False)
         original = page.goto
@@ -775,6 +808,7 @@ class LoginTests(unittest.IsolatedAsyncioTestCase):
 
 class RegressionTests(unittest.IsolatedAsyncioTestCase):
     execute = LoginTests.execute
+    @mock_clock
     async def test_submit_substep_timeout_attribution(self):
         from playwright.async_api import TimeoutError as PlaywrightTimeout
         for action in ('submit_trial', 'page_recheck', 'submit_click'):
@@ -812,6 +846,7 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn(SECRET, json.dumps(result))
             self.context.close.assert_awaited_once()
 
+    @mock_clock
     async def test_non_json_login_error_is_safe_and_challenge_specific(self):
         for challenged in (False, True):
             page = FakePage(response())
@@ -827,6 +862,7 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn('private-html', json.dumps(result))
             self.context.cookies.assert_not_awaited()
 
+    @mock_clock
     async def test_key_self_network_failure_is_not_optional(self):
         page = FakePage(response())
         original = page.locator(core.SUBMIT_SELECTORS[0]).click.side_effect
@@ -853,6 +889,7 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(clean['self_status'])
         self.assertIsNone(clean['login_success'])
 
+    @mock_clock
     async def test_http200_login_false_never_reads_cookie_or_navigates(self):
         page = FakePage(response())
         async def click(**kwargs):
@@ -866,6 +903,7 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(page.goto_urls, [core.ORIGIN + '/login'])
         self.context.cookies.assert_not_awaited()
 
+    @mock_clock
     async def test_unrelated_post_completion_does_not_unlock_console(self):
         page = FakePage()
         async def click(**kwargs):
@@ -880,6 +918,7 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(page.goto_urls, [core.ORIGIN + '/login'])
         self.context.cookies.assert_not_awaited()
 
+    @mock_clock
     async def test_delayed_spa_storage_not_interrupted(self):
         page = FakePage(response())
         ready_at = None
@@ -898,9 +937,11 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertGreaterEqual(asyncio.get_running_loop().time(), ready_at)
             return await original(url, **kwargs)
         page.goto = goto
-        self.assertTrue((await self.execute(page, timeout_ms=1000))['ok'])
+        result = await self.execute(page, timeout_ms=1000)
+        self.assertTrue(result['ok'], result.get('error'))
         page.locator(core.SUBMIT_SELECTORS[0]).click.assert_awaited_once()
 
+    @mock_clock
     async def test_optional_image_redirect_or_network_failure_not_global(self):
         for fails in (False, True):
             page = FakePage(response())
@@ -914,8 +955,10 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
                 route.abort.assert_awaited_once()
                 await original(**kwargs)
             page.locator(core.SUBMIT_SELECTORS[0]).click.side_effect = click
-            self.assertTrue((await self.execute(page))['ok'])
+            result = await self.execute(page)
+            self.assertTrue(result['ok'], result.get('error'))
 
+    @mock_clock
     async def test_playwright_timeout_fill_submit_and_profile(self):
         from playwright.async_api import TimeoutError as PlaywrightTimeout
         for phase in ('fill', 'submit', 'profile_wait'):
@@ -943,6 +986,7 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
             self.context.close.assert_awaited_once()
             self.assertLessEqual(page.locator(core.SUBMIT_SELECTORS[0]).click.await_count, 1)
 
+    @mock_clock
     async def test_execution_context_navigation_retry_is_bounded(self):
         from playwright.async_api import Error
         for persistent in (False, True):
@@ -964,6 +1008,7 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(count, 3)
             page.locator(core.SUBMIT_SELECTORS[0]).click.assert_awaited_once()
 
+    @mock_clock
     async def test_disabled_form_controls_never_submit(self):
         page = FakePage(response())
         for selector in core.SUBMIT_SELECTORS:
@@ -972,6 +1017,7 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result['error'], 'login_form_unavailable')
         page.locator(core.SUBMIT_SELECTORS[0]).click.assert_not_awaited()
 
+    @mock_clock
     async def test_storage_self_id_mismatch(self):
         page = FakePage(response({'success': True, 'data': {'id': 43}}))
         result = await self.execute(page)
