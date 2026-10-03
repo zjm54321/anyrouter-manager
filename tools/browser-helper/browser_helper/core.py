@@ -484,9 +484,11 @@ async def login_work(credentials, launch, resources, state):
     explicit_active = False
     explicit_request = None
     explicit_user = None
+    login_reply = None
+    capture_closed = False
 
     async def guard_route(route):
-        nonlocal explicit_request
+        nonlocal explicit_request, login_reply
         request = route.request
         headers = getattr(request, 'headers', {})
         if 'x-helper-proof' in headers:
@@ -527,10 +529,20 @@ async def login_work(credentials, launch, resources, state):
             return
         login = kind == 'login' and state['submitted']
         if login:
+            if request.redirected_from is not None or login_reply is not None or capture_closed:
+                state.update(network_failed=True, failure_request='login', exception='network')
+                await route.abort()
+                return
+            # Playwright caches the API wrapper for each Request implementation.
+            # Keep this exact owner, never a URL-keyed response/body cache.
+            login_reply = dict(request=request, body=None, status=None, claimed=False,
+                               ready=asyncio.get_running_loop().create_future())
             state.update(login_requested=True, pending_login=True)
         elif kind == 'self' and state['submitted']:
             state['self_requested'] = True
             state['self_user_header_present'] = 'new-api-user' in getattr(request, 'headers', {})
+        fetched = None
+        fulfilled = False
         try:
             remaining_ms = max(1, int((state['deadline'] - asyncio.get_running_loop().time()) * 1000))
             fetched = await route.fetch(max_redirects=0, max_retries=0, timeout=remaining_ms)
@@ -541,7 +553,19 @@ async def login_work(credentials, launch, resources, state):
                     state.update(network_failed=True, failure_request=kind, exception='network')
                 await route.abort()
             else:
+                if login:
+                    if fetched.url != request.url:
+                        raise Failure('login_failed')
+                    # route.fetch already buffered this APIResponse. Bound the
+                    # retained bytes BEFORE parsing; this is not a streaming cap.
+                    login_reply['status'] = fetched.status
+                    login_reply['body'] = await fetched.body()
+                    if capture_closed:
+                        raise Failure('login_failed')
+                    if len(login_reply['body']) > MAX_PROFILE_BYTES:
+                        raise Failure('login_failed')
                 await route.fulfill(response=fetched)
+                fulfilled = True
         except Exception as exc:
             if critical:
                 state.update(network_failed=True, failure_request=kind,
@@ -549,7 +573,22 @@ async def login_work(credentials, launch, resources, state):
             await route.abort()
         finally:
             if login:
-                state['pending_login'] = False
+                try:
+                    # fulfill references the APIResponse's fetch UID: dispose
+                    # only after fulfill has returned (or failed), never before.
+                    if fetched is not None:
+                        await fetched.dispose()
+                except BaseException:
+                    fulfilled = False
+                    state.update(network_failed=True, failure_request='login', exception='network')
+                    raise
+                finally:
+                    accepted = fulfilled and not capture_closed and not state['network_failed']
+                    if not accepted:
+                        login_reply['body'] = None
+                    if not login_reply['ready'].done():
+                        login_reply['ready'].set_result(accepted)
+                    state['pending_login'] = False
 
     await context.route('**/*', guard_route)
     page = await context.new_page()
@@ -573,18 +612,30 @@ async def login_work(credentials, launch, resources, state):
                 return
             request = request.redirected_from
         prefix = 'login' if kind == 'login' else 'self'
+        owned = None
+        if kind == 'login':
+            owned = login_reply
+            if (owned is None or owned['request'] is not response.request or owned['claimed']
+                    or response.url != response.request.url or response.status != owned['status']):
+                return
+            owned['claimed'] = True
+            if not await owned['ready']:
+                return
         state[prefix + '_requested'] = True
         state[prefix + '_status'] = response.status
         if kind == 'self':
             state['self_user_header_present'] = 'new-api-user' in getattr(response.request, 'headers', {})
         try:
-            payload = await response.json()
+            payload = json.loads(owned['body'].decode('utf-8')) if owned is not None else await response.json()
         except Exception as exc:
             if exception_kind(exc) == 'timeout':
                 state['exception'] = 'timeout'
             if kind == 'login':
                 login_error = 'challenge_or_block' if response.status in (403, 429, 503) else 'login_failed'
             return
+        finally:
+            if owned is not None:
+                owned['body'] = None
         state[prefix + '_json'] = True
         success = payload.get('success') if isinstance(payload, dict) else None
         state[prefix + '_success'] = success if type(success) is bool else None
@@ -723,7 +774,12 @@ async def login_work(credentials, launch, resources, state):
         state['phase'] = 'done'
         return {'ok': True, 'cookies': cookies, 'api_user': captured}
     finally:
+        capture_closed = True
         page.remove_listener('response', on_response)
+        if login_reply is not None:
+            login_reply['body'] = None
+            if not login_reply['ready'].done():
+                login_reply['ready'].set_result(False)
         pending = list(tasks)
         for task in pending:
             task.cancel()

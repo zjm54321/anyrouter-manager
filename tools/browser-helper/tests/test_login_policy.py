@@ -105,16 +105,22 @@ process.stdout.write(JSON.stringify(results));
         page.locator(core.SUBMIT_SELECTORS[0]).click.assert_awaited_once()
 
     async def test_login_query_is_preserved_not_stripped(self):
-        await self.execute(FakePage(response()))
         url = core.ORIGIN+'/api/user/login?turnstile=private-query-sentinel&x=%2F'
-        request = SimpleNamespace(url=url, method='POST')
-        self.assertEqual(core.request_kind(request), 'login')
-        reply = SimpleNamespace(url=url, status=200)
-        route = SimpleNamespace(request=request, fetch=AsyncMock(return_value=reply), abort=AsyncMock(), fulfill=AsyncMock())
-        await self.context.route.await_args.args[1](route)
+        page = FakePage(response())
+        page.login_event.url = page.login_event.request.url = url
+        page.login_event.request.redirected_from = None
+        self.assertEqual(core.request_kind(page.login_event.request), 'login')
+        result = await self.execute(page)
+        self.assertTrue(result['ok'])
+        route, reply = page.login_route, page.login_fetched
+        self.assertIs(route.request, page.login_event.request)
         self.assertEqual(route.request.url, url)
+        self.assertEqual(reply.url, url)
         self.assertEqual(route.fetch.await_args.kwargs['max_redirects'], 0)
         route.fulfill.assert_awaited_once_with(response=reply)
+        reply.body.assert_awaited_once()
+        reply.dispose.assert_awaited_once()
+        page.login_event.json.assert_not_awaited()
 
     async def test_continue_selected_after_wrong_owner_header(self):
         username, password = Locator(), Locator()

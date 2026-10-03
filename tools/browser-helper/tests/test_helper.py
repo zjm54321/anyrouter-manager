@@ -67,12 +67,23 @@ class FakePage:
         self.inputs = {}
         self.goto_urls = []
         self.ready = False
+        self.login_event = response({'success': True}, url=core.ORIGIN + '/api/user/login')
+        self.login_event.json.side_effect = RuntimeError('browser body unavailable after navigation')
+        self.login_body = b'{"success":true}'
+        self.login_fulfill = AsyncMock(side_effect=self.deliver_login)
         self.evaluate = AsyncMock(side_effect=lambda script, arg=None: {'error': 'network'} if script == core.SESSION_PROFILE_JS else ({'id': 42 if self.ready else None, 'ready': True} if script == core.USER_STATE_JS else self.challenge))
 
-    async def accepted_login(self):
-        self.listeners['response'](response({'success': True}, url=core.ORIGIN + '/api/user/login'))
+    async def deliver_login(self, **kwargs):
+        self.listeners['response'](self.login_event)
         self.ready = True
         await asyncio.sleep(0)
+
+    async def accepted_login(self):
+        self.login_fetched = SimpleNamespace(status=self.login_event.status, url=self.login_event.url,
+            body=AsyncMock(return_value=self.login_body), dispose=AsyncMock())
+        self.login_route = SimpleNamespace(request=self.login_event.request,
+            fetch=AsyncMock(return_value=self.login_fetched), fulfill=self.login_fulfill, abort=AsyncMock())
+        await self.guard(self.login_route)
 
     def locator(self, selector):
         if selector not in self.inputs:
@@ -112,7 +123,7 @@ class FakeContext:
         self.page = page
         self.cookies = AsyncMock(return_value=[cookie()] if cookies is None else cookies)
         self.new_page = AsyncMock(return_value=page)
-        self.route = AsyncMock()
+        self.route = AsyncMock(side_effect=lambda pattern, handler: setattr(page, 'guard', handler))
         self.close = AsyncMock()
 
 
@@ -205,8 +216,9 @@ class LoginTests(unittest.IsolatedAsyncioTestCase):
         self.context = FakeContext(page, cookies)
         self.browser = FakeBrowser(self.context)
         self.launch = AsyncMock(return_value=self.browser)
+        self.state = {}
         with patch.object(core, 'browser_launcher', return_value=self.launch):
-            return await core.run_login(core.LoginInput('mock-user', SECRET, timeout_ms))
+            return await core.run_login(core.LoginInput('mock-user', SECRET, timeout_ms), self.state)
 
     async def execute_virtual(self, page, cookies=None, timeout_ms=160):
         # Only selected mock-only cookie/profile fixtures use this clock.
@@ -236,6 +248,79 @@ class LoginTests(unittest.IsolatedAsyncioTestCase):
         self.browser.close.assert_awaited_once()
         self.assertEqual(page.goto_urls, [core.ORIGIN + '/login'])
         self.assertEqual(page.listeners, {})
+        page.login_event.json.assert_not_awaited()
+        page.login_fetched.body.assert_awaited_once()
+        page.login_fetched.dispose.assert_awaited_once()
+
+    async def test_retained_login_body_rejects_malformed_or_oversized(self):
+        for body in (b'private-body-sentinel', b'{"success":true}' + b' ' * core.MAX_PROFILE_BYTES):
+            page = FakePage(response())
+            page.login_body = body
+            result = await self.execute_virtual(page)
+            self.assertEqual(result, {'ok': False, 'error': 'login_failed'})
+            self.context.cookies.assert_not_awaited()
+            page.login_event.json.assert_not_awaited()
+            page.login_fetched.dispose.assert_awaited_once()
+            self.assertNotIn('private-body-sentinel', json.dumps(self.state))
+
+    async def test_login_event_requires_owned_request_url_status_and_no_redirect(self):
+        for mismatch in ('request', 'status', 'url', 'redirect'):
+            page = FakePage(response())
+            async def fulfill(**kwargs):
+                event = response({'success': True}, url=page.login_event.url)
+                if mismatch != 'request':
+                    event.request = page.login_event.request
+                if mismatch == 'status':
+                    event.status = 201
+                elif mismatch == 'url':
+                    event.url += '?different'
+                elif mismatch == 'redirect':
+                    event.request.redirected_from = SimpleNamespace(url=event.url, redirected_from=None)
+                page.listeners['response'](event)
+                page.listeners['response'](page.profile)
+                page.ready = True
+                page.url = core.ORIGIN + '/console'
+                await asyncio.sleep(0)
+                event.json.assert_not_awaited()
+            page.login_fulfill.side_effect = fulfill
+            self.assertFalse((await self.execute_virtual(page))['ok'])
+            self.context.cookies.assert_not_awaited()
+            self.assertIsNone(self.state.get('login_success'))
+            self.context.close.assert_awaited_once()
+
+    async def test_login_fulfill_failure_or_cancellation_after_event_cannot_authenticate(self):
+        for cancel in (False, True):
+            page = FakePage(response())
+            route_task = None
+            async def fulfill(**kwargs):
+                await page.deliver_login()
+                page.listeners['response'](page.profile)
+                page.url = core.ORIGIN + '/console'
+                # Let the response task wait on the unfinished fulfill while
+                # the main polling loop can see both console and self proof.
+                await asyncio.sleep(0)
+                self.assertIsNot(self.state.get('login_success'), True)
+                self.context.cookies.assert_not_awaited()
+                if cancel:
+                    await asyncio.Future()
+                raise RuntimeError(SECRET)
+            page.login_fulfill.side_effect = fulfill
+            async def click(**kwargs):
+                nonlocal route_task
+                route_task = asyncio.create_task(page.accepted_login())
+                await asyncio.sleep(0)
+            page.locator(core.SUBMIT_SELECTORS[0]).click.side_effect = click
+            try:
+                self.assertFalse((await self.execute_virtual(page))['ok'])
+            finally:
+                route_task.cancel()
+                await asyncio.gather(route_task, return_exceptions=True)
+            self.context.cookies.assert_not_awaited()
+            page.login_event.json.assert_not_awaited()
+            page.login_fetched.dispose.assert_awaited_once()
+            self.context.close.assert_awaited_once()
+            self.browser.close.assert_awaited_once()
+            self.assertEqual(page.listeners, {})
 
     def proactive_page(self, reply=None, after=None, before=None):
         page = FakePage()
@@ -461,18 +546,19 @@ class LoginTests(unittest.IsolatedAsyncioTestCase):
             route.continue_.assert_not_awaited()
 
     async def test_redirects_never_fulfilled_or_followed(self):
-        await self.execute(FakePage(response()))
-        guard = self.context.route.await_args.args[1]
         for status in (301, 302, 303, 307, 308):
             for body in (None, b'username=mock-user&password=secret'):
-                request = SimpleNamespace(url=core.ORIGIN + '/api/user/login', post_data_buffer=body, method='POST')
-                route = SimpleNamespace(request=request, fetch=AsyncMock(return_value=SimpleNamespace(status=status, url=request.url)),
-                                        fulfill=AsyncMock(), abort=AsyncMock(), continue_=AsyncMock())
-                await guard(route)
+                page = FakePage(response())
+                page.login_event.status = status
+                page.login_event.request.post_data_buffer = body
+                self.assertFalse((await self.execute_virtual(page))['ok'])
+                route = page.login_route
                 self.assertEqual(route.fetch.await_args.kwargs['max_redirects'], 0)
                 route.abort.assert_awaited_once()
                 route.fulfill.assert_not_awaited()
-                route.continue_.assert_not_awaited()
+                page.login_fetched.body.assert_not_awaited()
+                page.login_fetched.dispose.assert_awaited_once()
+                self.context.cookies.assert_not_awaited()
 
     async def test_safe_requests_fetch_no_redirects_and_fulfill(self):
         await self.execute(FakePage(response()))
@@ -608,13 +694,14 @@ class LoginTests(unittest.IsolatedAsyncioTestCase):
             nonlocal completed
             await asyncio.sleep(5.2)
             completed = True
-            return SimpleNamespace(status=200, url=core.ORIGIN + '/api/user/login')
+            return SimpleNamespace(status=200, url=core.ORIGIN + '/api/user/login',
+                                   body=AsyncMock(return_value=page.login_body), dispose=AsyncMock())
         async def click(**kwargs):
             nonlocal network_task
             guard = context.route.await_args.args[1]
             async def fulfill(**kwargs):
-                await page.accepted_login()
-            route = SimpleNamespace(request=SimpleNamespace(url=core.ORIGIN + '/api/user/login', post_data_buffer=b'credentials', method='POST'),
+                await page.deliver_login()
+            route = SimpleNamespace(request=page.login_event.request,
                                     fetch=fetch, abort=AsyncMock(), fulfill=fulfill)
             network_task = asyncio.create_task(guard(route))
             await asyncio.sleep(0)
@@ -729,9 +816,8 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
         for challenged in (False, True):
             page = FakePage(response())
             async def click(**kwargs):
-                reply = response(url=core.ORIGIN + '/api/user/login')
-                reply.json.side_effect = ValueError('private-html-password-token')
-                page.listeners['response'](reply)
+                page.login_body = b'private-html-password-token'
+                await page.accepted_login()
                 page.challenge = challenged
             page.locator(core.SUBMIT_SELECTORS[0]).click.side_effect = click
             with patch.dict(os.environ, {'BROWSER_HELPER_DIAGNOSTICS': '1'}):
@@ -770,7 +856,8 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
     async def test_http200_login_false_never_reads_cookie_or_navigates(self):
         page = FakePage(response())
         async def click(**kwargs):
-            page.listeners['response'](response({'success': False, 'message': SECRET}, url=core.ORIGIN + '/api/user/login'))
+            page.login_body = json.dumps({'success': False, 'message': SECRET}).encode()
+            await page.accepted_login()
             page.listeners['response'](response())
             page.ready = True
         page.locator(core.SUBMIT_SELECTORS[0]).click.side_effect = click
@@ -798,7 +885,7 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
         ready_at = None
         async def click(**kwargs):
             nonlocal ready_at
-            page.listeners['response'](response({'success': True}, url=core.ORIGIN + '/api/user/login'))
+            await page.accepted_login()
             ready_at = asyncio.get_running_loop().time() + 0.22
         page.locator(core.SUBMIT_SELECTORS[0]).click.side_effect = click
         async def evaluate(script):
@@ -903,7 +990,8 @@ from test_helper import FakePage, FakeContext, FakeBrowser, response
 from browser_helper import core
 page = FakePage(response())
 async def rejected(**kwargs):
-    page.listeners['response'](response({'success':False,'message':'private-body-sentinel', 'token':'private-token-sentinel','private':'private-field-sentinel'},url=core.ORIGIN+'/api/user/login'))
+    page.login_body = b'{"success":false,"message":"private-body-sentinel","token":"private-token-sentinel","private":"private-field-sentinel"}'
+    await page.accepted_login()
     page.url = core.ORIGIN+'/login?private-query-sentinel'
 core.browser_launcher = lambda: (lambda **kwargs: asyncio.sleep(0, result=FakeBrowser(FakeContext(page))))
 page.locator(core.SUBMIT_SELECTORS[0]).click.side_effect = rejected
